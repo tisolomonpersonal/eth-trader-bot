@@ -180,7 +180,7 @@ Recent closes (last 6h): {closes[-6:]}
 Recent volumes (last 6h): {volumes[-6:]}
 
 Leverage: 45x — liquidation is ~2.2% against you. Be conservative.
-Trade size: 0.002 ETH
+Trade size: 0.08 ETH
 
 You MUST provide SL and TP prices (not percentages).
 
