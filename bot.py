@@ -9,7 +9,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
-QTY = 0.002
+QTY = 0.08
 LEVERAGE = 45
 CHECK_INTERVAL = 3600  # every hour
 
