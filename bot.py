@@ -9,7 +9,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
-TRADE_SIZE = 80  # USD
+TRADE_SIZE = 8  # USD
 STATE_FILE = "/tmp/bot_state.json"
 
 # Ghana is UTC+0 (no daylight saving)
