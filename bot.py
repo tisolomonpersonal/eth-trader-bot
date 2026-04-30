@@ -9,13 +9,9 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
-TRADE_SIZE = 8  # USD
-STATE_FILE = "/tmp/bot_state.json"
-
-# Ghana is UTC+0 (no daylight saving)
-# 3pm Ghana = 15:00 UTC, 6pm Ghana = 18:00 UTC
-ENTRY_HOUR = 15
-CHECK_HOUR = 18
+QTY = 0.002
+LEVERAGE = 45
+CHECK_INTERVAL = 3600  # every hour
 
 def send_telegram(message):
     try:
@@ -27,12 +23,33 @@ def send_telegram(message):
     except:
         pass
 
+def get_server_time():
+    r = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
+    return str(int(float(r.json()["result"]["timeNano"]) / 1000000))
+
+def sign_request(params):
+    timestamp = get_server_time()
+    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'))
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": "5000"
+    }
+    return headers
+
+def set_leverage():
+    params = {"category": "linear", "symbol": SYMBOL, "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
+    headers = sign_request(params)
+    requests.post("https://api.bybit.com/v5/position/set-leverage", json=params, headers=headers, timeout=10)
+
 def get_price():
-    r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={SYMBOL}", timeout=10)
+    r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={SYMBOL}", timeout=10)
     return float(r.json()["result"]["list"][0]["lastPrice"])
 
 def get_candles():
-    r = requests.get(f"https://api.bybit.com/v5/market/kline?category=spot&symbol={SYMBOL}&interval=60&limit=200", timeout=10)
+    r = requests.get(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval=60&limit=24", timeout=10)
     candles = r.json()["result"]["list"]
     return [{"open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]} for c in reversed(candles)]
 
@@ -44,32 +61,52 @@ def get_fear_greed():
     except:
         return "unavailable"
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"position": None, "date": None}
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-def get_server_time():
-    r = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
-    return str(int(float(r.json()["result"]["timeNano"]) / 1000000))
-
-def place_order(side, qty_usdt=None, qty_eth=None):
+def get_position():
+    params = {"category": "linear", "symbol": SYMBOL}
     timestamp = get_server_time()
-    if side == "Buy":
-        params = {"category": "spot", "symbol": SYMBOL, "side": "Buy",
-                  "orderType": "Market", "qty": str(qty_usdt), "marketUnit": "quoteCoin"}
-    else:
-        params = {"category": "spot", "symbol": SYMBOL, "side": "Sell",
-                  "orderType": "Market", "qty": str(round(qty_eth, 6)), "marketUnit": "baseCoin"}
-    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'))
+    query = f"category=linear&symbol={SYMBOL}"
+    param_str = timestamp + BYBIT_API_KEY + "5000" + query
     sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": timestamp,
-               "X-BAPI-SIGN": sign, "X-BAPI-RECV-WINDOW": "5000"}
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": "5000"
+    }
+    r = requests.get(f"https://api.bybit.com/v5/position/list?{query}", headers=headers, timeout=10)
+    positions = r.json()["result"]["list"]
+    for p in positions:
+        if float(p["size"]) > 0:
+            return p
+    return None
+
+def place_order(side, sl, tp):
+    params = {
+        "category": "linear",
+        "symbol": SYMBOL,
+        "side": side,
+        "orderType": "Market",
+        "qty": str(QTY),
+        "stopLoss": str(round(sl, 2)),
+        "takeProfit": str(round(tp, 2)),
+        "slTriggerBy": "MarkPrice",
+        "tpTriggerBy": "MarkPrice"
+    }
+    headers = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/order/create", json=params, headers=headers, timeout=10)
+    return r.json()
+
+def close_position(side, qty):
+    close_side = "Sell" if side == "Buy" else "Buy"
+    params = {
+        "category": "linear",
+        "symbol": SYMBOL,
+        "side": close_side,
+        "orderType": "Market",
+        "qty": str(qty),
+        "reduceOnly": True
+    }
+    headers = sign_request(params)
     r = requests.post("https://api.bybit.com/v5/order/create", json=params, headers=headers, timeout=10)
     return r.json()
 
@@ -82,125 +119,118 @@ def ask_claude(prompt):
     )
     return message.content[0].text
 
-def run_entry():
-    """3pm Ghana: Claude analyzes and decides whether to buy"""
+def run_cycle():
     price = get_price()
     candles = get_candles()
     fear_greed = get_fear_greed()
+    position = get_position()
 
-    recent = candles[-24:]
-    highs = [float(c["high"]) for c in recent]
-    lows = [float(c["low"]) for c in recent]
-    closes = [float(c["close"]) for c in recent]
-    volumes = [float(c["volume"]) for c in recent]
+    closes = [float(c["close"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    volumes = [float(c["volume"]) for c in candles]
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    prompt = f"""You are a professional crypto trader. Analyze ETH/USDT and decide whether to BUY or SKIP.
+    if position:
+        side = position["side"]
+        entry = float(position["avgPrice"])
+        pnl = float(position["unrealisedPnl"])
+        pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
 
-Current price: ${price}
-Fear & Greed Index: {fear_greed}
-Last 24h — High: ${max(highs):.2f}, Low: ${min(lows):.2f}
+        prompt = f"""You are managing an open ETH/USDT perpetual position at 45x leverage.
+
+Time: {now}
+Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
+Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
+Fear & Greed: {fear_greed}
+Recent closes: {closes[-6:]}
+
+Should you HOLD or CLOSE this position?
+- CLOSE if momentum is reversing or risk is too high
+- HOLD if trend is still strong
+
+Respond in this exact format:
+DECISION: HOLD or CLOSE
+REASON: (2 sentences max)"""
+
+        response = ask_claude(prompt)
+        decision = "HOLD"
+        for line in response.strip().split("\n"):
+            if line.startswith("DECISION:"):
+                decision = line.replace("DECISION:", "").strip()
+
+        if decision == "CLOSE":
+            qty = float(position["size"])
+            result = close_position(side, qty)
+            if result.get("retCode") == 0:
+                send_telegram(f"🔴 <b>POSITION CLOSED</b>\nEntry: ${entry:.2f} → Exit: ${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n\n{response}")
+            else:
+                send_telegram(f"❌ Close failed: {result.get('retMsg')}")
+        else:
+            send_telegram(f"🟡 <b>HOLDING {side}</b>\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n\n{response}")
+
+    else:
+        prompt = f"""You are a professional crypto trader. Analyze ETH/USDT perpetual and decide to go LONG, SHORT, or SKIP.
+
+Time: {now}
+Current price: ${price:.2f}
+Fear & Greed: {fear_greed}
+24h High: ${max(highs):.2f} | 24h Low: ${min(lows):.2f}
 Recent closes (last 6h): {closes[-6:]}
 Recent volumes (last 6h): {volumes[-6:]}
 
-Rules:
-- Only BUY if there is a clear short-term upside opportunity
-- SKIP if trend is unclear or risky
-- Trade size is $80 USDT spot
+Leverage: 45x — liquidation is ~2.2% against you. Be conservative.
+Trade size: 0.002 ETH
+
+You MUST provide SL and TP prices (not percentages).
 
 Respond in this exact format:
-DECISION: BUY or SKIP
+DECISION: LONG or SHORT or SKIP
 REASON: (2 sentences max)
-TARGET: $X.XX (if BUY)
-STOPLOSS: $X.XX (if BUY)"""
+SL: $X.XX
+TP: $X.XX"""
 
-    response = ask_claude(prompt)
-    lines = response.strip().split("\n")
-    decision = "SKIP"
-    for line in lines:
-        if line.startswith("DECISION:"):
-            decision = line.replace("DECISION:", "").strip()
+        response = ask_claude(prompt)
+        lines = response.strip().split("\n")
+        decision = "SKIP"
+        sl = tp = 0.0
 
-    state = load_state()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+        for line in lines:
+            if line.startswith("DECISION:"):
+                decision = line.replace("DECISION:", "").strip()
+            elif line.startswith("SL:"):
+                try:
+                    sl = float(line.replace("SL:", "").replace("$", "").strip())
+                except:
+                    pass
+            elif line.startswith("TP:"):
+                try:
+                    tp = float(line.replace("TP:", "").replace("$", "").strip())
+                except:
+                    pass
 
-    if decision == "BUY":
-        result = place_order("Buy", qty_usdt=TRADE_SIZE)
-        if result.get("retCode") == 0:
-            state["position"] = {"price": price, "qty": TRADE_SIZE / price, "date": today}
-            state["date"] = today
-            save_state(state)
-            send_telegram(f"🔵 <b>CLAUDE BOUGHT ETH</b>\nPrice: ${price:.2f}\n\n{response}")
+        if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
+            side = "Buy" if decision == "LONG" else "Sell"
+            set_leverage()
+            result = place_order(side, sl, tp)
+            if result.get("retCode") == 0:
+                send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\n\n{response}")
+            else:
+                send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
+        elif decision == "SKIP":
+            send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\n{response}")
         else:
-            send_telegram(f"❌ Buy failed: {result.get('retMsg')}\n\nClaude wanted to buy:\n{response}")
-    else:
-        send_telegram(f"⏭ <b>CLAUDE SKIPPED</b>\nPrice: ${price:.2f}\n\n{response}")
-
-def run_check():
-    """6pm Ghana: Claude checks open position and decides to hold or sell"""
-    state = load_state()
-    if not state.get("position"):
-        send_telegram("ℹ️ <b>6PM Check</b>: No open position.")
-        return
-
-    price = get_price()
-    position = state["position"]
-    buy_price = position["price"]
-    qty_eth = position["qty"]
-    pnl_pct = ((price - buy_price) / buy_price) * 100
-    pnl_usd = (price - buy_price) * qty_eth
-
-    prompt = f"""You are a professional crypto trader managing an open ETH/USDT spot position.
-
-Entry price: ${buy_price:.2f}
-Current price: ${price:.2f}
-PnL: {pnl_pct:.2f}% (${pnl_usd:.4f})
-Position size: ~$80 USDT
-
-Should you HOLD or SELL?
-- SELL if profit is good enough or trend is weakening
-- SELL if loss is getting worse
-- HOLD only if momentum is clearly still positive
-
-Respond in this exact format:
-DECISION: HOLD or SELL
-REASON: (2 sentences max)"""
-
-    response = ask_claude(prompt)
-    lines = response.strip().split("\n")
-    decision = "HOLD"
-    for line in lines:
-        if line.startswith("DECISION:"):
-            decision = line.replace("DECISION:", "").strip()
-
-    if decision == "SELL":
-        result = place_order("Sell", qty_eth=qty_eth)
-        if result.get("retCode") == 0:
-            state["position"] = None
-            save_state(state)
-            send_telegram(f"💰 <b>CLAUDE SOLD ETH</b>\nEntry: ${buy_price:.2f} → Exit: ${price:.2f}\nPnL: {pnl_pct:.2f}% (${pnl_usd:.4f})\n\n{response}")
-        else:
-            send_telegram(f"❌ Sell failed: {result.get('retMsg')}\n\nClaude wanted to sell:\n{response}")
-    else:
-        send_telegram(f"🟡 <b>CLAUDE HOLDING</b>\nPrice: ${price:.2f} | PnL: {pnl_pct:.2f}%\n\n{response}")
+            send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🤖 <b>ETH Trader Bot Started</b>\nWaiting for 3PM (entry) and 6PM (check) Ghana time...")
-    print("Bot running...")
+    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.002 ETH | Hourly checks")
     while True:
-        now = datetime.utcnow()
-        hour = now.hour
-        minute = now.minute
-
-        if hour == ENTRY_HOUR and minute == 0:
-            print("Running entry check...")
-            run_entry()
-            time.sleep(61)
-        elif hour == CHECK_HOUR and minute == 0:
-            print("Running position check...")
-            run_check()
-            time.sleep(61)
-        else:
-            time.sleep(30)
+        try:
+            run_cycle()
+        except Exception as e:
+            send_telegram(f"⚠️ Error: {str(e)}")
+            print(f"Error: {e}")
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
