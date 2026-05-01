@@ -29,28 +29,22 @@ def get_server_time():
 
 def sign_request(params):
     timestamp = get_server_time()
-    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+    body = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+    param_str = timestamp + BYBIT_API_KEY + "5000" + body
     sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": BYBIT_API_KEY,
         "X-BAPI-TIMESTAMP": timestamp,
         "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": "5000"
+        "X-BAPI-RECV-WINDOW": "5000",
+        "Content-Type": "application/json"
     }
-    return headers
+    return headers, body
 
 def set_leverage():
     params = {"category": "linear", "symbol": SYMBOL, "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
-    timestamp = get_server_time()
-    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'), ensure_ascii=False)
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": "5000"
-    }
-    requests.post("https://api.bybit.com/v5/position/set-leverage", json=params, headers=headers, timeout=10)
+    headers, body = sign_request(params)
+    requests.post("https://api.bybit.com/v5/position/set-leverage", data=body, headers=headers, timeout=10)
 
 def get_price():
     r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={SYMBOL}", timeout=10)
@@ -99,8 +93,8 @@ def place_order(side, sl, tp):
         "slTriggerBy": "MarkPrice",
         "tpTriggerBy": "MarkPrice"
     }
-    headers = sign_request(params)
-    r = requests.post("https://api.bybit.com/v5/order/create", json=params, headers=headers, timeout=10)
+    headers, body = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
 def close_position(side, qty):
@@ -111,10 +105,10 @@ def close_position(side, qty):
         "side": close_side,
         "orderType": "Market",
         "qty": str(qty),
-        "reduceOnly": True
+        "reduceOnly": "true"
     }
-    headers = sign_request(params)
-    r = requests.post("https://api.bybit.com/v5/order/create", json=params, headers=headers, timeout=10)
+    headers, body = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
 def ask_claude(prompt):
