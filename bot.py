@@ -82,12 +82,14 @@ def get_position():
     return None
 
 def place_order(side, sl, tp):
+    position_idx = 1 if side == "Buy" else 2
     params = {
         "category": "linear",
         "symbol": SYMBOL,
         "side": side,
         "orderType": "Market",
         "qty": str(QTY),
+        "positionIdx": position_idx,
         "stopLoss": str(round(sl, 2)),
         "takeProfit": str(round(tp, 2)),
         "slTriggerBy": "MarkPrice",
@@ -99,12 +101,14 @@ def place_order(side, sl, tp):
 
 def close_position(side, qty):
     close_side = "Sell" if side == "Buy" else "Buy"
+    position_idx = 1 if side == "Buy" else 2
     params = {
         "category": "linear",
         "symbol": SYMBOL,
         "side": close_side,
         "orderType": "Market",
         "qty": str(qty),
+        "positionIdx": position_idx,
         "reduceOnly": "true"
     }
     headers, body = sign_request(params)
