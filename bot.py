@@ -115,7 +115,6 @@ def close_position(side, qty):
     r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
-# --- TECHNICAL INDICATORS ---
 def calculate_rsi(closes, period=14):
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -140,7 +139,6 @@ def calculate_macd(closes):
     ema12 = calculate_ema(closes, 12)
     ema26 = calculate_ema(closes, 26)
     macd_line = round(ema12 - ema26, 4)
-    # Signal line (9 EMA of last MACD values approximated)
     signal = round(macd_line * 0.9, 4)
     histogram = round(macd_line - signal, 4)
     return macd_line, signal, histogram
@@ -175,7 +173,6 @@ def run_cycle():
     volumes = [c["volume"] for c in candles]
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    # Calculate indicators
     rsi = calculate_rsi(closes)
     macd, signal, histogram = calculate_macd(closes)
     bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
@@ -189,7 +186,7 @@ def run_cycle():
         pnl = float(position["unrealisedPnl"])
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
 
-        prompt = f"""You are managing an open ETH/USDT perpetual position at 45x leverage.
+        prompt = f"""You are managing an open ETH/USDT perpetual position.
 
 Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
@@ -202,8 +199,8 @@ Technical Indicators:
 - EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
 - Fear & Greed: {fear_greed}
 
-Should you HOLD or CLOSE?
-- CLOSE if RSI is reversing, MACD crosses bearish, or price hits BB extreme
+Make your decision based purely on technical signals.
+- CLOSE if RSI is reversing, MACD crosses against position, or price hits BB extreme
 - HOLD if trend and momentum still confirm direction
 
 Respond in this exact format:
@@ -241,12 +238,9 @@ Technical Indicators:
 - Fear & Greed: {fear_greed}
 - Recent volumes (last 6h): {volumes[-6:]}
 
-Leverage: 45x — liquidation is ~2.2% against you. Be conservative.
-Trade size: 0.08 ETH
-
-Rules:
-- LONG if RSI < 50, MACD bullish, price above EMA20, uptrend
-- SHORT if RSI > 60, MACD bearish, price below EMA20, downtrend
+Make your decision based purely on technical signals.
+- LONG if RSI < 50, MACD bullish, price above EMA20, uptrend confirmed
+- SHORT if RSI > 60, MACD bearish, price below EMA20, downtrend confirmed
 - SKIP if signals conflict or market is unclear
 - SL must be outside BB bands, TP at next BB band level
 
