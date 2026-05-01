@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.08
 LEVERAGE = 45
-CHECK_INTERVAL = 3600  # every hour
+CHECK_INTERVAL = 3600
 
 def send_telegram(message):
     try:
@@ -29,8 +29,8 @@ def get_server_time():
 
 def sign_request(params):
     timestamp = get_server_time()
-    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'))
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": BYBIT_API_KEY,
         "X-BAPI-TIMESTAMP": timestamp,
@@ -41,7 +41,15 @@ def sign_request(params):
 
 def set_leverage():
     params = {"category": "linear", "symbol": SYMBOL, "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
-    headers = sign_request(params)
+    timestamp = get_server_time()
+    param_str = timestamp + BYBIT_API_KEY + "5000" + json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": "5000"
+    }
     requests.post("https://api.bybit.com/v5/position/set-leverage", json=params, headers=headers, timeout=10)
 
 def get_price():
@@ -62,11 +70,10 @@ def get_fear_greed():
         return "unavailable"
 
 def get_position():
-    params = {"category": "linear", "symbol": SYMBOL}
     timestamp = get_server_time()
     query = f"category=linear&symbol={SYMBOL}"
     param_str = timestamp + BYBIT_API_KEY + "5000" + query
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": BYBIT_API_KEY,
         "X-BAPI-TIMESTAMP": timestamp,
@@ -223,7 +230,7 @@ TP: $X.XX"""
             send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.002 ETH | Hourly checks")
+    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.08 ETH | Hourly checks")
     while True:
         try:
             run_cycle()
