@@ -11,7 +11,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.14
 LEVERAGE = 25
-CHECK_INTERVAL = 3600
+INTERVAL_NO_POSITION = 3600   # 1 hour when no trade
+INTERVAL_IN_POSITION = 1800   # 30 mins when in trade
+STATE_FILE = "/tmp/bot_state.json"
 
 def send_telegram(message):
     try:
@@ -99,6 +101,19 @@ def place_order(side, sl, tp):
     r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
+def update_sl_tp(side, new_sl=None, new_tp=None):
+    position_idx = 1 if side == "Buy" else 2
+    params = {"category": "linear", "symbol": SYMBOL, "positionIdx": position_idx}
+    if new_sl:
+        params["stopLoss"] = str(round(new_sl, 2))
+        params["slTriggerBy"] = "MarkPrice"
+    if new_tp:
+        params["takeProfit"] = str(round(new_tp, 2))
+        params["tpTriggerBy"] = "MarkPrice"
+    headers, body = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/position/trading-stop", data=body, headers=headers, timeout=10)
+    return r.json()
+
 def close_position(side, qty):
     close_side = "Sell" if side == "Buy" else "Buy"
     position_idx = 1 if side == "Buy" else 2
@@ -152,20 +167,48 @@ def calculate_bollinger(closes, period=20):
     lower = round(sma - 2 * std, 2)
     return round(sma, 2), upper, lower
 
-def ask_claude(prompt):
+def smart_tp(side, price, bb_upper, bb_lower, bb_mid):
+    bb_range = bb_upper - bb_lower
+    if side == "Buy":
+        tp = round(bb_mid + (bb_range * 1.5), 2)
+        return max(tp, bb_upper)
+    else:
+        tp = round(bb_mid - (bb_range * 1.5), 2)
+        return min(tp, bb_lower)
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"last_position": None, "total_pnl": 0, "wins": 0, "losses": 0, "be_moved": False}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def ask_claude(prompt, retries=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+    for attempt in range(retries):
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return message.content[0].text
+        except Exception as e:
+            if "overloaded" in str(e).lower() and attempt < retries - 1:
+                send_telegram(f"⏳ Anthropic overloaded, retrying in 30s... (attempt {attempt+1}/{retries})")
+                time.sleep(30)
+            else:
+                raise e
 
 def run_cycle():
     price = get_price()
     candles = get_candles()
     fear_greed = get_fear_greed()
     position = get_position()
+    state = load_state()
 
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
@@ -180,17 +223,52 @@ def run_cycle():
     ema50 = calculate_ema(closes, 50)
     trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
 
+    # --- Detect TP/SL hit ---
+    if state.get("last_position") and not position:
+        last = state["last_position"]
+        entry = last["price"]
+        side = last["side"]
+        pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
+        pnl_usd = pnl_pct / 100 * QTY * entry
+        if pnl_pct > 0:
+            state["wins"] = state.get("wins", 0) + 1
+            state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
+            send_telegram(f"🎯 <b>TP HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n+${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
+        else:
+            state["losses"] = state.get("losses", 0) + 1
+            state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
+            send_telegram(f"🛑 <b>SL HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
+        state["last_position"] = None
+        state["be_moved"] = False
+        save_state(state)
+
     if position:
         side = position["side"]
         entry = float(position["avgPrice"])
         pnl = float(position["unrealisedPnl"])
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
+        current_tp = float(position.get("takeProfit", 0))
+        be_moved = state.get("be_moved", False)
+        updates = []
 
+        # --- Trailing TP ---
+        new_tp = smart_tp(side, price, bb_upper, bb_lower, bb_mid)
+        if side == "Buy" and new_tp > current_tp and current_tp > 0:
+            result = update_sl_tp(side, new_tp=new_tp)
+            if result.get("retCode") == 0:
+                updates.append(f"TP→${new_tp}")
+        elif side == "Sell" and new_tp < current_tp and current_tp > 0:
+            result = update_sl_tp(side, new_tp=new_tp)
+            if result.get("retCode") == 0:
+                updates.append(f"TP→${new_tp}")
+
+        # --- Ask Claude ---
         prompt = f"""You are managing an open ETH/USDT perpetual position.
 
 Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
+Breakeven SL already moved: {be_moved}
 
 Technical Indicators:
 - RSI(14): {rsi} (>70 overbought, <30 oversold)
@@ -199,12 +277,13 @@ Technical Indicators:
 - EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
 - Fear & Greed: {fear_greed}
 
-Make your decision based purely on technical signals.
-- CLOSE if RSI is reversing, MACD crosses against position, or price hits BB extreme
+Make decisions based purely on technical signals.
+- CLOSE if RSI reversing, MACD crosses against position, or price hits BB extreme
 - HOLD if trend and momentum still confirm direction
+- MOVE_BE if profit is sufficient and you want to move SL to breakeven to protect gains — only if not already moved
 
 Respond in this exact format:
-DECISION: HOLD or CLOSE
+DECISION: HOLD or CLOSE or MOVE_BE
 REASON: (2 sentences max)"""
 
         response = ask_claude(prompt)
@@ -217,11 +296,37 @@ REASON: (2 sentences max)"""
             qty = float(position["size"])
             result = close_position(side, qty)
             if result.get("retCode") == 0:
-                send_telegram(f"🔴 <b>POSITION CLOSED</b>\nEntry: ${entry:.2f} → Exit: ${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
+                if pnl > 0:
+                    state["wins"] = state.get("wins", 0) + 1
+                else:
+                    state["losses"] = state.get("losses", 0) + 1
+                state["total_pnl"] = state.get("total_pnl", 0) + pnl
+                state["last_position"] = None
+                state["be_moved"] = False
+                save_state(state)
+                send_telegram(f"🔴 <b>CLOSED</b> | ${entry:.2f}→${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%) | W:{state['wins']} L:{state['losses']}\n{response}")
             else:
                 send_telegram(f"❌ Close failed: {result.get('retMsg')}")
+
+        elif decision == "MOVE_BE" and not be_moved:
+            result = update_sl_tp(side, new_sl=entry)
+            if result.get("retCode") == 0:
+                state["be_moved"] = True
+                save_state(state)
+                updates.append(f"SL→BE (${entry:.2f})")
+                send_telegram(f"🔒 <b>SL MOVED TO BREAKEVEN</b> ${entry:.2f}\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n{response}")
+            else:
+                send_telegram(f"❌ BE move failed: {result.get('retMsg')}")
+
         else:
-            send_telegram(f"🟡 <b>HOLDING {side}</b>\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
+            update_str = " | " + " | ".join(updates) if updates else ""
+            send_telegram(f"🟡 <b>HOLD {side}</b> | ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%){update_str}\nRSI: {rsi} | {trend}")
+
+        state["last_position"] = {"price": entry, "side": side}
+        save_state(state)
+
+        # Sleep 30 mins when in position
+        return INTERVAL_IN_POSITION
 
     else:
         prompt = f"""You are a professional crypto trader. Analyze ETH/USDT perpetual and decide to go LONG, SHORT, or SKIP.
@@ -239,23 +344,22 @@ Technical Indicators:
 - Recent volumes (last 6h): {volumes[-6:]}
 
 Make your decision based purely on technical signals.
-- LONG if RSI < 50, MACD bullish, price above EMA20, uptrend confirmed
-- SHORT if RSI > 60, MACD bearish, price below EMA20, downtrend confirmed
-- SKIP if signals conflict or market is unclear
-- SL must be outside BB bands, TP at next BB band level
+- LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
+- SHORT if RSI > 45, MACD bearish, price below EMA20, downtrend confirmed
+- SKIP if majority of signals conflict
+- SL must be outside BB bands, TP will be calculated automatically
 
-You MUST provide SL and TP as exact prices.
+You MUST provide SL as exact price.
 
 Respond in this exact format:
 DECISION: LONG or SHORT or SKIP
 REASON: (2 sentences max)
-SL: $X.XX
-TP: $X.XX"""
+SL: $X.XX"""
 
         response = ask_claude(prompt)
         lines = response.strip().split("\n")
         decision = "SKIP"
-        sl = tp = 0.0
+        sl = 0.0
 
         for line in lines:
             if line.startswith("DECISION:"):
@@ -265,34 +369,35 @@ TP: $X.XX"""
                     sl = float(line.replace("SL:", "").replace("$", "").strip())
                 except:
                     pass
-            elif line.startswith("TP:"):
-                try:
-                    tp = float(line.replace("TP:", "").replace("$", "").strip())
-                except:
-                    pass
 
-        if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
+        if decision in ("LONG", "SHORT") and sl > 0:
             side = "Buy" if decision == "LONG" else "Sell"
+            tp = smart_tp(side, price, bb_upper, bb_lower, bb_mid)
             set_leverage()
             result = place_order(side, sl, tp)
             if result.get("retCode") == 0:
-                send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n\n{response}")
+                state["last_position"] = {"price": price, "side": side}
+                state["be_moved"] = False
+                save_state(state)
+                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n{response}")
             else:
-                send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
-        elif decision == "SKIP":
-            send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\nRSI: {rsi} | {trend}\n{response}")
+                send_telegram(f"❌ Order failed: {result.get('retMsg')}")
         else:
-            send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
+            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | RSI: {rsi} | {trend}")
+
+        # Sleep 1 hour when no position
+        return INTERVAL_NO_POSITION
 
 def main():
-    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.08 ETH | Hourly | RSI + MACD + BB")
+    send_telegram("🤖 <b>ETH Bot Started</b>\n25x | 0.14 ETH | 1h entry scan | 30min position monitor")
     while True:
         try:
-            run_cycle()
+            interval = run_cycle()
         except Exception as e:
             send_telegram(f"⚠️ Error: {str(e)}")
             print(f"Error: {e}")
-        time.sleep(CHECK_INTERVAL)
+            interval = INTERVAL_NO_POSITION
+        time.sleep(interval)
 
 if __name__ == "__main__":
     main()
