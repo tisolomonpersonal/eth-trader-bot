@@ -11,7 +11,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 MAX_RISK_USD = 5.0
 MIN_EARLY_PROFIT = 1.0
-CIRCUIT_BREAKER_LOSS = 5.0
 INTERVAL_NO_POSITION = 3600
 INTERVAL_IN_POSITION = 1800
 STATE_FILE = "/tmp/bot_state.json"
@@ -179,13 +178,17 @@ def calculate_atr(candles, period=14):
     return round(sum(trs[-period:]) / period, 4)
 
 def detect_market_regime(closes, highs, lows, atr, bb_upper, bb_lower):
+    """Detect if market is trending or sideways"""
     bb_width = (bb_upper - bb_lower) / closes[-1] * 100
     ema20 = calculate_ema(closes, 20)
     ema50 = calculate_ema(closes, 50)
     ema_spread = abs(ema20 - ema50) / closes[-1] * 100
+
+    # Check recent price movement
     recent_high = max(highs[-24:])
     recent_low = min(lows[-24:])
     range_pct = (recent_high - recent_low) / closes[-1] * 100
+
     if bb_width > 3.0 and ema_spread > 0.5 and range_pct > 3.0:
         return "TRENDING"
     else:
@@ -208,7 +211,10 @@ def liquidation_price(side, entry, leverage):
 
 def smart_tp(side, price, bb_upper, bb_lower, bb_mid, regime):
     bb_range = bb_upper - bb_lower
-    multiplier = 2.0 if regime == "TRENDING" else 1.0
+    if regime == "TRENDING":
+        multiplier = 2.0
+    else:
+        multiplier = 1.0
     if side == "Buy":
         tp = round(bb_mid + (bb_range * multiplier), 2)
         return max(tp, bb_upper)
@@ -216,18 +222,11 @@ def smart_tp(side, price, bb_upper, bb_lower, bb_mid, regime):
         tp = round(bb_mid - (bb_range * multiplier), 2)
         return min(tp, bb_lower)
 
-def is_moving_toward_tp(side, entry, current_price, tp):
-    """Check if price is moving toward TP not away from it"""
-    if side == "Buy":
-        return current_price > entry
-    else:
-        return current_price < entry
-
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"last_position": None, "total_pnl": 0, "wins": 0, "losses": 0, "be_moved": False}
+    return {"last_position": None, "total_pnl": 0, "wins": 0, "losses": 0, "be_moved": False, "qty": 0.08}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -272,24 +271,22 @@ def run_cycle():
     trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
     regime = detect_market_regime(closes, highs, lows, atr, bb_upper, bb_lower)
 
-    # --- Detect TP/SL hit (only if we didn't manually close) ---
+    # --- Detect TP/SL hit ---
     if state.get("last_position") and not position:
         last = state["last_position"]
-        # Only report if we didn't already report a manual close
-        if not last.get("manually_closed", False):
-            entry = last["price"]
-            side = last["side"]
-            qty = last.get("qty", 0.08)
-            pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
-            pnl_usd = pnl_pct / 100 * qty * entry
-            if pnl_pct > 0:
-                state["wins"] = state.get("wins", 0) + 1
-                state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
-                send_telegram(f"🎯 <b>TP HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n+${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
-            else:
-                state["losses"] = state.get("losses", 0) + 1
-                state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
-                send_telegram(f"🛑 <b>SL HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
+        entry = last["price"]
+        side = last["side"]
+        qty = last.get("qty", 0.08)
+        pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
+        pnl_usd = pnl_pct / 100 * qty * entry
+        if pnl_pct > 0:
+            state["wins"] = state.get("wins", 0) + 1
+            state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
+            send_telegram(f"🎯 <b>TP HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n+${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
+        else:
+            state["losses"] = state.get("losses", 0) + 1
+            state["total_pnl"] = state.get("total_pnl", 0) + pnl_usd
+            send_telegram(f"🛑 <b>SL HIT!</b>\nEntry: ${entry:.2f} → ~${price:.2f}\n${pnl_usd:.4f} ({pnl_pct:.2f}%)\nW:{state['wins']} L:{state['losses']} | Total: ${state['total_pnl']:.4f}")
         state["last_position"] = None
         state["be_moved"] = False
         save_state(state)
@@ -299,25 +296,10 @@ def run_cycle():
         entry = float(position["avgPrice"])
         pnl = float(position["unrealisedPnl"])
         qty = float(position["size"])
-        tp = float(position.get("takeProfit", 0))
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
         current_tp = float(position.get("takeProfit", 0))
         be_moved = state.get("be_moved", False)
         updates = []
-
-        # --- CIRCUIT BREAKER: force close if loss >= $5 ---
-        if pnl <= -CIRCUIT_BREAKER_LOSS:
-            result = close_position(side, qty)
-            if result.get("retCode") == 0:
-                state["losses"] = state.get("losses", 0) + 1
-                state["total_pnl"] = state.get("total_pnl", 0) + pnl
-                state["last_position"] = {"price": entry, "side": side, "qty": qty, "manually_closed": True}
-                state["be_moved"] = False
-                save_state(state)
-                send_telegram(f"🚨 <b>CIRCUIT BREAKER</b> — Force closed!\nLoss hit -${CIRCUIT_BREAKER_LOSS}\nEntry: ${entry:.2f} → ${price:.2f}\nPnL: ${pnl:.4f} | W:{state['wins']} L:{state['losses']}")
-            else:
-                send_telegram(f"🚨 Circuit breaker failed to close: {result.get('retMsg')}")
-            return INTERVAL_NO_POSITION
 
         # --- Trailing TP ---
         new_tp = smart_tp(side, price, bb_upper, bb_lower, bb_mid, regime)
@@ -330,15 +312,11 @@ def run_cycle():
             if result.get("retCode") == 0:
                 updates.append(f"TP→${new_tp}")
 
-        # --- Check if price is moving toward TP ---
-        heading_to_tp = is_moving_toward_tp(side, entry, price, tp)
-
         prompt = f"""You are managing an open ETH/USDT perpetual position.
 
 Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
-Price moving toward TP: {heading_to_tp}
 Market Regime: {regime}
 Breakeven SL already moved: {be_moved}
 
@@ -350,12 +328,11 @@ Technical Indicators:
 - ATR(14): {atr}
 - Fear & Greed: {fear_greed}
 
-Rules — follow strictly:
-- CLOSE only if price is moving AWAY from TP and reversal is confirmed by multiple indicators
-- CLOSE_EARLY only if ALL of these are true: PnL >= ${MIN_EARLY_PROFIT}, price is moving AWAY from TP, AND 60-70%+ reversal probability confirmed by RSI + MACD + BB together
-- DO NOT close early if price is still moving toward TP — let it run
-- HOLD if price is moving toward TP or trend still confirms direction
-- MOVE_BE only when profit is clear, momentum still strong, not too early
+Rules:
+- CLOSE if RSI reversing, MACD crosses against position, or price hits BB extreme
+- CLOSE_EARLY if PnL >= ${MIN_EARLY_PROFIT} AND you see 60-70%+ chance of temporary reversal — protect the profit
+- HOLD if trend and momentum still confirm direction
+- MOVE_BE only when position is clearly profitable AND momentum is still strong AND it is the right time — not too early, not too late
 
 Respond in this exact format:
 DECISION: HOLD or CLOSE or CLOSE_EARLY or MOVE_BE
@@ -367,16 +344,6 @@ REASON: (2 sentences max)"""
             if line.startswith("DECISION:"):
                 decision = line.replace("DECISION:", "").strip()
 
-        # --- Enforce minimum profit rule for CLOSE_EARLY ---
-        if decision == "CLOSE_EARLY" and pnl < MIN_EARLY_PROFIT:
-            decision = "HOLD"
-            response += f"\n[Override: PnL ${pnl:.4f} below ${MIN_EARLY_PROFIT} minimum — holding]"
-
-        # --- Enforce: don't close if heading to TP ---
-        if decision in ("CLOSE", "CLOSE_EARLY") and heading_to_tp and pnl > 0:
-            decision = "HOLD"
-            response += "\n[Override: Price heading toward TP — holding]"
-
         if decision in ("CLOSE", "CLOSE_EARLY"):
             result = close_position(side, qty)
             if result.get("retCode") == 0:
@@ -385,7 +352,7 @@ REASON: (2 sentences max)"""
                 else:
                     state["losses"] = state.get("losses", 0) + 1
                 state["total_pnl"] = state.get("total_pnl", 0) + pnl
-                state["last_position"] = {"price": entry, "side": side, "qty": qty, "manually_closed": True}
+                state["last_position"] = None
                 state["be_moved"] = False
                 save_state(state)
                 label = "💰 EARLY EXIT" if decision == "CLOSE_EARLY" else "🔴 CLOSED"
@@ -407,7 +374,7 @@ REASON: (2 sentences max)"""
             update_str = " | " + " | ".join(updates) if updates else ""
             send_telegram(f"🟡 <b>HOLD {side}</b> | ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%){update_str}\nRSI: {rsi} | {regime} | {trend}\n\n{response}")
 
-        state["last_position"] = {"price": entry, "side": side, "qty": qty, "manually_closed": False}
+        state["last_position"] = {"price": entry, "side": side, "qty": qty}
         save_state(state)
         return INTERVAL_IN_POSITION
 
@@ -428,7 +395,7 @@ Technical Indicators:
 - Fear & Greed: {fear_greed}
 - Recent volumes (last 6h): {volumes[-6:]}
 
-Strategy guide:
+Strategy guide based on market regime:
 - TRENDING market: follow the trend, wider SL, larger TP, favor momentum entries
 - SIDEWAYS market: fade extremes, buy near BB lower, sell near BB upper, tighter TP
 
@@ -443,6 +410,8 @@ Entry rules:
 - LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
 - SHORT if RSI > 45, MACD bearish, price below EMA20, downtrend confirmed
 - SKIP if majority of signals conflict
+
+You MUST provide SL, TP, LEVERAGE and QTY.
 
 Respond in this exact format:
 DECISION: LONG or SHORT or SKIP
@@ -486,7 +455,10 @@ QTY: X.XX"""
         if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
             side = "Buy" if decision == "LONG" else "Sell"
 
+            # Clamp qty between 0.08 and 0.14
             qty = max(0.08, min(0.14, claude_qty)) if claude_qty else 0.08
+
+            # Calculate safe leverage
             safe_leverage = calculate_safe_leverage(price, sl, qty)
             if claude_leverage:
                 final_leverage = min(claude_leverage, safe_leverage)
@@ -494,7 +466,7 @@ QTY: X.XX"""
             else:
                 final_leverage = safe_leverage
 
-            # Verify SL 50%+ from liquidation
+            # Verify SL is 50%+ away from liquidation
             for lev in range(final_leverage, 24, -1):
                 liq = liquidation_price(side, price, lev)
                 if side == "Buy":
@@ -508,7 +480,7 @@ QTY: X.XX"""
             set_leverage(final_leverage)
             result = place_order(side, sl, tp, qty)
             if result.get("retCode") == 0:
-                state["last_position"] = {"price": price, "side": side, "qty": qty, "manually_closed": False}
+                state["last_position"] = {"price": price, "side": side, "qty": qty}
                 state["be_moved"] = False
                 save_state(state)
                 send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | {regime}\nQTY: {qty} ETH | Lev: {final_leverage}x | Max loss: ~$5\nSL: ${sl} | TP: ${tp}\nRSI: {rsi} | {trend}\n\n{response}")
@@ -520,7 +492,7 @@ QTY: X.XX"""
         return INTERVAL_NO_POSITION
 
 def main():
-    send_telegram("🤖 <b>ETH Bot Started</b>\n25-45x | 0.08-0.14 ETH | $5 Circuit Breaker | Smart Exit")
+    send_telegram("🤖 <b>ETH Bot Started</b>\n25-45x | 0.08-0.14 ETH | Trend+Sideways | Max $5 Risk | Smart Exit")
     while True:
         try:
             interval = run_cycle()
