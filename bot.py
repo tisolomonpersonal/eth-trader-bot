@@ -11,8 +11,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.14
 LEVERAGE = 25
-INTERVAL_NO_POSITION = 3600   # 1 hour when no trade
-INTERVAL_IN_POSITION = 1800   # 30 mins when in trade
+INTERVAL_NO_POSITION = 3600
+INTERVAL_IN_POSITION = 1800
 STATE_FILE = "/tmp/bot_state.json"
 
 def send_telegram(message):
@@ -304,7 +304,7 @@ REASON: (2 sentences max)"""
                 state["last_position"] = None
                 state["be_moved"] = False
                 save_state(state)
-                send_telegram(f"🔴 <b>CLOSED</b> | ${entry:.2f}→${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%) | W:{state['wins']} L:{state['losses']}\n{response}")
+                send_telegram(f"🔴 <b>CLOSED</b> | ${entry:.2f}→${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%) | W:{state['wins']} L:{state['losses']}\n\n{response}")
             else:
                 send_telegram(f"❌ Close failed: {result.get('retMsg')}")
 
@@ -314,18 +314,16 @@ REASON: (2 sentences max)"""
                 state["be_moved"] = True
                 save_state(state)
                 updates.append(f"SL→BE (${entry:.2f})")
-                send_telegram(f"🔒 <b>SL MOVED TO BREAKEVEN</b> ${entry:.2f}\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n{response}")
+                send_telegram(f"🔒 <b>SL MOVED TO BREAKEVEN</b> ${entry:.2f}\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n\n{response}")
             else:
                 send_telegram(f"❌ BE move failed: {result.get('retMsg')}")
 
         else:
             update_str = " | " + " | ".join(updates) if updates else ""
-            send_telegram(f"🟡 <b>HOLD {side}</b> | ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%){update_str}\nRSI: {rsi} | {trend}")
+            send_telegram(f"🟡 <b>HOLD {side}</b> | ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%){update_str}\nRSI: {rsi} | {trend}\n\n{response}")
 
         state["last_position"] = {"price": entry, "side": side}
         save_state(state)
-
-        # Sleep 30 mins when in position
         return INTERVAL_IN_POSITION
 
     else:
@@ -379,13 +377,12 @@ SL: $X.XX"""
                 state["last_position"] = {"price": price, "side": side}
                 state["be_moved"] = False
                 save_state(state)
-                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n{response}")
+                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n\n{response}")
             else:
                 send_telegram(f"❌ Order failed: {result.get('retMsg')}")
         else:
-            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | RSI: {rsi} | {trend}")
+            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | RSI: {rsi} | {trend}\n\n{response}")
 
-        # Sleep 1 hour when no position
         return INTERVAL_NO_POSITION
 
 def main():
