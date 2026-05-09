@@ -272,6 +272,7 @@ def run_cycle():
     atr = calculate_atr(candles)
     trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
     regime = detect_market_regime(closes, highs, lows, atr, bb_upper, bb_lower)
+    price_vs_bb = "NEAR_UPPER" if price >= bb_mid + (bb_upper - bb_mid) * 0.7 else "NEAR_LOWER" if price <= bb_mid - (bb_mid - bb_lower) * 0.7 else "MID"
 
     # --- Detect TP/SL hit (only if not manually closed) ---
     if state.get("last_position") and not position:
@@ -337,7 +338,7 @@ Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
 Price moving toward TP: {heading_to_tp}
-Market Regime: {regime}
+Market Regime: {regime} | Price vs BB: {price_vs_bb}
 Breakeven SL already moved: {be_moved}
 
 Technical Indicators:
@@ -416,6 +417,7 @@ Time: {now}
 Current price: ${price:.2f}
 24h High: ${max(highs):.2f} | 24h Low: ${min(lows):.2f}
 Market Regime: {regime}
+Price position vs Bollinger Bands: {price_vs_bb}
 
 Technical Indicators:
 - RSI(14): {rsi} (>70 overbought, <30 oversold)
@@ -426,9 +428,21 @@ Technical Indicators:
 - Fear & Greed: {fear_greed}
 - Recent volumes (last 6h): {volumes[-6:]}
 
-Strategy guide:
-- TRENDING market: follow the trend, wider SL, larger TP, favor momentum entries
-- SIDEWAYS market: fade extremes, buy near BB lower, sell near BB upper, tighter TP
+Strategy by market regime:
+TRENDING market:
+  - LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
+  - SHORT if RSI > 50, MACD bearish, price below EMA20, downtrend confirmed
+
+SIDEWAYS market:
+  - SHORT if price NEAR_UPPER BB and downtrend — this is a classic fade short, take it
+  - LONG if price NEAR_LOWER BB and uptrend — this is a classic fade long, take it
+  - SHORT if RSI > 60 and price near BB upper even with mixed signals — fade the extreme
+  - LONG if RSI < 40 and price near BB lower even with mixed signals — fade the extreme
+
+General rules:
+  - 3 out of 5 signals agreeing is enough to enter — do not wait for perfect alignment
+  - SKIP only if you genuinely cannot determine direction with any confidence
+  - Do not SKIP just because one indicator conflicts with others
 
 Risk rules:
 - Max risk per trade: $5.00
@@ -436,11 +450,6 @@ Risk rules:
 - Choose leverage between 25x and 45x so that if SL is hit, loss does not exceed $5.00
 - SL must be at least 50% away from liquidation price
 - SL must be outside BB bands
-
-Entry rules:
-- LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
-- SHORT if RSI > 45, MACD bearish, price below EMA20, downtrend confirmed
-- SKIP if majority of signals conflict
 
 You MUST provide SL, TP, LEVERAGE and QTY.
 
@@ -510,11 +519,11 @@ QTY: X.XX"""
                 state["last_position"] = {"price": price, "side": side, "qty": qty, "manually_closed": False}
                 state["be_moved"] = False
                 save_state(state)
-                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | {regime}\nQTY: {qty} ETH | Lev: {final_leverage}x | Max loss: ~$5\nSL: ${sl} | TP: ${tp}\nRSI: {rsi} | {trend}\n\n{response}")
+                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | {regime} | {price_vs_bb}\nQTY: {qty} ETH | Lev: {final_leverage}x | Max loss: ~$5\nSL: ${sl} | TP: ${tp}\nRSI: {rsi} | {trend}\n\n{response}")
             else:
                 send_telegram(f"❌ Order failed: {result.get('retMsg')}")
         else:
-            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | {regime} | RSI: {rsi} | {trend}\n\n{response}")
+            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | {regime} | {price_vs_bb} | RSI: {rsi} | {trend}\n\n{response}")
 
         return INTERVAL_NO_POSITION
 
