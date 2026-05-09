@@ -1,6 +1,5 @@
 import requests, json, os, time, hmac, hashlib
-import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 import anthropic
 
 # --- CONFIG ---
@@ -217,7 +216,8 @@ def smart_tp(side, price, bb_upper, bb_lower, bb_mid, regime):
         tp = round(bb_mid - (bb_range * multiplier), 2)
         return min(tp, bb_lower)
 
-def is_moving_toward_tp(side, entry, current_price):
+def is_moving_toward_tp(side, entry, current_price, tp):
+    """Check if price is moving toward TP not away from it"""
     if side == "Buy":
         return current_price > entry
     else:
@@ -251,8 +251,6 @@ def ask_claude(prompt, retries=3):
                 raise e
 
 def run_cycle():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
     price = get_price()
     candles = get_candles()
     fear_greed = get_fear_greed()
@@ -263,6 +261,7 @@ def run_cycle():
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
     volumes = [c["volume"] for c in candles]
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     rsi = calculate_rsi(closes)
     macd, signal, histogram = calculate_macd(closes)
@@ -272,11 +271,11 @@ def run_cycle():
     atr = calculate_atr(candles)
     trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
     regime = detect_market_regime(closes, highs, lows, atr, bb_upper, bb_lower)
-    price_vs_bb = "NEAR_UPPER" if price >= bb_mid + (bb_upper - bb_mid) * 0.7 else "NEAR_LOWER" if price <= bb_mid - (bb_mid - bb_lower) * 0.7 else "MID"
 
-    # --- Detect TP/SL hit (only if not manually closed) ---
+    # --- Detect TP/SL hit (only if we didn't manually close) ---
     if state.get("last_position") and not position:
         last = state["last_position"]
+        # Only report if we didn't already report a manual close
         if not last.get("manually_closed", False):
             entry = last["price"]
             side = last["side"]
@@ -300,12 +299,13 @@ def run_cycle():
         entry = float(position["avgPrice"])
         pnl = float(position["unrealisedPnl"])
         qty = float(position["size"])
+        tp = float(position.get("takeProfit", 0))
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
         current_tp = float(position.get("takeProfit", 0))
         be_moved = state.get("be_moved", False)
         updates = []
 
-        # --- CIRCUIT BREAKER ---
+        # --- CIRCUIT BREAKER: force close if loss >= $5 ---
         if pnl <= -CIRCUIT_BREAKER_LOSS:
             result = close_position(side, qty)
             if result.get("retCode") == 0:
@@ -316,7 +316,7 @@ def run_cycle():
                 save_state(state)
                 send_telegram(f"🚨 <b>CIRCUIT BREAKER</b> — Force closed!\nLoss hit -${CIRCUIT_BREAKER_LOSS}\nEntry: ${entry:.2f} → ${price:.2f}\nPnL: ${pnl:.4f} | W:{state['wins']} L:{state['losses']}")
             else:
-                send_telegram(f"🚨 Circuit breaker failed: {result.get('retMsg')}")
+                send_telegram(f"🚨 Circuit breaker failed to close: {result.get('retMsg')}")
             return INTERVAL_NO_POSITION
 
         # --- Trailing TP ---
@@ -330,7 +330,8 @@ def run_cycle():
             if result.get("retCode") == 0:
                 updates.append(f"TP→${new_tp}")
 
-        heading_to_tp = is_moving_toward_tp(side, entry, price)
+        # --- Check if price is moving toward TP ---
+        heading_to_tp = is_moving_toward_tp(side, entry, price, tp)
 
         prompt = f"""You are managing an open ETH/USDT perpetual position.
 
@@ -338,7 +339,7 @@ Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
 Price moving toward TP: {heading_to_tp}
-Market Regime: {regime} | Price vs BB: {price_vs_bb}
+Market Regime: {regime}
 Breakeven SL already moved: {be_moved}
 
 Technical Indicators:
@@ -350,10 +351,10 @@ Technical Indicators:
 - Fear & Greed: {fear_greed}
 
 Rules — follow strictly:
-- CLOSE only if price is moving AWAY from TP and reversal confirmed by multiple indicators
-- CLOSE_EARLY only if ALL true: PnL >= ${MIN_EARLY_PROFIT}, price moving AWAY from TP, AND 60-70%+ reversal probability confirmed by RSI + MACD + BB together
+- CLOSE only if price is moving AWAY from TP and reversal is confirmed by multiple indicators
+- CLOSE_EARLY only if ALL of these are true: PnL >= ${MIN_EARLY_PROFIT}, price is moving AWAY from TP, AND 60-70%+ reversal probability confirmed by RSI + MACD + BB together
 - DO NOT close early if price is still moving toward TP — let it run
-- HOLD if price moving toward TP or trend still confirms direction
+- HOLD if price is moving toward TP or trend still confirms direction
 - MOVE_BE only when profit is clear, momentum still strong, not too early
 
 Respond in this exact format:
@@ -366,12 +367,12 @@ REASON: (2 sentences max)"""
             if line.startswith("DECISION:"):
                 decision = line.replace("DECISION:", "").strip()
 
-        # --- Enforce min profit for CLOSE_EARLY ---
+        # --- Enforce minimum profit rule for CLOSE_EARLY ---
         if decision == "CLOSE_EARLY" and pnl < MIN_EARLY_PROFIT:
             decision = "HOLD"
             response += f"\n[Override: PnL ${pnl:.4f} below ${MIN_EARLY_PROFIT} minimum — holding]"
 
-        # --- Enforce: don't close if heading to TP with profit ---
+        # --- Enforce: don't close if heading to TP ---
         if decision in ("CLOSE", "CLOSE_EARLY") and heading_to_tp and pnl > 0:
             decision = "HOLD"
             response += "\n[Override: Price heading toward TP — holding]"
@@ -417,7 +418,6 @@ Time: {now}
 Current price: ${price:.2f}
 24h High: ${max(highs):.2f} | 24h Low: ${min(lows):.2f}
 Market Regime: {regime}
-Price position vs Bollinger Bands: {price_vs_bb}
 
 Technical Indicators:
 - RSI(14): {rsi} (>70 overbought, <30 oversold)
@@ -428,21 +428,9 @@ Technical Indicators:
 - Fear & Greed: {fear_greed}
 - Recent volumes (last 6h): {volumes[-6:]}
 
-Strategy by market regime:
-TRENDING market:
-  - LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
-  - SHORT if RSI > 50, MACD bearish, price below EMA20, downtrend confirmed
-
-SIDEWAYS market:
-  - SHORT if price NEAR_UPPER BB and downtrend — this is a classic fade short, take it
-  - LONG if price NEAR_LOWER BB and uptrend — this is a classic fade long, take it
-  - SHORT if RSI > 60 and price near BB upper even with mixed signals — fade the extreme
-  - LONG if RSI < 40 and price near BB lower even with mixed signals — fade the extreme
-
-General rules:
-  - 3 out of 5 signals agreeing is enough to enter — do not wait for perfect alignment
-  - SKIP only if you genuinely cannot determine direction with any confidence
-  - Do not SKIP just because one indicator conflicts with others
+Strategy guide:
+- TRENDING market: follow the trend, wider SL, larger TP, favor momentum entries
+- SIDEWAYS market: fade extremes, buy near BB lower, sell near BB upper, tighter TP
 
 Risk rules:
 - Max risk per trade: $5.00
@@ -451,7 +439,10 @@ Risk rules:
 - SL must be at least 50% away from liquidation price
 - SL must be outside BB bands
 
-You MUST provide SL, TP, LEVERAGE and QTY.
+Entry rules:
+- LONG if RSI < 65, MACD bullish, price above EMA20, uptrend confirmed
+- SHORT if RSI > 45, MACD bearish, price below EMA20, downtrend confirmed
+- SKIP if majority of signals conflict
 
 Respond in this exact format:
 DECISION: LONG or SHORT or SKIP
@@ -494,6 +485,7 @@ QTY: X.XX"""
 
         if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
             side = "Buy" if decision == "LONG" else "Sell"
+
             qty = max(0.08, min(0.14, claude_qty)) if claude_qty else 0.08
             safe_leverage = calculate_safe_leverage(price, sl, qty)
             if claude_leverage:
@@ -519,11 +511,11 @@ QTY: X.XX"""
                 state["last_position"] = {"price": price, "side": side, "qty": qty, "manually_closed": False}
                 state["be_moved"] = False
                 save_state(state)
-                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | {regime} | {price_vs_bb}\nQTY: {qty} ETH | Lev: {final_leverage}x | Max loss: ~$5\nSL: ${sl} | TP: ${tp}\nRSI: {rsi} | {trend}\n\n{response}")
+                send_telegram(f"🚀 <b>{decision}</b> | ${price:.2f} | {regime}\nQTY: {qty} ETH | Lev: {final_leverage}x | Max loss: ~$5\nSL: ${sl} | TP: ${tp}\nRSI: {rsi} | {trend}\n\n{response}")
             else:
                 send_telegram(f"❌ Order failed: {result.get('retMsg')}")
         else:
-            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | {regime} | {price_vs_bb} | RSI: {rsi} | {trend}\n\n{response}")
+            send_telegram(f"⏭ <b>SKIP</b> | ${price:.2f} | {regime} | RSI: {rsi} | {trend}\n\n{response}")
 
         return INTERVAL_NO_POSITION
 
@@ -533,10 +525,8 @@ def main():
         try:
             interval = run_cycle()
         except Exception as e:
-            err = f"⚠️ Error: {type(e).__name__}: {str(e)}"
-            send_telegram(err)
-            print(err)
-            print(traceback.format_exc())
+            send_telegram(f"⚠️ Error: {str(e)}")
+            print(f"Error: {e}")
             interval = INTERVAL_NO_POSITION
         time.sleep(interval)
 
