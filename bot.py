@@ -1,5 +1,6 @@
 import requests, json, os, time, hmac, hashlib
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 import anthropic
 
 # --- CONFIG ---
@@ -152,16 +153,32 @@ def calculate_bollinger(closes, period=20):
     lower = round(sma - 2 * std, 2)
     return round(sma, 2), upper, lower
 
-def ask_claude(prompt):
+def is_moving_toward_tp(side, entry, price):
+    if side == "Buy":
+        return price > entry
+    else:
+        return price < entry
+
+def ask_claude(prompt, retries=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+    for attempt in range(retries):
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return message.content[0].text
+        except Exception as e:
+            if "overloaded" in str(e).lower() and attempt < retries - 1:
+                send_telegram(f"⏳ Anthropic overloaded, retrying in 30s... (attempt {attempt+1}/{retries})")
+                time.sleep(30)
+            else:
+                raise e
 
 def run_cycle():
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     price = get_price()
     candles = get_candles()
     fear_greed = get_fear_greed()
@@ -171,7 +188,6 @@ def run_cycle():
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
     volumes = [c["volume"] for c in candles]
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     rsi = calculate_rsi(closes)
     macd, signal, histogram = calculate_macd(closes)
@@ -185,12 +201,14 @@ def run_cycle():
         entry = float(position["avgPrice"])
         pnl = float(position["unrealisedPnl"])
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
+        heading_to_tp = is_moving_toward_tp(side, entry, price)
 
         prompt = f"""You are managing an open ETH/USDT perpetual position.
 
 Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
+Price moving toward TP: {heading_to_tp}
 
 Technical Indicators:
 - RSI(14): {rsi} (>70 overbought, <30 oversold)
@@ -199,9 +217,11 @@ Technical Indicators:
 - EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
 - Fear & Greed: {fear_greed}
 
-Make your decision based purely on technical signals.
-- CLOSE if RSI is reversing, MACD crosses against position, or price hits BB extreme
-- HOLD if trend and momentum still confirm direction
+Rules — follow strictly:
+- HOLD if price is moving toward TP — do NOT close, let it reach TP
+- HOLD if trend still confirms direction
+- CLOSE only if price is clearly moving AWAY from TP AND multiple indicators confirm reversal
+- Never close a profitable trade that is still heading toward TP
 
 Respond in this exact format:
 DECISION: HOLD or CLOSE
@@ -212,6 +232,11 @@ REASON: (2 sentences max)"""
         for line in response.strip().split("\n"):
             if line.startswith("DECISION:"):
                 decision = line.replace("DECISION:", "").strip()
+
+        # Hard override — never close if heading to TP with profit
+        if decision == "CLOSE" and heading_to_tp and pnl > 0:
+            decision = "HOLD"
+            response += "\n[Override: Price heading toward TP — holding]"
 
         if decision == "CLOSE":
             qty = float(position["size"])
@@ -285,13 +310,15 @@ TP: $X.XX"""
             send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.08 ETH | Hourly | RSI + MACD + BB")
+    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.14 ETH | Hourly | RSI + MACD + BB")
     while True:
         try:
             run_cycle()
         except Exception as e:
-            send_telegram(f"⚠️ Error: {str(e)}")
-            print(f"Error: {e}")
+            err = f"⚠️ Error: {type(e).__name__}: {str(e)}"
+            send_telegram(err)
+            print(err)
+            print(traceback.format_exc())
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
