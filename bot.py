@@ -100,22 +100,6 @@ def place_order(side, sl, tp):
     r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
-def close_position(side, qty):
-    close_side = "Sell" if side == "Buy" else "Buy"
-    position_idx = 1 if side == "Buy" else 2
-    params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "side": close_side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "positionIdx": position_idx,
-        "reduceOnly": "true"
-    }
-    headers, body = sign_request(params)
-    r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
-    return r.json()
-
 def calculate_rsi(closes, period=14):
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -152,12 +136,6 @@ def calculate_bollinger(closes, period=20):
     upper = round(sma + 2 * std, 2)
     lower = round(sma - 2 * std, 2)
     return round(sma, 2), upper, lower
-
-def is_moving_toward_tp(side, entry, price):
-    if side == "Buy":
-        return price > entry
-    else:
-        return price < entry
 
 def ask_claude(prompt, retries=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -196,60 +174,17 @@ def run_cycle():
     ema50 = calculate_ema(closes, 50)
     trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
 
+    # If already in a position, skip — let Bybit SL/TP handle it
     if position:
         side = position["side"]
         entry = float(position["avgPrice"])
         pnl = float(position["unrealisedPnl"])
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
-        heading_to_tp = is_moving_toward_tp(side, entry, price)
+        send_telegram(f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\nEntry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\nWaiting for SL/TP...")
+        return
 
-        prompt = f"""You are managing an open ETH/USDT perpetual position.
-
-Time: {now}
-Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
-Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
-Price moving toward TP: {heading_to_tp}
-
-Technical Indicators:
-- RSI(14): {rsi} (>70 overbought, <30 oversold)
-- MACD: {macd} | Signal: {signal} | Histogram: {histogram}
-- Bollinger Bands: Upper ${bb_upper} | Mid ${bb_mid} | Lower ${bb_lower}
-- EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
-- Fear & Greed: {fear_greed}
-
-Rules — follow strictly:
-- HOLD if price is moving toward TP — do NOT close, let it reach TP
-- HOLD if trend still confirms direction
-- CLOSE only if price is clearly moving AWAY from TP AND multiple indicators confirm reversal
-- Never close a profitable trade that is still heading toward TP
-
-Respond in this exact format:
-DECISION: HOLD or CLOSE
-REASON: (2 sentences max)"""
-
-        response = ask_claude(prompt)
-        decision = "HOLD"
-        for line in response.strip().split("\n"):
-            if line.startswith("DECISION:"):
-                decision = line.replace("DECISION:", "").strip()
-
-        # Hard override — never close if heading to TP with profit
-        if decision == "CLOSE" and heading_to_tp and pnl > 0:
-            decision = "HOLD"
-            response += "\n[Override: Price heading toward TP — holding]"
-
-        if decision == "CLOSE":
-            qty = float(position["size"])
-            result = close_position(side, qty)
-            if result.get("retCode") == 0:
-                send_telegram(f"🔴 <b>POSITION CLOSED</b>\nEntry: ${entry:.2f} → Exit: ${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
-            else:
-                send_telegram(f"❌ Close failed: {result.get('retMsg')}")
-        else:
-            send_telegram(f"🟡 <b>HOLDING {side}</b>\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
-
-    else:
-        prompt = f"""You are a professional crypto trader. Analyze ETH/USDT perpetual and decide to go LONG, SHORT, or SKIP.
+    # No position — ask Claude to enter
+    prompt = f"""You are a professional crypto trader. Analyze ETH/USDT perpetual and decide to go LONG, SHORT, or SKIP.
 
 Time: {now}
 Current price: ${price:.2f}
@@ -277,40 +212,40 @@ REASON: (2 sentences max)
 SL: $X.XX
 TP: $X.XX"""
 
-        response = ask_claude(prompt)
-        lines = response.strip().split("\n")
-        decision = "SKIP"
-        sl = tp = 0.0
+    response = ask_claude(prompt)
+    lines = response.strip().split("\n")
+    decision = "SKIP"
+    sl = tp = 0.0
 
-        for line in lines:
-            if line.startswith("DECISION:"):
-                decision = line.replace("DECISION:", "").strip()
-            elif line.startswith("SL:"):
-                try:
-                    sl = float(line.replace("SL:", "").replace("$", "").strip())
-                except:
-                    pass
-            elif line.startswith("TP:"):
-                try:
-                    tp = float(line.replace("TP:", "").replace("$", "").strip())
-                except:
-                    pass
+    for line in lines:
+        if line.startswith("DECISION:"):
+            decision = line.replace("DECISION:", "").strip()
+        elif line.startswith("SL:"):
+            try:
+                sl = float(line.replace("SL:", "").replace("$", "").strip())
+            except:
+                pass
+        elif line.startswith("TP:"):
+            try:
+                tp = float(line.replace("TP:", "").replace("$", "").strip())
+            except:
+                pass
 
-        if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
-            side = "Buy" if decision == "LONG" else "Sell"
-            set_leverage()
-            result = place_order(side, sl, tp)
-            if result.get("retCode") == 0:
-                send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n\n{response}")
-            else:
-                send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
-        elif decision == "SKIP":
-            send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\nRSI: {rsi} | {trend}\n{response}")
+    if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
+        side = "Buy" if decision == "LONG" else "Sell"
+        set_leverage()
+        result = place_order(side, sl, tp)
+        if result.get("retCode") == 0:
+            send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n\n{response}")
         else:
-            send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
+            send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
+    elif decision == "SKIP":
+        send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\nRSI: {rsi} | {trend}\n{response}")
+    else:
+        send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.14 ETH | Hourly | RSI + MACD + BB")
+    send_telegram("🤖 <b>ETH Bot Started</b>\n45x | 0.14 ETH | Hourly | SL/TP by Bybit only")
     while True:
         try:
             run_cycle()
