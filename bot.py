@@ -51,9 +51,9 @@ def get_price():
     return float(r.json()["result"]["list"][0]["lastPrice"])
 
 def get_candles():
-    r = requests.get(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval=60&limit=24", timeout=10)
+    r = requests.get(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval=60&limit=100", timeout=10)
     candles = r.json()["result"]["list"]
-    return [{"open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]} for c in reversed(candles)]
+    return [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])} for c in reversed(candles)]
 
 def get_fear_greed():
     try:
@@ -115,6 +115,43 @@ def close_position(side, qty):
     r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
+def calculate_rsi(closes, period=14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+def calculate_ema(closes, period):
+    k = 2 / (period + 1)
+    ema = closes[0]
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
+
+def calculate_macd(closes):
+    ema12 = calculate_ema(closes, 12)
+    ema26 = calculate_ema(closes, 26)
+    macd_line = round(ema12 - ema26, 4)
+    signal = round(macd_line * 0.9, 4)
+    histogram = round(macd_line - signal, 4)
+    return macd_line, signal, histogram
+
+def calculate_bollinger(closes, period=20):
+    recent = closes[-period:]
+    sma = sum(recent) / period
+    variance = sum((p - sma) ** 2 for p in recent) / period
+    std = variance ** 0.5
+    upper = round(sma + 2 * std, 2)
+    lower = round(sma - 2 * std, 2)
+    return round(sma, 2), upper, lower
+
 def ask_claude(prompt):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
@@ -130,11 +167,18 @@ def run_cycle():
     fear_greed = get_fear_greed()
     position = get_position()
 
-    closes = [float(c["close"]) for c in candles]
-    highs = [float(c["high"]) for c in candles]
-    lows = [float(c["low"]) for c in candles]
-    volumes = [float(c["volume"]) for c in candles]
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    volumes = [c["volume"] for c in candles]
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    rsi = calculate_rsi(closes)
+    macd, signal, histogram = calculate_macd(closes)
+    bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    trend = "UPTREND" if ema20 > ema50 else "DOWNTREND"
 
     if position:
         side = position["side"]
@@ -142,17 +186,22 @@ def run_cycle():
         pnl = float(position["unrealisedPnl"])
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
 
-        prompt = f"""You are managing an open ETH/USDT perpetual position at 45x leverage.
+        prompt = f"""You are managing an open ETH/USDT perpetual position.
 
 Time: {now}
 Position: {side} | Entry: ${entry:.2f} | Current: ${price:.2f}
 Unrealised PnL: ${pnl:.4f} ({pnl_pct:.2f}%)
-Fear & Greed: {fear_greed}
-Recent closes: {closes[-6:]}
 
-Should you HOLD or CLOSE this position?
-- CLOSE if momentum is reversing or risk is too high
-- HOLD if trend is still strong
+Technical Indicators:
+- RSI(14): {rsi} (>70 overbought, <30 oversold)
+- MACD: {macd} | Signal: {signal} | Histogram: {histogram}
+- Bollinger Bands: Upper ${bb_upper} | Mid ${bb_mid} | Lower ${bb_lower}
+- EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
+- Fear & Greed: {fear_greed}
+
+Make your decision based purely on technical signals.
+- CLOSE if RSI is reversing, MACD crosses against position, or price hits BB extreme
+- HOLD if trend and momentum still confirm direction
 
 Respond in this exact format:
 DECISION: HOLD or CLOSE
@@ -168,26 +217,34 @@ REASON: (2 sentences max)"""
             qty = float(position["size"])
             result = close_position(side, qty)
             if result.get("retCode") == 0:
-                send_telegram(f"🔴 <b>POSITION CLOSED</b>\nEntry: ${entry:.2f} → Exit: ${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n\n{response}")
+                send_telegram(f"🔴 <b>POSITION CLOSED</b>\nEntry: ${entry:.2f} → Exit: ${price:.2f}\nPnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
             else:
                 send_telegram(f"❌ Close failed: {result.get('retMsg')}")
         else:
-            send_telegram(f"🟡 <b>HOLDING {side}</b>\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n\n{response}")
+            send_telegram(f"🟡 <b>HOLDING {side}</b>\nPrice: ${price:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nRSI: {rsi} | {trend}\n\n{response}")
 
     else:
         prompt = f"""You are a professional crypto trader. Analyze ETH/USDT perpetual and decide to go LONG, SHORT, or SKIP.
 
 Time: {now}
 Current price: ${price:.2f}
-Fear & Greed: {fear_greed}
 24h High: ${max(highs):.2f} | 24h Low: ${min(lows):.2f}
-Recent closes (last 6h): {closes[-6:]}
-Recent volumes (last 6h): {volumes[-6:]}
 
-Leverage: 45x — liquidation is ~2.2% against you. Be conservative.
-Trade size: 0.08 ETH
+Technical Indicators:
+- RSI(14): {rsi} (>70 overbought, <30 oversold)
+- MACD: {macd} | Signal: {signal} | Histogram: {histogram}
+- Bollinger Bands: Upper ${bb_upper} | Mid ${bb_mid} | Lower ${bb_lower}
+- EMA20: ${ema20} | EMA50: ${ema50} | Trend: {trend}
+- Fear & Greed: {fear_greed}
+- Recent volumes (last 6h): {volumes[-6:]}
 
-You MUST provide SL and TP prices (not percentages).
+Make your decision based purely on technical signals.
+- LONG if RSI < 50, MACD bullish, price above EMA20, uptrend confirmed
+- SHORT if RSI > 60, MACD bearish, price below EMA20, downtrend confirmed
+- SKIP if signals conflict or market is unclear
+- SL must be outside BB bands, TP at next BB band level
+
+You MUST provide SL and TP as exact prices.
 
 Respond in this exact format:
 DECISION: LONG or SHORT or SKIP
@@ -219,16 +276,16 @@ TP: $X.XX"""
             set_leverage()
             result = place_order(side, sl, tp)
             if result.get("retCode") == 0:
-                send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\n\n{response}")
+                send_telegram(f"🚀 <b>{decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\nRSI: {rsi} | MACD: {macd} | {trend}\n\n{response}")
             else:
                 send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
         elif decision == "SKIP":
-            send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\n{response}")
+            send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\nRSI: {rsi} | {trend}\n{response}")
         else:
             send_telegram(f"⚠️ Claude gave incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.08 ETH | Hourly checks")
+    send_telegram("🤖 <b>ETH Derivatives Bot Started</b>\n45x Leverage | 0.08 ETH | Hourly | RSI + MACD + BB")
     while True:
         try:
             run_cycle()
