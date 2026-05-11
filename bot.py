@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.04
 LEVERAGE = 45
-CHECK_INTERVAL = 600  # 10 minutes
+CHECK_INTERVAL = 600
 
 def send_telegram(message):
     try:
@@ -53,7 +53,10 @@ def get_price():
 
 def get_candles(interval, limit):
     r = requests.get(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=10)
-    candles = r.json()["result"]["list"]
+    data = r.json()
+    if not data.get("result") or not data["result"].get("list"):
+        return []
+    candles = data["result"]["list"]
     return [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])} for c in reversed(candles)]
 
 def get_fear_greed():
@@ -101,6 +104,8 @@ def place_order(side, sl, tp):
     return r.json()
 
 def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
@@ -114,6 +119,8 @@ def calculate_rsi(closes, period=14):
     return round(100 - (100 / (1 + rs)), 2)
 
 def calculate_ema(closes, period):
+    if len(closes) < period:
+        return closes[-1] if closes else 0
     k = 2 / (period + 1)
     ema = closes[0]
     for price in closes[1:]:
@@ -121,6 +128,8 @@ def calculate_ema(closes, period):
     return round(ema, 2)
 
 def calculate_macd(closes):
+    if len(closes) < 26:
+        return 0, 0, 0
     ema12 = calculate_ema(closes, 12)
     ema26 = calculate_ema(closes, 26)
     macd_line = round(ema12 - ema26, 4)
@@ -129,6 +138,8 @@ def calculate_macd(closes):
     return macd_line, signal, histogram
 
 def calculate_bollinger(closes, period=20):
+    if len(closes) < period:
+        return closes[-1], closes[-1], closes[-1]
     recent = closes[-period:]
     sma = sum(recent) / period
     variance = sum((p - sma) ** 2 for p in recent) / period
@@ -138,6 +149,8 @@ def calculate_bollinger(closes, period=20):
     return round(sma, 2), upper, lower
 
 def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return 0
     trs = []
     for i in range(1, len(candles)):
         high = candles[i]["high"]
@@ -154,7 +167,6 @@ def get_liquidation_price(side, entry, leverage):
         return round(entry * (1 + 1 / leverage), 2)
 
 def sl_is_safe(side, entry, sl, leverage):
-    """SL must simply be on correct side of liquidation with 1% buffer"""
     liq = get_liquidation_price(side, entry, leverage)
     if side == "Buy":
         return sl > liq * 1.01
@@ -187,6 +199,11 @@ def run_cycle():
     fear_greed = get_fear_greed()
     position = get_position()
 
+    # Safety check — ensure enough candles
+    if len(candles_10m) < 30 or len(candles_1h) < 20:
+        send_telegram(f"⚠️ Not enough candle data, skipping cycle.")
+        return
+
     # --- 10M indicators ---
     closes_10m = [c["close"] for c in candles_10m]
     highs_10m = [c["high"] for c in candles_10m]
@@ -201,14 +218,13 @@ def run_cycle():
     atr_10m = calculate_atr(candles_10m)
     trend_10m = "UPTREND" if ema8_10m > ema21_10m else "DOWNTREND"
 
-    # Recent swing points for Elliott Wave on 10m
     recent_highs_10m = sorted(highs_10m[-30:], reverse=True)[:5]
     recent_lows_10m = sorted(lows_10m[-30:])[:5]
-    avg_volume_10m = round(sum(volumes_10m[-20:]) / 20, 2)
-    last_volume_10m = volumes_10m[-1]
-    volume_surge = round(last_volume_10m / avg_volume_10m, 2)
+    avg_volume_10m = sum(volumes_10m[-20:]) / 20 if len(volumes_10m) >= 20 else sum(volumes_10m) / len(volumes_10m)
+    last_volume_10m = volumes_10m[-1] if volumes_10m else 0
+    volume_surge = round(last_volume_10m / avg_volume_10m, 2) if avg_volume_10m > 0 else 0
 
-    # --- 1H indicators (trend filter) ---
+    # --- 1H indicators ---
     closes_1h = [c["close"] for c in candles_1h]
     ema20_1h = calculate_ema(closes_1h, 20)
     ema50_1h = calculate_ema(closes_1h, 50)
@@ -269,7 +285,7 @@ STEP 1 — Elliott Wave on 10M:
 STEP 2 — Momentum Confirmation (all must align):
 - EMA8 crossing above/below EMA21 in trade direction
 - MACD histogram turning positive (LONG) or negative (SHORT)
-- RSI between 40-70 for LONG, 30-60 for SHORT (momentum, not extreme)
+- RSI between 40-70 for LONG, 30-60 for SHORT
 - Volume surge > 1.2x on entry candle
 
 STEP 3 — Trend Filter:
@@ -277,8 +293,8 @@ STEP 3 — Trend Filter:
 - Never trade against 1H trend
 
 STEP 4 — Scalp SL/TP:
-- SL: just below/above last 10M swing low/high (tight — 0.2% to 0.5% from entry)
-- TP: 0.5% to 1.5% from entry (Wave 3 projection using 1.618 x Wave 1)
+- SL: just below/above last 10M swing low/high (0.2% to 0.5% from entry)
+- TP: 0.5% to 1.5% from entry (Wave 3 = 1.618 x Wave 1)
 - SL must be above liquidation + 1% buffer
 - Risk:Reward must be at least 1:2
 
@@ -338,18 +354,16 @@ TP: $X.XX"""
     if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
         side = "Buy" if decision == "LONG" else "Sell"
 
-        # Liquidation safety check
         if not sl_is_safe(side, price, sl, LEVERAGE):
             liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liquidation ${liq}\nSkipping this trade.")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liquidation ${liq}\nSkipping.")
             return
 
-        # Risk:Reward check
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
         if rr < 2:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R ratio {rr} below 1:2 minimum\nSkipping this trade.")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1:2 minimum\nSkipping.")
             return
 
         set_leverage()
