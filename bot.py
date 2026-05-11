@@ -52,12 +52,21 @@ def get_price():
     return float(r.json()["result"]["list"][0]["lastPrice"])
 
 def get_candles(interval, limit):
-    r = requests.get(f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=10)
-    data = r.json()
-    if not data.get("result") or not data["result"].get("list"):
+    try:
+        r = requests.get(
+            f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={interval}&limit={limit}",
+            timeout=10
+        )
+        data = r.json()
+        if not data.get("result") or not data["result"].get("list"):
+            return []
+        candles = data["result"]["list"]
+        if len(candles) == 0:
+            return []
+        return [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])} for c in reversed(candles)]
+    except Exception as e:
+        print(f"Candle fetch error ({interval}): {e}")
         return []
-    candles = data["result"]["list"]
-    return [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])} for c in reversed(candles)]
 
 def get_fear_greed():
     try:
@@ -139,7 +148,8 @@ def calculate_macd(closes):
 
 def calculate_bollinger(closes, period=20):
     if len(closes) < period:
-        return closes[-1], closes[-1], closes[-1]
+        c = closes[-1] if closes else 0
+        return c, c, c
     recent = closes[-period:]
     sma = sum(recent) / period
     variance = sum((p - sma) ** 2 for p in recent) / period
@@ -194,14 +204,21 @@ def run_cycle():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     price = get_price()
-    candles_10m = get_candles("10", 100)
-    candles_1h = get_candles("60", 50)
     fear_greed = get_fear_greed()
     position = get_position()
 
-    # Safety check — ensure enough candles
+    # Fetch candles with debug info
+    candles_10m = get_candles("10", 200)
+    candles_1h = get_candles("60", 50)
+
+    # Safety check with debug counts
     if len(candles_10m) < 30 or len(candles_1h) < 20:
-        send_telegram(f"⚠️ Not enough candle data, skipping cycle.")
+        send_telegram(
+            f"⚠️ Not enough candle data\n"
+            f"10M candles: {len(candles_10m)}\n"
+            f"1H candles: {len(candles_1h)}\n"
+            f"Retrying next cycle..."
+        )
         return
 
     # --- 10M indicators ---
@@ -243,7 +260,13 @@ def run_cycle():
         pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
         liq = get_liquidation_price(side, entry, LEVERAGE)
         liq_dist = round(abs(price - liq) / price * 100, 2)
-        send_telegram(f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\nEntry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\nLiq: ${liq} ({liq_dist}% away)\n10M: {trend_10m} | 1H: {trend_1h}\nWaiting for SL/TP...")
+        send_telegram(
+            f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\n"
+            f"Entry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n"
+            f"Liq: ${liq} ({liq_dist}% away)\n"
+            f"10M: {trend_10m} | 1H: {trend_1h}\n"
+            f"Waiting for SL/TP..."
+        )
         return
 
     prompt = f"""You are an expert Elliott Wave scalper trading ETH/USDT perpetual on 10-minute charts.
@@ -282,7 +305,7 @@ STEP 1 — Elliott Wave on 10M:
 - Wave 2 retracement: 38-62% of Wave 1 (Fibonacci)
 - ONLY enter at START of Wave 3
 
-STEP 2 — Momentum Confirmation (all must align):
+STEP 2 — Momentum Confirmation:
 - EMA8 crossing above/below EMA21 in trade direction
 - MACD histogram turning positive (LONG) or negative (SHORT)
 - RSI between 40-70 for LONG, 30-60 for SHORT
@@ -370,12 +393,24 @@ TP: $X.XX"""
         result = place_order(side, sl, tp)
         if result.get("retCode") == 0:
             liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(f"🌊 <b>WAVE 3 SCALP {decision}</b>\nPrice: ${price:.2f} | SL: ${sl} | TP: ${tp}\nR:R: 1:{rr} | Liq: ${liq}\nMomentum: {momentum} | Vol surge: {volume_surge}x\n1H: {trend_1h} | 10M: {trend_10m}\n\n{wave_count}\n\n{response}")
+            send_telegram(
+                f"🌊 <b>WAVE 3 SCALP {decision}</b>\n"
+                f"Price: ${price:.2f} | SL: ${sl} | TP: ${tp}\n"
+                f"R:R: 1:{rr} | Liq: ${liq}\n"
+                f"Momentum: {momentum} | Vol surge: {volume_surge}x\n"
+                f"1H: {trend_1h} | 10M: {trend_10m}\n\n"
+                f"{wave_count}\n\n{response}"
+            )
         else:
             send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
 
     elif decision == "SKIP":
-        send_telegram(f"⏭ <b>SKIP</b> — ${price:.2f}\n1H: {trend_1h} | 10M: {trend_10m}\nWave 3: {wave3_confirmed} | Momentum: {momentum}\n{response}")
+        send_telegram(
+            f"⏭ <b>SKIP</b> — ${price:.2f}\n"
+            f"1H: {trend_1h} | 10M: {trend_10m}\n"
+            f"Wave 3: {wave3_confirmed} | Momentum: {momentum}\n"
+            f"{response}"
+        )
     else:
         send_telegram(f"⚠️ Incomplete data, skipping.\n{response}")
 
