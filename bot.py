@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.04
 LEVERAGE = 45
-CHECK_INTERVAL = 3600
+CHECK_INTERVAL = 1800
 MIN_LIQ_BUFFER = 0.30  # SL must be at least 30% away from liquidation
 
 def send_telegram(message):
