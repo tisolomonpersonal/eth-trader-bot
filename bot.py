@@ -207,39 +207,39 @@ def run_cycle():
     fear_greed = get_fear_greed()
     position = get_position()
 
-    # Fetch candles with debug info
-    candles_10m = get_candles("10", 200)
+    # Fetch candles — Bybit supports: 1,3,5,15,30,60,120,240,360,720,D,W,M
+    candles_15m = get_candles("15", 200)
     candles_1h = get_candles("60", 50)
 
     # Safety check with debug counts
-    if len(candles_10m) < 30 or len(candles_1h) < 20:
+    if len(candles_15m) < 30 or len(candles_1h) < 20:
         send_telegram(
             f"⚠️ Not enough candle data\n"
-            f"10M candles: {len(candles_10m)}\n"
+            f"15M candles: {len(candles_15m)}\n"
             f"1H candles: {len(candles_1h)}\n"
             f"Retrying next cycle..."
         )
         return
 
-    # --- 10M indicators ---
-    closes_10m = [c["close"] for c in candles_10m]
-    highs_10m = [c["high"] for c in candles_10m]
-    lows_10m = [c["low"] for c in candles_10m]
-    volumes_10m = [c["volume"] for c in candles_10m]
-    rsi_10m = calculate_rsi(closes_10m)
-    macd_10m, signal_10m, hist_10m = calculate_macd(closes_10m)
-    bb_mid_10m, bb_upper_10m, bb_lower_10m = calculate_bollinger(closes_10m)
-    ema8_10m = calculate_ema(closes_10m, 8)
-    ema21_10m = calculate_ema(closes_10m, 21)
-    ema50_10m = calculate_ema(closes_10m, 50)
-    atr_10m = calculate_atr(candles_10m)
-    trend_10m = "UPTREND" if ema8_10m > ema21_10m else "DOWNTREND"
+    # --- 15M indicators ---
+    closes_15m = [c["close"] for c in candles_15m]
+    highs_15m = [c["high"] for c in candles_15m]
+    lows_15m = [c["low"] for c in candles_15m]
+    volumes_15m = [c["volume"] for c in candles_15m]
+    rsi_15m = calculate_rsi(closes_15m)
+    macd_15m, signal_15m, hist_15m = calculate_macd(closes_15m)
+    bb_mid_15m, bb_upper_15m, bb_lower_15m = calculate_bollinger(closes_15m)
+    ema8_15m = calculate_ema(closes_15m, 8)
+    ema21_15m = calculate_ema(closes_15m, 21)
+    ema50_15m = calculate_ema(closes_15m, 50)
+    atr_15m = calculate_atr(candles_15m)
+    trend_15m = "UPTREND" if ema8_15m > ema21_15m else "DOWNTREND"
 
-    recent_highs_10m = sorted(highs_10m[-30:], reverse=True)[:5]
-    recent_lows_10m = sorted(lows_10m[-30:])[:5]
-    avg_volume_10m = sum(volumes_10m[-20:]) / 20 if len(volumes_10m) >= 20 else sum(volumes_10m) / len(volumes_10m)
-    last_volume_10m = volumes_10m[-1] if volumes_10m else 0
-    volume_surge = round(last_volume_10m / avg_volume_10m, 2) if avg_volume_10m > 0 else 0
+    recent_highs_15m = sorted(highs_15m[-30:], reverse=True)[:5]
+    recent_lows_15m = sorted(lows_15m[-30:])[:5]
+    avg_volume_15m = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else sum(volumes_15m) / len(volumes_15m)
+    last_volume_15m = volumes_15m[-1] if volumes_15m else 0
+    volume_surge = round(last_volume_15m / avg_volume_15m, 2) if avg_volume_15m > 0 else 0
 
     # --- 1H indicators ---
     closes_1h = [c["close"] for c in candles_1h]
@@ -264,12 +264,12 @@ def run_cycle():
             f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\n"
             f"Entry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n"
             f"Liq: ${liq} ({liq_dist}% away)\n"
-            f"10M: {trend_10m} | 1H: {trend_1h}\n"
+            f"15M: {trend_15m} | 1H: {trend_1h}\n"
             f"Waiting for SL/TP..."
         )
         return
 
-    prompt = f"""You are an expert Elliott Wave scalper trading ETH/USDT perpetual on 10-minute charts.
+    prompt = f"""You are an expert Elliott Wave scalper trading ETH/USDT perpetual on 15-minute charts.
 
 Time: {now}
 Current price: ${price:.2f}
@@ -280,18 +280,18 @@ Fear & Greed: {fear_greed}
 - RSI(14): {rsi_1h}
 - EMA20: ${ema20_1h} | EMA50: ${ema50_1h}
 
-=== 10M TIMEFRAME (Scalping Timeframe) ===
-- Trend: {trend_10m}
-- RSI(14): {rsi_10m}
-- MACD: {macd_10m} | Signal: {signal_10m} | Histogram: {hist_10m}
-- Bollinger Bands: Upper ${bb_upper_10m} | Mid ${bb_mid_10m} | Lower ${bb_lower_10m}
-- EMA8: ${ema8_10m} | EMA21: ${ema21_10m} | EMA50: ${ema50_10m}
-- ATR(14): {atr_10m}
+=== 15M TIMEFRAME (Scalping Timeframe) ===
+- Trend: {trend_15m}
+- RSI(14): {rsi_15m}
+- MACD: {macd_15m} | Signal: {signal_15m} | Histogram: {hist_15m}
+- Bollinger Bands: Upper ${bb_upper_15m} | Mid ${bb_mid_15m} | Lower ${bb_lower_15m}
+- EMA8: ${ema8_15m} | EMA21: ${ema21_15m} | EMA50: ${ema50_15m}
+- ATR(14): {atr_15m}
 - Volume surge vs 20-candle avg: {volume_surge}x
-- Recent 10M Swing Highs: {recent_highs_10m}
-- Recent 10M Swing Lows: {recent_lows_10m}
-- Last 15 closes: {closes_10m[-15:]}
-- Last 15 volumes: {volumes_10m[-15:]}
+- Recent 15M Swing Highs: {recent_highs_15m}
+- Recent 15M Swing Lows: {recent_lows_15m}
+- Last 15 closes: {closes_15m[-15:]}
+- Last 15 volumes: {volumes_15m[-15:]}
 
 === LIQUIDATION SAFETY ===
 - LONG liquidation: ${liq_long} → SL must be above ${round(liq_long * 1.01, 2)}
@@ -299,7 +299,7 @@ Fear & Greed: {fear_greed}
 
 === SCALPING STRATEGY ===
 
-STEP 1 — Elliott Wave on 10M:
+STEP 1 — Elliott Wave on 15M:
 - Identify wave structure using swing highs/lows and last 15 closes
 - Wave 3 characteristics: strongest momentum, volume surge > 1.3x, MACD peak
 - Wave 2 retracement: 38-62% of Wave 1 (Fibonacci)
@@ -312,11 +312,11 @@ STEP 2 — Momentum Confirmation:
 - Volume surge > 1.2x on entry candle
 
 STEP 3 — Trend Filter:
-- 1H trend must agree with 10M direction
+- 1H trend must agree with 15M direction
 - Never trade against 1H trend
 
 STEP 4 — Scalp SL/TP:
-- SL: just below/above last 10M swing low/high (0.2% to 0.5% from entry)
+- SL: just below/above last 15M swing low/high (0.2% to 0.5% from entry)
 - TP: 0.5% to 1.5% from entry (Wave 3 = 1.618 x Wave 1)
 - SL must be above liquidation + 1% buffer
 - Risk:Reward must be at least 1:2
@@ -327,11 +327,11 @@ ENTRY RULES:
 - SKIP: wave unclear, momentum weak, trends disagree, volume flat, R:R < 1:2
 
 Respond in this exact format:
-WAVE_COUNT: (2-3 sentence wave analysis on 10M)
+WAVE_COUNT: (2-3 sentence wave analysis on 15M)
 MOMENTUM: STRONG_BULL or STRONG_BEAR or WEAK or NEUTRAL
 WAVE_3_CONFIRMED: YES or NO
 1H_TREND: BULLISH or BEARISH
-10M_TREND: BULLISH or BEARISH
+15M_TREND: BULLISH or BEARISH
 DECISION: LONG or SHORT or SKIP
 REASON: (2 sentences max)
 SL: $X.XX
@@ -398,7 +398,7 @@ TP: $X.XX"""
                 f"Price: ${price:.2f} | SL: ${sl} | TP: ${tp}\n"
                 f"R:R: 1:{rr} | Liq: ${liq}\n"
                 f"Momentum: {momentum} | Vol surge: {volume_surge}x\n"
-                f"1H: {trend_1h} | 10M: {trend_10m}\n\n"
+                f"1H: {trend_1h} | 15M: {trend_15m}\n\n"
                 f"{wave_count}\n\n{response}"
             )
         else:
@@ -407,7 +407,7 @@ TP: $X.XX"""
     elif decision == "SKIP":
         send_telegram(
             f"⏭ <b>SKIP</b> — ${price:.2f}\n"
-            f"1H: {trend_1h} | 10M: {trend_10m}\n"
+            f"1H: {trend_1h} | 15M: {trend_15m}\n"
             f"Wave 3: {wave3_confirmed} | Momentum: {momentum}\n"
             f"{response}"
         )
@@ -415,7 +415,7 @@ TP: $X.XX"""
         send_telegram(f"⚠️ Incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🌊 <b>ETH Scalp Bot Started</b>\n45x | 0.04 ETH | 10min | Elliott Wave + Momentum")
+    send_telegram("🌊 <b>ETH Scalp Bot Started</b>\n45x | 0.04 ETH | 15min | Elliott Wave + Momentum")
     while True:
         try:
             run_cycle()
