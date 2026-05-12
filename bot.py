@@ -113,7 +113,6 @@ def place_order(side, sl, tp):
     return r.json()
 
 def calculate_vwap(candles):
-    """VWAP = sum(typical_price * volume) / sum(volume)"""
     total_tp_vol = 0
     total_vol = 0
     for c in candles:
@@ -160,8 +159,7 @@ def calculate_atr(candles, period=14):
         trs.append(tr)
     return round(sum(trs[-period:]) / period, 4)
 
-def find_swing_points(candles, lookback=20):
-    """Find recent swing highs and lows for liquidity levels"""
+def find_swing_points(candles, lookback=30):
     highs = [c["high"] for c in candles[-lookback:]]
     lows = [c["low"] for c in candles[-lookback:]]
     swing_highs = []
@@ -174,55 +172,34 @@ def find_swing_points(candles, lookback=20):
     return sorted(swing_highs, reverse=True)[:3], sorted(swing_lows)[:3]
 
 def detect_liquidity_sweep(candles, swing_highs, swing_lows):
-    """
-    Detect if last 3 candles swept a liquidity level then rejected.
-    Returns: sweep_type (BEARISH_SWEEP, BULLISH_SWEEP, NONE), sweep_level
-    """
     if len(candles) < 3:
         return "NONE", 0
-
     last = candles[-1]
     prev = candles[-2]
-
-    # Bearish sweep: wick above swing high, closes back below it
     for high in swing_highs:
         if prev["high"] > high and prev["close"] < high:
             return "BEARISH_SWEEP", high
         if last["high"] > high and last["close"] < high:
             return "BEARISH_SWEEP", high
-
-    # Bullish sweep: wick below swing low, closes back above it
     for low in swing_lows:
         if prev["low"] < low and prev["close"] > low:
             return "BULLISH_SWEEP", low
         if last["low"] < low and last["close"] > low:
             return "BULLISH_SWEEP", low
-
     return "NONE", 0
 
 def detect_msb(candles, sweep_type):
-    """
-    After a sweep, detect Market Structure Break.
-    BULLISH_SWEEP → look for price breaking above recent high (MSB up)
-    BEARISH_SWEEP → look for price breaking below recent low (MSB down)
-    """
     if len(candles) < 5 or sweep_type == "NONE":
         return False
-
     recent_closes = [c["close"] for c in candles[-5:]]
     recent_highs = [c["high"] for c in candles[-5:]]
     recent_lows = [c["low"] for c in candles[-5:]]
-
     if sweep_type == "BULLISH_SWEEP":
-        # Price should break above a recent high after the sweep
         prev_high = max(recent_highs[:-1])
         return recent_closes[-1] > prev_high
-
     if sweep_type == "BEARISH_SWEEP":
-        # Price should break below a recent low after the sweep
         prev_low = min(recent_lows[:-1])
         return recent_closes[-1] < prev_low
-
     return False
 
 def get_liquidation_price(side, entry, leverage):
@@ -266,10 +243,7 @@ def run_cycle():
     candles_1h = get_candles("60", 50)
 
     if len(candles_15m) < 30 or len(candles_1h) < 20:
-        send_telegram(
-            f"⚠️ Not enough candle data\n"
-            f"15M: {len(candles_15m)} | 1H: {len(candles_1h)}"
-        )
+        send_telegram(f"⚠️ Not enough candle data\n15M: {len(candles_15m)} | 1H: {len(candles_1h)}")
         return
 
     # --- 15M indicators ---
@@ -289,12 +263,10 @@ def run_cycle():
     last_volume = volumes_15m[-1]
     volume_surge = round(last_volume / avg_volume, 2) if avg_volume > 0 else 0
 
-    # Swing points and liquidity detection
     swing_highs, swing_lows = find_swing_points(candles_15m, lookback=30)
     sweep_type, sweep_level = detect_liquidity_sweep(candles_15m, swing_highs, swing_lows)
     msb_confirmed = detect_msb(candles_15m, sweep_type)
 
-    # Last 3 candles for Claude context
     last_3 = candles_15m[-3:]
     last_3_summary = [
         f"C{i+1}: O${c['open']:.2f} H${c['high']:.2f} L${c['low']:.2f} Cl${c['close']:.2f} V{c['volume']:.0f}"
@@ -313,7 +285,6 @@ def run_cycle():
     liq_long = get_liquidation_price("Buy", price, LEVERAGE)
     liq_short = get_liquidation_price("Sell", price, LEVERAGE)
 
-    # If already in position, report and wait
     if position:
         side = position["side"]
         entry = float(position["avgPrice"])
@@ -365,37 +336,35 @@ Fear & Greed: {fear_greed}
 
 === MSB + VWAP STRATEGY ===
 
-SETUP RULES:
 1. VWAP Bias (1H):
-   - Price ABOVE 1H VWAP → only consider LONG
-   - Price BELOW 1H VWAP → only consider SHORT
-   - Never trade against VWAP bias
+   - Price ABOVE 1H VWAP → only LONG
+   - Price BELOW 1H VWAP → only SHORT
 
 2. Liquidity Sweep (15M):
-   - BULLISH_SWEEP: price wicked below swing low then closed above → smart money grabbed stops below, now going up
-   - BEARISH_SWEEP: price wicked above swing high then closed below → smart money grabbed stops above, now going down
-   - No sweep detected → SKIP
+   - BULLISH_SWEEP: wicked below swing low then closed above → going up
+   - BEARISH_SWEEP: wicked above swing high then closed below → going down
+   - No sweep → SKIP
 
 3. Market Structure Break (15M):
-   - After BULLISH_SWEEP: price breaks above recent high → confirmed LONG
-   - After BEARISH_SWEEP: price breaks below recent low → confirmed SHORT
+   - After BULLISH_SWEEP: price breaks above recent high → LONG
+   - After BEARISH_SWEEP: price breaks below recent low → SHORT
    - No MSB → SKIP
 
 4. Entry confirmation:
-   - Volume surge > 1.2x on confirmation candle
-   - RSI not extreme (30-70 range)
-   - EMA8/21 aligned with trade direction
+   - Volume surge > 1.2x
+   - RSI 30-70 range
+   - EMA8/21 aligned with direction
 
 5. SL/TP:
-   - LONG SL: below the sweep wick low (just below the liquidity grab candle)
-   - SHORT SL: above the sweep wick high
-   - TP: next significant swing high (LONG) or swing low (SHORT)
-   - Minimum R:R 1:2
+   - LONG SL: just below sweep wick low
+   - SHORT SL: just above sweep wick high
+   - TP: next significant swing level
+   - Minimum R:R 1.5 — aim for 2.0 when possible
 
 DECISION RULES:
-- LONG: price ABOVE 1H VWAP + BULLISH_SWEEP + MSB up + volume surge
-- SHORT: price BELOW 1H VWAP + BEARISH_SWEEP + MSB down + volume surge
-- SKIP: no sweep, no MSB, wrong VWAP side, weak volume, or R:R < 1:2
+- LONG: ABOVE 1H VWAP + BULLISH_SWEEP + MSB + volume surge
+- SHORT: BELOW 1H VWAP + BEARISH_SWEEP + MSB + volume surge
+- SKIP: no sweep, no MSB, wrong VWAP side, weak volume
 
 Respond in this exact format:
 SWEEP: BULLISH or BEARISH or NONE
@@ -454,8 +423,8 @@ TP: $X.XX"""
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
-        if rr < 2:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1:2 minimum")
+        if rr < 1.5:
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.5 minimum\nSkipping.")
             return
 
         set_leverage()
