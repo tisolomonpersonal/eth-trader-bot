@@ -112,6 +112,18 @@ def place_order(side, sl, tp):
     r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
     return r.json()
 
+def calculate_vwap(candles):
+    """VWAP = sum(typical_price * volume) / sum(volume)"""
+    total_tp_vol = 0
+    total_vol = 0
+    for c in candles:
+        typical_price = (c["high"] + c["low"] + c["close"]) / 3
+        total_tp_vol += typical_price * c["volume"]
+        total_vol += c["volume"]
+    if total_vol == 0:
+        return candles[-1]["close"]
+    return round(total_tp_vol / total_vol, 2)
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
@@ -136,28 +148,6 @@ def calculate_ema(closes, period):
         ema = price * k + ema * (1 - k)
     return round(ema, 2)
 
-def calculate_macd(closes):
-    if len(closes) < 26:
-        return 0, 0, 0
-    ema12 = calculate_ema(closes, 12)
-    ema26 = calculate_ema(closes, 26)
-    macd_line = round(ema12 - ema26, 4)
-    signal = round(macd_line * 0.9, 4)
-    histogram = round(macd_line - signal, 4)
-    return macd_line, signal, histogram
-
-def calculate_bollinger(closes, period=20):
-    if len(closes) < period:
-        c = closes[-1] if closes else 0
-        return c, c, c
-    recent = closes[-period:]
-    sma = sum(recent) / period
-    variance = sum((p - sma) ** 2 for p in recent) / period
-    std = variance ** 0.5
-    upper = round(sma + 2 * std, 2)
-    lower = round(sma - 2 * std, 2)
-    return round(sma, 2), upper, lower
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return 0
@@ -169,6 +159,71 @@ def calculate_atr(candles, period=14):
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     return round(sum(trs[-period:]) / period, 4)
+
+def find_swing_points(candles, lookback=20):
+    """Find recent swing highs and lows for liquidity levels"""
+    highs = [c["high"] for c in candles[-lookback:]]
+    lows = [c["low"] for c in candles[-lookback:]]
+    swing_highs = []
+    swing_lows = []
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            swing_highs.append(round(highs[i], 2))
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            swing_lows.append(round(lows[i], 2))
+    return sorted(swing_highs, reverse=True)[:3], sorted(swing_lows)[:3]
+
+def detect_liquidity_sweep(candles, swing_highs, swing_lows):
+    """
+    Detect if last 3 candles swept a liquidity level then rejected.
+    Returns: sweep_type (BEARISH_SWEEP, BULLISH_SWEEP, NONE), sweep_level
+    """
+    if len(candles) < 3:
+        return "NONE", 0
+
+    last = candles[-1]
+    prev = candles[-2]
+
+    # Bearish sweep: wick above swing high, closes back below it
+    for high in swing_highs:
+        if prev["high"] > high and prev["close"] < high:
+            return "BEARISH_SWEEP", high
+        if last["high"] > high and last["close"] < high:
+            return "BEARISH_SWEEP", high
+
+    # Bullish sweep: wick below swing low, closes back above it
+    for low in swing_lows:
+        if prev["low"] < low and prev["close"] > low:
+            return "BULLISH_SWEEP", low
+        if last["low"] < low and last["close"] > low:
+            return "BULLISH_SWEEP", low
+
+    return "NONE", 0
+
+def detect_msb(candles, sweep_type):
+    """
+    After a sweep, detect Market Structure Break.
+    BULLISH_SWEEP → look for price breaking above recent high (MSB up)
+    BEARISH_SWEEP → look for price breaking below recent low (MSB down)
+    """
+    if len(candles) < 5 or sweep_type == "NONE":
+        return False
+
+    recent_closes = [c["close"] for c in candles[-5:]]
+    recent_highs = [c["high"] for c in candles[-5:]]
+    recent_lows = [c["low"] for c in candles[-5:]]
+
+    if sweep_type == "BULLISH_SWEEP":
+        # Price should break above a recent high after the sweep
+        prev_high = max(recent_highs[:-1])
+        return recent_closes[-1] > prev_high
+
+    if sweep_type == "BEARISH_SWEEP":
+        # Price should break below a recent low after the sweep
+        prev_low = min(recent_lows[:-1])
+        return recent_closes[-1] < prev_low
+
+    return False
 
 def get_liquidation_price(side, entry, leverage):
     if side == "Buy":
@@ -207,17 +262,13 @@ def run_cycle():
     fear_greed = get_fear_greed()
     position = get_position()
 
-    # Fetch candles — Bybit supports: 1,3,5,15,30,60,120,240,360,720,D,W,M
     candles_15m = get_candles("15", 200)
     candles_1h = get_candles("60", 50)
 
-    # Safety check with debug counts
     if len(candles_15m) < 30 or len(candles_1h) < 20:
         send_telegram(
             f"⚠️ Not enough candle data\n"
-            f"15M candles: {len(candles_15m)}\n"
-            f"1H candles: {len(candles_1h)}\n"
-            f"Retrying next cycle..."
+            f"15M: {len(candles_15m)} | 1H: {len(candles_1h)}"
         )
         return
 
@@ -226,29 +277,39 @@ def run_cycle():
     highs_15m = [c["high"] for c in candles_15m]
     lows_15m = [c["low"] for c in candles_15m]
     volumes_15m = [c["volume"] for c in candles_15m]
+
     rsi_15m = calculate_rsi(closes_15m)
-    macd_15m, signal_15m, hist_15m = calculate_macd(closes_15m)
-    bb_mid_15m, bb_upper_15m, bb_lower_15m = calculate_bollinger(closes_15m)
     ema8_15m = calculate_ema(closes_15m, 8)
     ema21_15m = calculate_ema(closes_15m, 21)
-    ema50_15m = calculate_ema(closes_15m, 50)
     atr_15m = calculate_atr(candles_15m)
     trend_15m = "UPTREND" if ema8_15m > ema21_15m else "DOWNTREND"
+    vwap_15m = calculate_vwap(candles_15m[-50:])
 
-    recent_highs_15m = sorted(highs_15m[-30:], reverse=True)[:5]
-    recent_lows_15m = sorted(lows_15m[-30:])[:5]
-    avg_volume_15m = sum(volumes_15m[-20:]) / 20 if len(volumes_15m) >= 20 else sum(volumes_15m) / len(volumes_15m)
-    last_volume_15m = volumes_15m[-1] if volumes_15m else 0
-    volume_surge = round(last_volume_15m / avg_volume_15m, 2) if avg_volume_15m > 0 else 0
+    avg_volume = sum(volumes_15m[-20:]) / 20
+    last_volume = volumes_15m[-1]
+    volume_surge = round(last_volume / avg_volume, 2) if avg_volume > 0 else 0
+
+    # Swing points and liquidity detection
+    swing_highs, swing_lows = find_swing_points(candles_15m, lookback=30)
+    sweep_type, sweep_level = detect_liquidity_sweep(candles_15m, swing_highs, swing_lows)
+    msb_confirmed = detect_msb(candles_15m, sweep_type)
+
+    # Last 3 candles for Claude context
+    last_3 = candles_15m[-3:]
+    last_3_summary = [
+        f"C{i+1}: O${c['open']:.2f} H${c['high']:.2f} L${c['low']:.2f} Cl${c['close']:.2f} V{c['volume']:.0f}"
+        for i, c in enumerate(last_3)
+    ]
 
     # --- 1H indicators ---
     closes_1h = [c["close"] for c in candles_1h]
     ema20_1h = calculate_ema(closes_1h, 20)
     ema50_1h = calculate_ema(closes_1h, 50)
     rsi_1h = calculate_rsi(closes_1h)
+    vwap_1h = calculate_vwap(candles_1h)
     trend_1h = "UPTREND" if ema20_1h > ema50_1h else "DOWNTREND"
+    price_vs_vwap_1h = "ABOVE" if price > vwap_1h else "BELOW"
 
-    # Liquidation prices
     liq_long = get_liquidation_price("Buy", price, LEVERAGE)
     liq_short = get_liquidation_price("Sell", price, LEVERAGE)
 
@@ -264,74 +325,83 @@ def run_cycle():
             f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\n"
             f"Entry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n"
             f"Liq: ${liq} ({liq_dist}% away)\n"
-            f"15M: {trend_15m} | 1H: {trend_1h}\n"
+            f"VWAP: ${vwap_1h} | Price: {price_vs_vwap_1h}\n"
             f"Waiting for SL/TP..."
         )
         return
 
-    prompt = f"""You are an expert Elliott Wave scalper trading ETH/USDT perpetual on 15-minute charts.
+    prompt = f"""You are a professional scalp trader using Market Structure Break (MSB) + VWAP strategy on ETH/USDT perpetual.
 
 Time: {now}
 Current price: ${price:.2f}
 Fear & Greed: {fear_greed}
 
-=== 1H TIMEFRAME (Trend Filter) ===
+=== 1H TIMEFRAME (Bias Filter) ===
 - Trend: {trend_1h}
+- VWAP: ${vwap_1h} | Price is {price_vs_vwap_1h} VWAP
 - RSI(14): {rsi_1h}
 - EMA20: ${ema20_1h} | EMA50: ${ema50_1h}
+- Rule: ONLY LONG if price ABOVE 1H VWAP | ONLY SHORT if price BELOW 1H VWAP
 
-=== 15M TIMEFRAME (Scalping Timeframe) ===
+=== 15M TIMEFRAME (Entry) ===
 - Trend: {trend_15m}
+- VWAP: ${vwap_15m}
 - RSI(14): {rsi_15m}
-- MACD: {macd_15m} | Signal: {signal_15m} | Histogram: {hist_15m}
-- Bollinger Bands: Upper ${bb_upper_15m} | Mid ${bb_mid_15m} | Lower ${bb_lower_15m}
-- EMA8: ${ema8_15m} | EMA21: ${ema21_15m} | EMA50: ${ema50_15m}
-- ATR(14): {atr_15m}
-- Volume surge vs 20-candle avg: {volume_surge}x
-- Recent 15M Swing Highs: {recent_highs_15m}
-- Recent 15M Swing Lows: {recent_lows_15m}
-- Last 15 closes: {closes_15m[-15:]}
-- Last 15 volumes: {volumes_15m[-15:]}
+- EMA8: ${ema8_15m} | EMA21: ${ema21_15m}
+- ATR: {atr_15m}
+- Volume surge: {volume_surge}x avg
+- Recent swing highs: {swing_highs}
+- Recent swing lows: {swing_lows}
+- Liquidity sweep detected: {sweep_type} at ${sweep_level}
+- MSB confirmed by code: {msb_confirmed}
+- Last 3 candles:
+  {last_3_summary[0]}
+  {last_3_summary[1]}
+  {last_3_summary[2]}
 
 === LIQUIDATION SAFETY ===
-- LONG liquidation: ${liq_long} → SL must be above ${round(liq_long * 1.01, 2)}
-- SHORT liquidation: ${liq_short} → SL must be below ${round(liq_short * 0.99, 2)}
+- LONG liq: ${liq_long} → SL must be above ${round(liq_long * 1.01, 2)}
+- SHORT liq: ${liq_short} → SL must be below ${round(liq_short * 0.99, 2)}
 
-=== SCALPING STRATEGY ===
+=== MSB + VWAP STRATEGY ===
 
-STEP 1 — Elliott Wave on 15M:
-- Identify wave structure using swing highs/lows and last 15 closes
-- Wave 3 characteristics: strongest momentum, volume surge > 1.3x, MACD peak
-- Wave 2 retracement: 38-62% of Wave 1 (Fibonacci)
-- ONLY enter at START of Wave 3
+SETUP RULES:
+1. VWAP Bias (1H):
+   - Price ABOVE 1H VWAP → only consider LONG
+   - Price BELOW 1H VWAP → only consider SHORT
+   - Never trade against VWAP bias
 
-STEP 2 — Momentum Confirmation:
-- EMA8 crossing above/below EMA21 in trade direction
-- MACD histogram turning positive (LONG) or negative (SHORT)
-- RSI between 40-70 for LONG, 30-60 for SHORT
-- Volume surge > 1.2x on entry candle
+2. Liquidity Sweep (15M):
+   - BULLISH_SWEEP: price wicked below swing low then closed above → smart money grabbed stops below, now going up
+   - BEARISH_SWEEP: price wicked above swing high then closed below → smart money grabbed stops above, now going down
+   - No sweep detected → SKIP
 
-STEP 3 — Trend Filter:
-- 1H trend must agree with 15M direction
-- Never trade against 1H trend
+3. Market Structure Break (15M):
+   - After BULLISH_SWEEP: price breaks above recent high → confirmed LONG
+   - After BEARISH_SWEEP: price breaks below recent low → confirmed SHORT
+   - No MSB → SKIP
 
-STEP 4 — Scalp SL/TP:
-- SL: just below/above last 15M swing low/high (0.2% to 0.5% from entry)
-- TP: 0.5% to 1.5% from entry (Wave 3 = 1.618 x Wave 1)
-- SL must be above liquidation + 1% buffer
-- Risk:Reward must be at least 1:2
+4. Entry confirmation:
+   - Volume surge > 1.2x on confirmation candle
+   - RSI not extreme (30-70 range)
+   - EMA8/21 aligned with trade direction
 
-ENTRY RULES:
-- LONG: 1H UPTREND + Wave 3 up + EMA8 > EMA21 + MACD bullish + volume surge
-- SHORT: 1H DOWNTREND + Wave 3 down + EMA8 < EMA21 + MACD bearish + volume surge
-- SKIP: wave unclear, momentum weak, trends disagree, volume flat, R:R < 1:2
+5. SL/TP:
+   - LONG SL: below the sweep wick low (just below the liquidity grab candle)
+   - SHORT SL: above the sweep wick high
+   - TP: next significant swing high (LONG) or swing low (SHORT)
+   - Minimum R:R 1:2
+
+DECISION RULES:
+- LONG: price ABOVE 1H VWAP + BULLISH_SWEEP + MSB up + volume surge
+- SHORT: price BELOW 1H VWAP + BEARISH_SWEEP + MSB down + volume surge
+- SKIP: no sweep, no MSB, wrong VWAP side, weak volume, or R:R < 1:2
 
 Respond in this exact format:
-WAVE_COUNT: (2-3 sentence wave analysis on 15M)
-MOMENTUM: STRONG_BULL or STRONG_BEAR or WEAK or NEUTRAL
-WAVE_3_CONFIRMED: YES or NO
-1H_TREND: BULLISH or BEARISH
-15M_TREND: BULLISH or BEARISH
+SWEEP: BULLISH or BEARISH or NONE
+MSB: YES or NO
+VWAP_BIAS: LONG or SHORT
+SETUP_QUALITY: STRONG or WEAK or NONE
 DECISION: LONG or SHORT or SKIP
 REASON: (2 sentences max)
 SL: $X.XX
@@ -341,9 +411,10 @@ TP: $X.XX"""
     lines = response.strip().split("\n")
     decision = "SKIP"
     sl = tp = 0.0
-    wave_count = ""
-    wave3_confirmed = "NO"
-    momentum = "NEUTRAL"
+    sweep_result = "NONE"
+    msb_result = "NO"
+    setup_quality = "NONE"
+    vwap_bias = "NONE"
 
     for line in lines:
         if line.startswith("DECISION:"):
@@ -358,35 +429,33 @@ TP: $X.XX"""
                 tp = float(line.replace("TP:", "").replace("$", "").strip())
             except:
                 pass
-        elif line.startswith("WAVE_COUNT:"):
-            wave_count = line.replace("WAVE_COUNT:", "").strip()
-        elif line.startswith("WAVE_3_CONFIRMED:"):
-            wave3_confirmed = line.replace("WAVE_3_CONFIRMED:", "").strip()
-        elif line.startswith("MOMENTUM:"):
-            momentum = line.replace("MOMENTUM:", "").strip()
+        elif line.startswith("SWEEP:"):
+            sweep_result = line.replace("SWEEP:", "").strip()
+        elif line.startswith("MSB:"):
+            msb_result = line.replace("MSB:", "").strip()
+        elif line.startswith("SETUP_QUALITY:"):
+            setup_quality = line.replace("SETUP_QUALITY:", "").strip()
+        elif line.startswith("VWAP_BIAS:"):
+            vwap_bias = line.replace("VWAP_BIAS:", "").strip()
 
     # Hard rules
-    if decision in ("LONG", "SHORT") and wave3_confirmed != "YES":
+    if decision in ("LONG", "SHORT") and setup_quality != "STRONG":
         decision = "SKIP"
-        response += "\n[Override: Wave 3 not confirmed]"
-
-    if decision in ("LONG", "SHORT") and momentum not in ("STRONG_BULL", "STRONG_BEAR"):
-        decision = "SKIP"
-        response += "\n[Override: Momentum not strong enough]"
+        response += "\n[Override: Setup quality not STRONG]"
 
     if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
         side = "Buy" if decision == "LONG" else "Sell"
 
         if not sl_is_safe(side, price, sl, LEVERAGE):
             liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liquidation ${liq}\nSkipping.")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liq ${liq}")
             return
 
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
         if rr < 2:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1:2 minimum\nSkipping.")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1:2 minimum")
             return
 
         set_leverage()
@@ -394,28 +463,28 @@ TP: $X.XX"""
         if result.get("retCode") == 0:
             liq = get_liquidation_price(side, price, LEVERAGE)
             send_telegram(
-                f"🌊 <b>WAVE 3 SCALP {decision}</b>\n"
+                f"🎯 <b>MSB SCALP {decision}</b>\n"
                 f"Price: ${price:.2f} | SL: ${sl} | TP: ${tp}\n"
                 f"R:R: 1:{rr} | Liq: ${liq}\n"
-                f"Momentum: {momentum} | Vol surge: {volume_surge}x\n"
-                f"1H: {trend_1h} | 15M: {trend_15m}\n\n"
-                f"{wave_count}\n\n{response}"
+                f"Sweep: {sweep_result} | MSB: {msb_result}\n"
+                f"VWAP bias: {vwap_bias} | Vol: {volume_surge}x\n\n"
+                f"{response}"
             )
         else:
-            send_telegram(f"❌ Order failed: {result.get('retMsg')}\n\nClaude wanted: {decision}")
+            send_telegram(f"❌ Order failed: {result.get('retMsg')}")
 
     elif decision == "SKIP":
         send_telegram(
             f"⏭ <b>SKIP</b> — ${price:.2f}\n"
-            f"1H: {trend_1h} | 15M: {trend_15m}\n"
-            f"Wave 3: {wave3_confirmed} | Momentum: {momentum}\n"
+            f"VWAP: ${vwap_1h} ({price_vs_vwap_1h}) | 1H: {trend_1h}\n"
+            f"Sweep: {sweep_result} | MSB: {msb_result} | Quality: {setup_quality}\n"
             f"{response}"
         )
     else:
         send_telegram(f"⚠️ Incomplete data, skipping.\n{response}")
 
 def main():
-    send_telegram("🌊 <b>ETH Scalp Bot Started</b>\n45x | 0.04 ETH | 15min | Elliott Wave + Momentum")
+    send_telegram("🎯 <b>ETH MSB Scalp Bot Started</b>\n45x | 0.04 ETH | 15min | MSB + VWAP")
     while True:
         try:
             run_cycle()
