@@ -13,7 +13,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.04
 LEVERAGE = 45
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "900"))  # seconds (default: 15 minutes)
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))  # seconds (default: 1 hour, saves tokens)
 
 # --- RISK / SAFETY GUARDS ---
 # NOTE: These are *equity-based* limits (USDT). With very small accounts + 45x leverage,
