@@ -753,8 +753,14 @@ def run_cycle():
     daily_pnl = (float(equity) - float(state.get("start_equity"))) if (equity is not None and state.get("start_equity") is not None) else 0.0
     perf = performance_summary(state)
 
-    prompt = f"""You are Claude, acting as the trading decision maker.
-You MUST follow the rules below exactly.
+    last_candles = candles[-10:]
+    last_candles_summary = [
+        f"C{i+1}: O{c['open']:.2f} H{c['high']:.2f} L{c['low']:.2f} C{c['close']:.2f} V{c['volume']:.0f}"
+        for i, c in enumerate(last_candles)
+    ]
+
+    prompt = f"""You are Claude, an autonomous crypto trader and account manager.
+Your job: study the market and decide whether to enter a trade right now.
 
 SYMBOL: {SYMBOL} perpetual (Bybit)
 Time: {now}
@@ -778,27 +784,27 @@ RSI({RSI_PERIOD}): {rsi_tf}
 MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} momentum={macd_momentum}
 ATR({ATR_PERIOD}): {atr_tf} ({atr_tf_pct*100:.2f}%)
 
-=== ANTI-WHIPSAW FILTERS (must pass to trade) ===
-1) Distance filter: distance from MA{MA_PERIOD} must be >= {MA_DISTANCE_PCT*100:.2f}%
-2) ATR% filter: {ATR_PCT_MIN*100:.2f}% <= ATR% <= {ATR_PCT_MAX*100:.2f}%
+Last 10 candles:
+{last_candles_summary[0]}
+{last_candles_summary[1]}
+{last_candles_summary[2]}
+{last_candles_summary[3]}
+{last_candles_summary[4]}
+{last_candles_summary[5]}
+{last_candles_summary[6]}
+{last_candles_summary[7]}
+{last_candles_summary[8]}
+{last_candles_summary[9]}
 
-=== TREND FILTER ===
-LONG bias only if close > MA{MA_PERIOD} AND MA slope is UP.
-SHORT bias only if close < MA{MA_PERIOD} AND MA slope is DOWN.
+=== HARD CONSTRAINTS (the system will block trades that violate these) ===
+1) You MUST output a clear DECISION: LONG, SHORT, or SKIP.
+2) If LONG/SHORT, you MUST provide SL and TP (2 decimals).
+3) Aim for minimum R:R >= 1.5 (TP distance / SL distance).
+4) Avoid liquidation risk (45x leverage): keep SL far enough from liquidation.
+5) If today's PnL is near the daily limit or consecutive losses are high, be more conservative.
 
-=== ENTRY TRIGGER ===
-LONG trigger only if MACD histogram is > 0 AND momentum is UP.
-SHORT trigger only if MACD histogram is < 0 AND momentum is DOWN.
-
-=== RSI FILTER ===
-LONG only if {RSI_LONG_MIN} <= RSI <= {RSI_LONG_MAX}
-SHORT only if {RSI_SHORT_MIN} <= RSI <= {RSI_SHORT_MAX}
-
-=== SL/TP RULES ===
-Use ATR-based risk:
-- For LONG: SL = price - {SL_ATR_MULT}*ATR, TP = price + {TP_ATR_MULT}*ATR
-- For SHORT: SL = price + {SL_ATR_MULT}*ATR, TP = price - {TP_ATR_MULT}*ATR
-Return exact numbers with 2 decimals.
+You may use any analysis method you want (trend, range, structure, momentum, mean reversion).
+Only propose a trade if you believe the setup has a real edge; otherwise SKIP.
 
 Respond ONLY in this exact format:
 DECISION: LONG or SHORT or SKIP
