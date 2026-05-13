@@ -2,6 +2,7 @@ import requests, json, os, time, hmac, hashlib
 import traceback
 from datetime import datetime, timezone
 import anthropic
+from pathlib import Path
 
 # --- CONFIG ---
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
@@ -12,7 +13,129 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.04
 LEVERAGE = 45
-CHECK_INTERVAL = 600
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))  # seconds
+
+# --- RISK / SAFETY GUARDS ---
+# NOTE: These are *equity-based* limits (USDT). With very small accounts + 45x leverage,
+# equity can swing quickly. Consider lowering leverage in production.
+MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "2"))
+MAX_CONSEC_LOSS_USD = float(os.environ.get("MAX_CONSEC_LOSS_USD", "4"))
+
+# Pause after volatility spikes (15m ATR as % of price)
+VOL_SPIKE_ATR_PCT = float(os.environ.get("VOL_SPIKE_ATR_PCT", "0.02"))  # 2%
+VOL_PAUSE_SECONDS = int(os.environ.get("VOL_PAUSE_SECONDS", "1800"))     # 30 minutes
+
+# --- STRATEGY (1H): MACD + RSI + 200 MA + anti-whipsaw filters ---
+MA_PERIOD = int(os.environ.get("MA_PERIOD", "200"))
+MA_SLOPE_LOOKBACK = int(os.environ.get("MA_SLOPE_LOOKBACK", "10"))  # candles
+MA_DISTANCE_PCT = float(os.environ.get("MA_DISTANCE_PCT", "0.003"))  # 0.3%
+
+MACD_FAST = int(os.environ.get("MACD_FAST", "12"))
+MACD_SLOW = int(os.environ.get("MACD_SLOW", "26"))
+MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", "9"))
+
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
+RSI_LONG_MIN = float(os.environ.get("RSI_LONG_MIN", "50"))
+RSI_LONG_MAX = float(os.environ.get("RSI_LONG_MAX", "70"))
+RSI_SHORT_MIN = float(os.environ.get("RSI_SHORT_MIN", "30"))
+RSI_SHORT_MAX = float(os.environ.get("RSI_SHORT_MAX", "50"))
+
+ATR_PERIOD_1H = int(os.environ.get("ATR_PERIOD_1H", "14"))
+ATR_PCT_MIN_1H = float(os.environ.get("ATR_PCT_MIN_1H", "0.003"))  # 0.3% (avoid dead chop)
+ATR_PCT_MAX_1H = float(os.environ.get("ATR_PCT_MAX_1H", "0.02"))   # 2.0% (avoid chaos)
+
+SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))
+TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
+
+BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")  # common: UNIFIED / CONTRACT
+STATE_FILE = Path(__file__).with_name("bot_state.json")
+
+def utc_now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def load_state():
+    try:
+        if STATE_FILE.exists():
+            with STATE_FILE.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except:
+        pass
+    return {
+        "day": None,
+        "start_equity": None,
+        "entry_equity": None,
+        "entry_time": None,
+        "entry_price": None,
+        "entry_side": None,
+        "had_position": False,
+        "consecutive_loss": 0.0,
+        "total_pnl": 0.0,
+        "trade_history": [],
+        "paused_until": 0,
+        "pause_reason": ""
+    }
+
+def save_state(state):
+    try:
+        with STATE_FILE.open("w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except:
+        pass
+
+def sign_get_request(query: str):
+    """
+    Bybit v5 GET signing: sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + queryString)
+    """
+    timestamp = get_server_time()
+    recv_window = "5000"
+    param_str = timestamp + BYBIT_API_KEY + recv_window + query
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": recv_window
+    }
+    return headers
+
+def get_wallet_equity_usdt():
+    """
+    Returns total equity in USDT (best-effort parsing across Bybit response shapes).
+    """
+    query = f"accountType={BYBIT_ACCOUNT_TYPE}&coin=USDT"
+    headers = sign_get_request(query)
+    r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}", headers=headers, timeout=10)
+    data = r.json()
+    if not data.get("result") or not data["result"].get("list"):
+        return None
+    item = data["result"]["list"][0]
+
+    # Shape A: top-level totalEquity string
+    if "totalEquity" in item and item["totalEquity"] not in (None, ""):
+        try:
+            return float(item["totalEquity"])
+        except:
+            pass
+
+    # Shape B: item["coin"] list with USDT element
+    coins = item.get("coin") or []
+    for c in coins:
+        if (c.get("coin") or "").upper() == "USDT":
+            for k in ("equity", "walletBalance", "availableToWithdraw", "availableBalance"):
+                if k in c and c[k] not in (None, ""):
+                    try:
+                        return float(c[k])
+                    except:
+                        continue
+
+    # Last resort: try common keys
+    for k in ("totalWalletBalance", "totalMarginBalance"):
+        if k in item and item[k] not in (None, ""):
+            try:
+                return float(item[k])
+            except:
+                pass
+    return None
 
 def send_telegram(message):
     try:
@@ -147,6 +270,114 @@ def calculate_ema(closes, period):
         ema = price * k + ema * (1 - k)
     return round(ema, 2)
 
+def calculate_ema_series(values, period):
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    ema = values[0]
+    out = [ema]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+        out.append(ema)
+    return out
+
+def calculate_sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+def calculate_macd(closes):
+    """
+    Returns (macd_line, signal_line, histogram) series lists (floats).
+    """
+    if len(closes) < MACD_SLOW + MACD_SIGNAL + 5:
+        return [], [], []
+    ema_fast = calculate_ema_series(closes, MACD_FAST)
+    ema_slow = calculate_ema_series(closes, MACD_SLOW)
+    macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
+    signal_line = calculate_ema_series(macd_line, MACD_SIGNAL)
+    hist = [m - s for m, s in zip(macd_line, signal_line)]
+    return macd_line, signal_line, hist
+
+def get_trade_decision_1h(candles_1h):
+    """
+    Deterministic strategy:
+    - Trend filter: close above/below MA200 + MA200 slope
+    - Anti-whipsaw: distance from MA200 (pct)
+    - Momentum trigger: MACD histogram crosses 0 on candle close
+    - RSI filter to avoid extremes
+    - ATR% filter to avoid dead chop / chaos
+    Returns: (decision, reason, indicators_dict)
+    """
+    closes = [c["close"] for c in candles_1h]
+    if len(closes) < MA_PERIOD + MA_SLOPE_LOOKBACK + 5:
+        return "SKIP", "Not enough 1H candle history for MA200/slope.", {}
+
+    close = closes[-1]
+    ma200 = calculate_sma(closes, MA_PERIOD)
+    ma200_prev = sum(closes[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
+    slope = ma200 - ma200_prev
+    slope_dir = "UP" if slope > 0 else "DOWN" if slope < 0 else "FLAT"
+
+    dist_pct = abs(close - ma200) / ma200 if ma200 else 0
+
+    rsi = calculate_rsi(closes, period=RSI_PERIOD)
+
+    macd_line, sig_line, hist = calculate_macd(closes)
+    if len(hist) < 3:
+        return "SKIP", "Not enough data for MACD.", {}
+
+    # candle-close confirmation: look at the last two closed values
+    macd_cross_up = hist[-1] > 0 and hist[-2] <= 0
+    macd_cross_down = hist[-1] < 0 and hist[-2] >= 0
+
+    atr = calculate_atr(candles_1h, period=ATR_PERIOD_1H)
+    atr_pct = (atr / close) if close > 0 else 0
+
+    # Filters first (avoid whipsaw)
+    if dist_pct < MA_DISTANCE_PCT:
+        return "SKIP", f"Too close to MA{MA_PERIOD} (distance {dist_pct*100:.2f}%).", {
+            "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+        }
+
+    if atr_pct < ATR_PCT_MIN_1H:
+        return "SKIP", f"ATR too low (ATR% {atr_pct*100:.2f}%), likely chop.", {
+            "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+        }
+
+    if atr_pct > ATR_PCT_MAX_1H:
+        return "SKIP", f"ATR too high (ATR% {atr_pct*100:.2f}%), too volatile.", {
+            "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+        }
+
+    # LONG setup
+    if close > ma200 and slope > 0 and macd_cross_up and (RSI_LONG_MIN <= rsi <= RSI_LONG_MAX):
+        return "LONG", "Price above rising MA200 + MACD up-cross + RSI filter passed.", {
+            "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+        }
+
+    # SHORT setup
+    if close < ma200 and slope < 0 and macd_cross_down and (RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX):
+        return "SHORT", "Price below falling MA200 + MACD down-cross + RSI filter passed.", {
+            "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+        }
+
+    # Otherwise skip with a short reason
+    if close > ma200 and slope <= 0:
+        reason = "Above MA200 but MA200 slope not up (possible range)."
+    elif close < ma200 and slope >= 0:
+        reason = "Below MA200 but MA200 slope not down (possible range)."
+    elif close > ma200 and not macd_cross_up:
+        reason = "Above MA200 but no MACD up-cross on close."
+    elif close < ma200 and not macd_cross_down:
+        reason = "Below MA200 but no MACD down-cross on close."
+    else:
+        reason = "No valid setup."
+
+    return "SKIP", reason, {
+        "ma200": ma200, "slope_dir": slope_dir, "dist_pct": dist_pct, "rsi": rsi, "atr": atr, "atr_pct": atr_pct
+    }
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return 0
@@ -221,69 +452,177 @@ def ask_claude(prompt, retries=3):
         try:
             message = client.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=800,
+                max_tokens=700,
                 messages=[{"role": "user", "content": prompt}]
             )
             return message.content[0].text
         except Exception as e:
+            # transient overloads happen occasionally
             if "overloaded" in str(e).lower() and attempt < retries - 1:
-                send_telegram(f"⏳ Anthropic overloaded, retrying in 30s... (attempt {attempt+1}/{retries})")
-                time.sleep(30)
+                time.sleep(20)
             else:
                 raise e
 
+def parse_claude_trade_response(text):
+    """
+    Expected format:
+      DECISION: LONG|SHORT|SKIP
+      REASON: ...
+      SL: $X.XX
+      TP: $X.XX
+    """
+    decision = "SKIP"
+    reason = ""
+    sl = 0.0
+    tp = 0.0
+    personal_message = ""
+    for raw in (text or "").strip().splitlines():
+        line = raw.strip()
+        if line.upper().startswith("DECISION:"):
+            decision = line.split(":", 1)[1].strip().upper()
+        elif line.upper().startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("PERSONAL_MESSAGE:"):
+            personal_message = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("SL:"):
+            try:
+                sl = float(line.split(":", 1)[1].replace("$", "").strip())
+            except:
+                pass
+        elif line.upper().startswith("TP:"):
+            try:
+                tp = float(line.split(":", 1)[1].replace("$", "").strip())
+            except:
+                pass
+    if decision not in ("LONG", "SHORT", "SKIP"):
+        decision = "SKIP"
+    return decision, reason, sl, tp, personal_message
+
 def run_cycle():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    today = datetime.now(timezone.utc).date().isoformat()
 
     price = get_price()
     fear_greed = get_fear_greed()
     position = get_position()
+    equity = get_wallet_equity_usdt()
+
+    # Claude runs the decision-making (and proposes SL/TP). If there's no key, never enter.
+    if not ANTHROPIC_API_KEY and not position:
+        send_telegram("⚠️ ANTHROPIC_API_KEY is missing. Skipping entries this cycle.")
+        return
+
+    # If we can't fetch equity, we can't enforce the $-based risk limits safely.
+    # We'll still report an active position, but we will not open new ones.
+    if equity is None and not position:
+        send_telegram("⚠️ Could not fetch wallet equity (USDT). Skipping entries this cycle.")
+        return
+
+    state = load_state()
+    if state.get("day") != today or state.get("start_equity") is None:
+        trade_history = state.get("trade_history") or []
+        total_pnl = float(state.get("total_pnl") or 0.0)
+        state = {
+            "day": today,
+            "start_equity": equity,
+            "entry_equity": None,
+            "entry_time": None,
+            "entry_price": None,
+            "entry_side": None,
+            "had_position": False,
+            "consecutive_loss": 0.0,
+            "total_pnl": total_pnl,
+            "trade_history": trade_history[-50:],
+            "paused_until": 0,
+            "pause_reason": ""
+        }
+        save_state(state)
 
     candles_15m = get_candles("15", 200)
-    candles_1h = get_candles("60", 50)
+    candles_1h = get_candles("60", 300)
 
-    if len(candles_15m) < 30 or len(candles_1h) < 20:
+    if len(candles_15m) < 30 or len(candles_1h) < (MA_PERIOD + MA_SLOPE_LOOKBACK + 5):
         send_telegram(f"⚠️ Not enough candle data\n15M: {len(candles_15m)} | 1H: {len(candles_1h)}")
         return
 
-    # --- 15M indicators ---
-    closes_15m = [c["close"] for c in candles_15m]
-    highs_15m = [c["high"] for c in candles_15m]
-    lows_15m = [c["low"] for c in candles_15m]
-    volumes_15m = [c["volume"] for c in candles_15m]
-
-    rsi_15m = calculate_rsi(closes_15m)
-    ema8_15m = calculate_ema(closes_15m, 8)
-    ema21_15m = calculate_ema(closes_15m, 21)
+    # --- 15M indicator (only used for volatility spike pause) ---
     atr_15m = calculate_atr(candles_15m)
-    trend_15m = "UPTREND" if ema8_15m > ema21_15m else "DOWNTREND"
-    vwap_15m = calculate_vwap(candles_15m[-50:])
-
-    avg_volume = sum(volumes_15m[-20:]) / 20
-    last_volume = volumes_15m[-1]
-    volume_surge = round(last_volume / avg_volume, 2) if avg_volume > 0 else 0
-
-    swing_highs, swing_lows = find_swing_points(candles_15m, lookback=30)
-    sweep_type, sweep_level = detect_liquidity_sweep(candles_15m, swing_highs, swing_lows)
-    msb_confirmed = detect_msb(candles_15m, sweep_type)
-
-    last_3 = candles_15m[-3:]
-    last_3_summary = [
-        f"C{i+1}: O${c['open']:.2f} H${c['high']:.2f} L${c['low']:.2f} Cl${c['close']:.2f} V{c['volume']:.0f}"
-        for i, c in enumerate(last_3)
-    ]
-
-    # --- 1H indicators ---
-    closes_1h = [c["close"] for c in candles_1h]
-    ema20_1h = calculate_ema(closes_1h, 20)
-    ema50_1h = calculate_ema(closes_1h, 50)
-    rsi_1h = calculate_rsi(closes_1h)
-    vwap_1h = calculate_vwap(candles_1h)
-    trend_1h = "UPTREND" if ema20_1h > ema50_1h else "DOWNTREND"
-    price_vs_vwap_1h = "ABOVE" if price > vwap_1h else "BELOW"
 
     liq_long = get_liquidation_price("Buy", price, LEVERAGE)
     liq_short = get_liquidation_price("Sell", price, LEVERAGE)
+
+    # --- VOLATILITY PAUSE ---
+    atr_pct = (atr_15m / price) if price > 0 else 0
+    if atr_pct >= VOL_SPIKE_ATR_PCT:
+        pause_until = utc_now_ts() + VOL_PAUSE_SECONDS
+        if pause_until > int(state.get("paused_until") or 0):
+            state["paused_until"] = pause_until
+            state["pause_reason"] = f"VOL_SPIKE (15m ATR%={atr_pct*100:.2f}%)"
+            save_state(state)
+            send_telegram(
+                f"⏸ <b>PAUSE</b> — Volatility spike\n"
+                f"15m ATR: {atr_15m} ({atr_pct*100:.2f}%) | Price: ${price:.2f}\n"
+                f"Pausing for {int(VOL_PAUSE_SECONDS/60)}m."
+            )
+
+    # --- POSITION TRANSITION TRACKING (for consecutive loss) ---
+    # If we *had* a position previously and now it's closed, update consecutive loss.
+    if state.get("had_position") and not position:
+        if equity is not None and state.get("entry_equity") is not None:
+            trade_pnl = float(equity) - float(state["entry_equity"])
+            if trade_pnl < 0:
+                state["consecutive_loss"] = round(float(state.get("consecutive_loss", 0.0)) + abs(trade_pnl), 4)
+            else:
+                state["consecutive_loss"] = 0.0
+            # performance memory
+            state["total_pnl"] = round(float(state.get("total_pnl", 0.0)) + trade_pnl, 4)
+            hist = state.get("trade_history") or []
+            hist.append({
+                "entry_time": state.get("entry_time"),
+                "exit_time": now,
+                "side": state.get("entry_side"),
+                "entry_price": state.get("entry_price"),
+                "exit_price": price,
+                "pnl": round(trade_pnl, 4)
+            })
+            state["trade_history"] = hist[-50:]
+        state["had_position"] = False
+        state["entry_equity"] = None
+        state["entry_time"] = None
+        state["entry_price"] = None
+        state["entry_side"] = None
+        save_state(state)
+
+    # --- DAILY LOSS LIMIT (equity-based) ---
+    if equity is not None and state.get("start_equity") is not None:
+        daily_loss = max(0.0, float(state["start_equity"]) - float(equity))
+        if daily_loss >= MAX_DAILY_LOSS_USD:
+            # Pause until next UTC day
+            tomorrow = datetime.now(timezone.utc).date().toordinal() + 1
+            pause_until = int(datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc).timestamp())
+            state["paused_until"] = max(int(state.get("paused_until") or 0), pause_until)
+            state["pause_reason"] = f"DAILY_LOSS_LIMIT (down ${daily_loss:.2f} / ${MAX_DAILY_LOSS_USD:.2f})"
+            save_state(state)
+
+    # --- CONSECUTIVE LOSS LIMIT (cumulative since last win) ---
+    if float(state.get("consecutive_loss") or 0.0) >= MAX_CONSEC_LOSS_USD:
+        tomorrow = datetime.now(timezone.utc).date().toordinal() + 1
+        pause_until = int(datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc).timestamp())
+        state["paused_until"] = max(int(state.get("paused_until") or 0), pause_until)
+        state["pause_reason"] = f"CONSEC_LOSS_LIMIT (${state['consecutive_loss']:.2f} / ${MAX_CONSEC_LOSS_USD:.2f})"
+        save_state(state)
+
+    # If paused, do not enter new trades
+    if utc_now_ts() < int(state.get("paused_until") or 0) and not position:
+        reason = state.get("pause_reason") or "PAUSED"
+        eq_txt = f"${equity:.2f}" if equity is not None else "n/a"
+        send_telegram(
+            f"⏸ <b>PAUSED</b> — ${price:.2f}\n"
+            f"Reason: {reason}\n"
+            f"Equity: {eq_txt} | Start: {state.get('start_equity')}\n"
+            f"15m ATR%: {atr_pct*100:.2f}%"
+        )
+        return
 
     if position:
         side = position["side"]
@@ -296,164 +635,162 @@ def run_cycle():
             f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\n"
             f"Entry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n"
             f"Liq: ${liq} ({liq_dist}% away)\n"
-            f"VWAP: ${vwap_1h} | Price: {price_vs_vwap_1h}\n"
             f"Waiting for SL/TP..."
         )
+        # Ensure state knows we have a position (for later PnL tracking). If the bot restarts
+        # mid-position, this sets a baseline equity (best effort).
+        if not state.get("had_position"):
+            state["had_position"] = True
+            if state.get("entry_equity") is None and equity is not None:
+                state["entry_equity"] = float(equity)
+            state["entry_time"] = state.get("entry_time") or now
+            state["entry_price"] = state.get("entry_price") or entry
+            state["entry_side"] = state.get("entry_side") or side
+            save_state(state)
         return
 
-    prompt = f"""You are a professional scalp trader using Market Structure Break (MSB) + VWAP strategy on ETH/USDT perpetual.
+    # --- Claude in charge: compute indicators, send to Claude, execute if allowed ---
+    closes_1h = [c["close"] for c in candles_1h]
+    close_1h = closes_1h[-1]
+    ma200 = calculate_sma(closes_1h, MA_PERIOD)
+    ma200_prev = sum(closes_1h[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
+    slope = ma200 - ma200_prev
+    slope_dir = "UP" if slope > 0 else "DOWN" if slope < 0 else "FLAT"
+    dist_pct = abs(close_1h - ma200) / ma200 if ma200 else 0
 
+    rsi_1h = calculate_rsi(closes_1h, period=RSI_PERIOD)
+    macd_line, sig_line, hist = calculate_macd(closes_1h)
+    macd_hist_last = hist[-1] if hist else 0
+    macd_hist_prev = hist[-2] if len(hist) >= 2 else 0
+    macd_cross = "UP" if (macd_hist_last > 0 and macd_hist_prev <= 0) else "DOWN" if (macd_hist_last < 0 and macd_hist_prev >= 0) else "NONE"
+
+    atr_1h = calculate_atr(candles_1h, period=ATR_PERIOD_1H)
+    atr_1h_pct = (atr_1h / close_1h) if close_1h > 0 else 0
+
+    # Performance context for Claude (lightweight, last 5 trades)
+    hist = state.get("trade_history") or []
+    last5 = hist[-5:]
+    perf_lines = []
+    for t in last5:
+        try:
+            perf_lines.append(f"{t.get('side')} pnl={t.get('pnl')} at {t.get('exit_time')}")
+        except:
+            pass
+    perf_text = "\n".join(perf_lines) if perf_lines else "No closed trades recorded yet."
+    daily_pnl = (float(equity) - float(state.get("start_equity"))) if (equity is not None and state.get("start_equity") is not None) else 0.0
+
+    prompt = f"""You are Claude, acting as the trading decision maker.
+You MUST follow the rules below exactly.
+
+SYMBOL: {SYMBOL} perpetual (Bybit)
 Time: {now}
 Current price: ${price:.2f}
 Fear & Greed: {fear_greed}
 
-=== 1H TIMEFRAME (Bias Filter) ===
-- Trend: {trend_1h}
-- VWAP: ${vwap_1h} | Price is {price_vs_vwap_1h} VWAP
-- RSI(14): {rsi_1h}
-- EMA20: ${ema20_1h} | EMA50: ${ema50_1h}
-- Rule: ONLY LONG if price ABOVE 1H VWAP | ONLY SHORT if price BELOW 1H VWAP
+=== PERFORMANCE MEMORY (context) ===
+Today's PnL (equity-based): ${daily_pnl:.2f}
+Consecutive loss (equity-based): ${float(state.get("consecutive_loss") or 0.0):.2f}
+Lifetime PnL (equity-based): ${float(state.get("total_pnl") or 0.0):.2f}
+Last trades:
+{perf_text}
 
-=== 15M TIMEFRAME (Entry) ===
-- Trend: {trend_15m}
-- VWAP: ${vwap_15m}
-- RSI(14): {rsi_15m}
-- EMA8: ${ema8_15m} | EMA21: ${ema21_15m}
-- ATR: {atr_15m}
-- Volume surge: {volume_surge}x avg
-- Recent swing highs: {swing_highs}
-- Recent swing lows: {swing_lows}
-- Liquidity sweep detected: {sweep_type} at ${sweep_level}
-- MSB confirmed by code: {msb_confirmed}
-- Last 3 candles:
-  {last_3_summary[0]}
-  {last_3_summary[1]}
-  {last_3_summary[2]}
+=== 1H INDICATORS ===
+Close: ${close_1h:.2f}
+MA{MA_PERIOD}: ${ma200:.2f}
+MA{MA_PERIOD} slope ({MA_SLOPE_LOOKBACK} bars): {slope_dir} (delta {slope:.4f})
+Distance from MA{MA_PERIOD}: {dist_pct*100:.2f}%
+RSI({RSI_PERIOD}): {rsi_1h}
+MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} cross={macd_cross}
+ATR({ATR_PERIOD_1H}): {atr_1h} ({atr_1h_pct*100:.2f}%)
 
-=== LIQUIDATION SAFETY ===
-- LONG liq: ${liq_long} → SL must be above ${round(liq_long * 1.01, 2)}
-- SHORT liq: ${liq_short} → SL must be below ${round(liq_short * 0.99, 2)}
+=== ANTI-WHIPSAW FILTERS (must pass to trade) ===
+1) Distance filter: distance from MA{MA_PERIOD} must be >= {MA_DISTANCE_PCT*100:.2f}%
+2) ATR% filter: {ATR_PCT_MIN_1H*100:.2f}% <= ATR% <= {ATR_PCT_MAX_1H*100:.2f}%
 
-=== MSB + VWAP STRATEGY ===
+=== TREND FILTER ===
+LONG bias only if close > MA{MA_PERIOD} AND MA slope is UP.
+SHORT bias only if close < MA{MA_PERIOD} AND MA slope is DOWN.
 
-1. VWAP Bias (1H):
-   - Price ABOVE 1H VWAP → only LONG
-   - Price BELOW 1H VWAP → only SHORT
+=== ENTRY TRIGGER ===
+LONG trigger only if MACD histogram crosses UP through 0 on candle close.
+SHORT trigger only if MACD histogram crosses DOWN through 0 on candle close.
 
-2. Liquidity Sweep (15M):
-   - BULLISH_SWEEP: wicked below swing low then closed above → going up
-   - BEARISH_SWEEP: wicked above swing high then closed below → going down
-   - No sweep → SKIP
+=== RSI FILTER ===
+LONG only if {RSI_LONG_MIN} <= RSI <= {RSI_LONG_MAX}
+SHORT only if {RSI_SHORT_MIN} <= RSI <= {RSI_SHORT_MAX}
 
-3. Market Structure Break (15M):
-   - After BULLISH_SWEEP: price breaks above recent high → LONG
-   - After BEARISH_SWEEP: price breaks below recent low → SHORT
-   - No MSB → SKIP
+=== SL/TP RULES ===
+Use ATR-based risk:
+- For LONG: SL = price - {SL_ATR_MULT}*ATR, TP = price + {TP_ATR_MULT}*ATR
+- For SHORT: SL = price + {SL_ATR_MULT}*ATR, TP = price - {TP_ATR_MULT}*ATR
+Return exact numbers with 2 decimals.
 
-4. Entry confirmation:
-   - Volume surge > 1.2x
-   - RSI 30-70 range
-   - EMA8/21 aligned with direction
-
-5. SL/TP:
-   - LONG SL: just below sweep wick low
-   - SHORT SL: just above sweep wick high
-   - TP: next significant swing level
-   - Minimum R:R 1.5 — aim for 2.0 when possible
-
-DECISION RULES:
-- LONG: ABOVE 1H VWAP + BULLISH_SWEEP + MSB + volume surge
-- SHORT: BELOW 1H VWAP + BEARISH_SWEEP + MSB + volume surge
-- SKIP: no sweep, no MSB, wrong VWAP side, weak volume
-
-Respond in this exact format:
-SWEEP: BULLISH or BEARISH or NONE
-MSB: YES or NO
-VWAP_BIAS: LONG or SHORT
-SETUP_QUALITY: STRONG or WEAK or NONE
+Respond ONLY in this exact format:
 DECISION: LONG or SHORT or SKIP
-REASON: (2 sentences max)
+REASON: (max 2 sentences)
+PERSONAL_MESSAGE: (one short sentence to the user, optional)
 SL: $X.XX
-TP: $X.XX"""
+TP: $X.XX
+"""
 
-    response = ask_claude(prompt)
-    lines = response.strip().split("\n")
-    decision = "SKIP"
-    sl = tp = 0.0
-    sweep_result = "NONE"
-    msb_result = "NO"
-    setup_quality = "NONE"
-    vwap_bias = "NONE"
+    claude_text = ask_claude(prompt)
+    decision, reason, sl, tp, personal_message = parse_claude_trade_response(claude_text)
 
-    for line in lines:
-        if line.startswith("DECISION:"):
-            decision = line.replace("DECISION:", "").strip()
-        elif line.startswith("SL:"):
-            try:
-                sl = float(line.replace("SL:", "").replace("$", "").strip())
-            except:
-                pass
-        elif line.startswith("TP:"):
-            try:
-                tp = float(line.replace("TP:", "").replace("$", "").strip())
-            except:
-                pass
-        elif line.startswith("SWEEP:"):
-            sweep_result = line.replace("SWEEP:", "").strip()
-        elif line.startswith("MSB:"):
-            msb_result = line.replace("MSB:", "").strip()
-        elif line.startswith("SETUP_QUALITY:"):
-            setup_quality = line.replace("SETUP_QUALITY:", "").strip()
-        elif line.startswith("VWAP_BIAS:"):
-            vwap_bias = line.replace("VWAP_BIAS:", "").strip()
-
-    # Hard rules
-    if decision in ("LONG", "SHORT") and setup_quality != "STRONG":
-        decision = "SKIP"
-        response += "\n[Override: Setup quality not STRONG]"
+    # Always notify every check (decision + reason)
+    send_telegram(
+        f"🧠 <b>CLAUDE CHECK</b> — {now}\n"
+        f"Price: ${price:.2f} | Decision: <b>{decision}</b>\n"
+        f"Reason: {reason if reason else '(none)'}\n"
+        f"{('Message: ' + personal_message + chr(10)) if personal_message else ''}"
+        f"MA{MA_PERIOD}: ${ma200:.2f} | Dist: {dist_pct*100:.2f}% | Slope: {slope_dir}\n"
+        f"RSI: {rsi_1h} | MACD cross: {macd_cross} | ATR%: {atr_1h_pct*100:.2f}%\n"
+        f"Proposed SL/TP: ${sl:.2f} / ${tp:.2f}"
+    )
 
     if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
         side = "Buy" if decision == "LONG" else "Sell"
 
         if not sl_is_safe(side, price, sl, LEVERAGE):
             liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liq ${liq}")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liq ${liq}\nClaude: {decision} | {reason}")
             return
 
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
         if rr < 1.5:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.5 minimum\nSkipping.")
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.5 minimum\nClaude: {decision} | {reason}")
             return
 
         set_leverage()
+        equity_before = equity
         result = place_order(side, sl, tp)
         if result.get("retCode") == 0:
             liq = get_liquidation_price(side, price, LEVERAGE)
             send_telegram(
-                f"🎯 <b>MSB SCALP {decision}</b>\n"
+                f"🎯 <b>CLAUDE {decision}</b>\n"
+                f"Time: {now}\n"
                 f"Price: ${price:.2f} | SL: ${sl} | TP: ${tp}\n"
                 f"R:R: 1:{rr} | Liq: ${liq}\n"
-                f"Sweep: {sweep_result} | MSB: {msb_result}\n"
-                f"VWAP bias: {vwap_bias} | Vol: {volume_surge}x\n\n"
-                f"{response}"
+                f"Reason: {reason}\n\n"
+                f"{claude_text}"
             )
+            state["had_position"] = True
+            if equity_before is not None:
+                state["entry_equity"] = float(equity_before)
+            state["entry_time"] = now
+            state["entry_price"] = price
+            state["entry_side"] = side
+            save_state(state)
         else:
             send_telegram(f"❌ Order failed: {result.get('retMsg')}")
-
     elif decision == "SKIP":
-        send_telegram(
-            f"⏭ <b>SKIP</b> — ${price:.2f}\n"
-            f"VWAP: ${vwap_1h} ({price_vs_vwap_1h}) | 1H: {trend_1h}\n"
-            f"Sweep: {sweep_result} | MSB: {msb_result} | Quality: {setup_quality}\n"
-            f"{response}"
-        )
+        return
     else:
-        send_telegram(f"⚠️ Incomplete data, skipping.\n{response}")
+        send_telegram(f"⚠️ Claude output incomplete; skipping.\n{claude_text}")
 
 def main():
-    send_telegram("🎯 <b>ETH MSB Scalp Bot Started</b>\n45x | 0.04 ETH | 15min | MSB + VWAP")
+    send_telegram(f"📈 <b>ETH Bot Started</b>\n45x | 0.04 ETH | 1h checks | Claude in charge (MACD+RSI+MA{MA_PERIOD})")
     while True:
         try:
             run_cycle()
