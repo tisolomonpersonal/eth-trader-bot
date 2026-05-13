@@ -9,3 +9,4 @@ venv/
 .env
 .env.*
 bot_state.json
+log.txt

@@ -13,7 +13,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
 QTY = 0.04
 LEVERAGE = 45
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))  # seconds
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "900"))  # seconds (default: 15 minutes)
 
 # --- RISK / SAFETY GUARDS ---
 # NOTE: These are *equity-based* limits (USDT). With very small accounts + 45x leverage,
@@ -25,7 +25,9 @@ MAX_CONSEC_LOSS_USD = float(os.environ.get("MAX_CONSEC_LOSS_USD", "4"))
 VOL_SPIKE_ATR_PCT = float(os.environ.get("VOL_SPIKE_ATR_PCT", "0.02"))  # 2%
 VOL_PAUSE_SECONDS = int(os.environ.get("VOL_PAUSE_SECONDS", "1800"))     # 30 minutes
 
-# --- STRATEGY (1H): MACD + RSI + 200 MA + anti-whipsaw filters ---
+# --- STRATEGY (15M): Claude-led market analysis with indicator context + constraints ---
+DECISION_INTERVAL = os.environ.get("DECISION_INTERVAL", "15")  # Bybit kline interval string
+DECISION_CANDLE_LIMIT = int(os.environ.get("DECISION_CANDLE_LIMIT", "500"))
 MA_PERIOD = int(os.environ.get("MA_PERIOD", "200"))
 MA_SLOPE_LOOKBACK = int(os.environ.get("MA_SLOPE_LOOKBACK", "10"))  # candles
 MA_DISTANCE_PCT = float(os.environ.get("MA_DISTANCE_PCT", "0.003"))  # 0.3%
@@ -40,15 +42,16 @@ RSI_LONG_MAX = float(os.environ.get("RSI_LONG_MAX", "70"))
 RSI_SHORT_MIN = float(os.environ.get("RSI_SHORT_MIN", "30"))
 RSI_SHORT_MAX = float(os.environ.get("RSI_SHORT_MAX", "50"))
 
-ATR_PERIOD_1H = int(os.environ.get("ATR_PERIOD_1H", "14"))
-ATR_PCT_MIN_1H = float(os.environ.get("ATR_PCT_MIN_1H", "0.003"))  # 0.3% (avoid dead chop)
-ATR_PCT_MAX_1H = float(os.environ.get("ATR_PCT_MAX_1H", "0.02"))   # 2.0% (avoid chaos)
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
+ATR_PCT_MIN = float(os.environ.get("ATR_PCT_MIN", "0.003"))  # 0.3% (avoid dead chop)
+ATR_PCT_MAX = float(os.environ.get("ATR_PCT_MAX", "0.02"))   # 2.0% (avoid chaos)
 
 SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))
 TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")  # common: UNIFIED / CONTRACT
 STATE_FILE = Path(__file__).with_name("bot_state.json")
+LOG_FILE = Path(__file__).with_name("log.txt")
 
 def utc_now_ts():
     return int(datetime.now(timezone.utc).timestamp())
@@ -81,6 +84,51 @@ def save_state(state):
             json.dump(state, f, indent=2)
     except:
         pass
+
+def append_log(event_type, payload):
+    """
+    Append-only JSONL log for durable audit trail on persistent storage.
+    Each line is: {"ts": "...", "event": "...", ...payload}
+    """
+    try:
+        record = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "event": event_type
+        }
+        if isinstance(payload, dict):
+            record.update(payload)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except:
+        pass
+
+def performance_summary(state):
+    """
+    Returns a small summary dict to feed Claude each cycle (keeps prompt small).
+    """
+    hist = state.get("trade_history") or []
+    pnls = []
+    for t in hist:
+        try:
+            pnls.append(float(t.get("pnl") or 0.0))
+        except:
+            pass
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    total = len(pnls)
+    winrate = (len(wins) / total) * 100 if total else 0.0
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+    last_pnl = pnls[-1] if pnls else 0.0
+    return {
+        "trades": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "winrate": round(winrate, 2),
+        "avg_win": round(avg_win, 4),
+        "avg_loss": round(avg_loss, 4),
+        "last_pnl": round(last_pnl, 4)
+    }
 
 def sign_get_request(query: str):
     """
@@ -538,21 +586,19 @@ def run_cycle():
         }
         save_state(state)
 
-    candles_15m = get_candles("15", 200)
-    candles_1h = get_candles("60", 300)
-
-    if len(candles_15m) < 30 or len(candles_1h) < (MA_PERIOD + MA_SLOPE_LOOKBACK + 5):
-        send_telegram(f"⚠️ Not enough candle data\n15M: {len(candles_15m)} | 1H: {len(candles_1h)}")
+    candles = get_candles(DECISION_INTERVAL, DECISION_CANDLE_LIMIT)
+    if len(candles) < (MA_PERIOD + MA_SLOPE_LOOKBACK + 5):
+        send_telegram(f"⚠️ Not enough candle data\n{DECISION_INTERVAL}M: {len(candles)}")
         return
 
-    # --- 15M indicator (only used for volatility spike pause) ---
-    atr_15m = calculate_atr(candles_15m)
+    # ATR used for volatility pause (same timeframe as decision by default)
+    atr_decision = calculate_atr(candles, period=ATR_PERIOD)
 
     liq_long = get_liquidation_price("Buy", price, LEVERAGE)
     liq_short = get_liquidation_price("Sell", price, LEVERAGE)
 
     # --- VOLATILITY PAUSE ---
-    atr_pct = (atr_15m / price) if price > 0 else 0
+    atr_pct = (atr_decision / price) if price > 0 else 0
     if atr_pct >= VOL_SPIKE_ATR_PCT:
         pause_until = utc_now_ts() + VOL_PAUSE_SECONDS
         if pause_until > int(state.get("paused_until") or 0):
@@ -561,9 +607,17 @@ def run_cycle():
             save_state(state)
             send_telegram(
                 f"⏸ <b>PAUSE</b> — Volatility spike\n"
-                f"15m ATR: {atr_15m} ({atr_pct*100:.2f}%) | Price: ${price:.2f}\n"
+                f"{DECISION_INTERVAL}m ATR: {atr_decision} ({atr_pct*100:.2f}%) | Price: ${price:.2f}\n"
                 f"Pausing for {int(VOL_PAUSE_SECONDS/60)}m."
             )
+            append_log("PAUSE", {
+                "reason": state.get("pause_reason"),
+                "paused_until": state.get("paused_until"),
+                "price": round(price, 2),
+                "atr": atr_decision,
+                "atr_pct": round(atr_pct, 6),
+                "interval": DECISION_INTERVAL
+            })
 
     # --- POSITION TRANSITION TRACKING (for consecutive loss) ---
     # If we *had* a position previously and now it's closed, update consecutive loss.
@@ -586,6 +640,17 @@ def run_cycle():
                 "pnl": round(trade_pnl, 4)
             })
             state["trade_history"] = hist[-50:]
+            append_log("CLOSE", {
+                "side": state.get("entry_side"),
+                "entry_time": state.get("entry_time"),
+                "exit_time": now,
+                "entry_price": state.get("entry_price"),
+                "exit_price": round(price, 2),
+                "pnl": round(trade_pnl, 4),
+                "equity": round(float(equity), 4) if equity is not None else None,
+                "consecutive_loss": state.get("consecutive_loss"),
+                "total_pnl": state.get("total_pnl")
+            })
         state["had_position"] = False
         state["entry_equity"] = None
         state["entry_time"] = None
@@ -620,8 +685,14 @@ def run_cycle():
             f"⏸ <b>PAUSED</b> — ${price:.2f}\n"
             f"Reason: {reason}\n"
             f"Equity: {eq_txt} | Start: {state.get('start_equity')}\n"
-            f"15m ATR%: {atr_pct*100:.2f}%"
+            f"{DECISION_INTERVAL}m ATR%: {atr_pct*100:.2f}%"
         )
+        append_log("PAUSED_SKIP", {
+            "reason": reason,
+            "paused_until": state.get("paused_until"),
+            "price": round(price, 2),
+            "equity": round(float(equity), 4) if equity is not None else None
+        })
         return
 
     if position:
@@ -650,24 +721,26 @@ def run_cycle():
         return
 
     # --- Claude in charge: compute indicators, send to Claude, execute if allowed ---
-    closes_1h = [c["close"] for c in candles_1h]
-    close_1h = closes_1h[-1]
-    ma200 = calculate_sma(closes_1h, MA_PERIOD)
-    ma200_prev = sum(closes_1h[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
+    closes_tf = [c["close"] for c in candles]
+    close_tf = closes_tf[-1]
+    ma200 = calculate_sma(closes_tf, MA_PERIOD)
+    ma200_prev = sum(closes_tf[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
     slope = ma200 - ma200_prev
     slope_dir = "UP" if slope > 0 else "DOWN" if slope < 0 else "FLAT"
-    dist_pct = abs(close_1h - ma200) / ma200 if ma200 else 0
+    dist_pct = abs(close_tf - ma200) / ma200 if ma200 else 0
 
-    rsi_1h = calculate_rsi(closes_1h, period=RSI_PERIOD)
-    macd_line, sig_line, hist = calculate_macd(closes_1h)
+    rsi_tf = calculate_rsi(closes_tf, period=RSI_PERIOD)
+    macd_line, sig_line, hist = calculate_macd(closes_tf)
     macd_hist_last = hist[-1] if hist else 0
     macd_hist_prev = hist[-2] if len(hist) >= 2 else 0
-    macd_cross = "UP" if (macd_hist_last > 0 and macd_hist_prev <= 0) else "DOWN" if (macd_hist_last < 0 and macd_hist_prev >= 0) else "NONE"
+    # Easier trigger (higher frequency): momentum direction + histogram sign,
+    # not only a 0-cross event.
+    macd_momentum = "UP" if macd_hist_last > macd_hist_prev else "DOWN" if macd_hist_last < macd_hist_prev else "FLAT"
 
-    atr_1h = calculate_atr(candles_1h, period=ATR_PERIOD_1H)
-    atr_1h_pct = (atr_1h / close_1h) if close_1h > 0 else 0
+    atr_tf = calculate_atr(candles, period=ATR_PERIOD)
+    atr_tf_pct = (atr_tf / close_tf) if close_tf > 0 else 0
 
-    # Performance context for Claude (lightweight, last 5 trades)
+    # Performance context for Claude (summary + last 5 trades)
     hist = state.get("trade_history") or []
     last5 = hist[-5:]
     perf_lines = []
@@ -678,6 +751,7 @@ def run_cycle():
             pass
     perf_text = "\n".join(perf_lines) if perf_lines else "No closed trades recorded yet."
     daily_pnl = (float(equity) - float(state.get("start_equity"))) if (equity is not None and state.get("start_equity") is not None) else 0.0
+    perf = performance_summary(state)
 
     prompt = f"""You are Claude, acting as the trading decision maker.
 You MUST follow the rules below exactly.
@@ -691,29 +765,30 @@ Fear & Greed: {fear_greed}
 Today's PnL (equity-based): ${daily_pnl:.2f}
 Consecutive loss (equity-based): ${float(state.get("consecutive_loss") or 0.0):.2f}
 Lifetime PnL (equity-based): ${float(state.get("total_pnl") or 0.0):.2f}
+Stats: trades={perf['trades']} winrate={perf['winrate']}% avg_win={perf['avg_win']} avg_loss={perf['avg_loss']} last_pnl={perf['last_pnl']}
 Last trades:
 {perf_text}
 
-=== 1H INDICATORS ===
-Close: ${close_1h:.2f}
+=== {DECISION_INTERVAL}M INDICATORS ===
+Close: ${close_tf:.2f}
 MA{MA_PERIOD}: ${ma200:.2f}
 MA{MA_PERIOD} slope ({MA_SLOPE_LOOKBACK} bars): {slope_dir} (delta {slope:.4f})
 Distance from MA{MA_PERIOD}: {dist_pct*100:.2f}%
-RSI({RSI_PERIOD}): {rsi_1h}
-MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} cross={macd_cross}
-ATR({ATR_PERIOD_1H}): {atr_1h} ({atr_1h_pct*100:.2f}%)
+RSI({RSI_PERIOD}): {rsi_tf}
+MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} momentum={macd_momentum}
+ATR({ATR_PERIOD}): {atr_tf} ({atr_tf_pct*100:.2f}%)
 
 === ANTI-WHIPSAW FILTERS (must pass to trade) ===
 1) Distance filter: distance from MA{MA_PERIOD} must be >= {MA_DISTANCE_PCT*100:.2f}%
-2) ATR% filter: {ATR_PCT_MIN_1H*100:.2f}% <= ATR% <= {ATR_PCT_MAX_1H*100:.2f}%
+2) ATR% filter: {ATR_PCT_MIN*100:.2f}% <= ATR% <= {ATR_PCT_MAX*100:.2f}%
 
 === TREND FILTER ===
 LONG bias only if close > MA{MA_PERIOD} AND MA slope is UP.
 SHORT bias only if close < MA{MA_PERIOD} AND MA slope is DOWN.
 
 === ENTRY TRIGGER ===
-LONG trigger only if MACD histogram crosses UP through 0 on candle close.
-SHORT trigger only if MACD histogram crosses DOWN through 0 on candle close.
+LONG trigger only if MACD histogram is > 0 AND momentum is UP.
+SHORT trigger only if MACD histogram is < 0 AND momentum is DOWN.
 
 === RSI FILTER ===
 LONG only if {RSI_LONG_MIN} <= RSI <= {RSI_LONG_MAX}
@@ -743,9 +818,32 @@ TP: $X.XX
         f"Reason: {reason if reason else '(none)'}\n"
         f"{('Message: ' + personal_message + chr(10)) if personal_message else ''}"
         f"MA{MA_PERIOD}: ${ma200:.2f} | Dist: {dist_pct*100:.2f}% | Slope: {slope_dir}\n"
-        f"RSI: {rsi_1h} | MACD cross: {macd_cross} | ATR%: {atr_1h_pct*100:.2f}%\n"
+        f"RSI: {rsi_tf} | MACD momentum: {macd_momentum} | ATR%: {atr_tf_pct*100:.2f}%\n"
         f"Proposed SL/TP: ${sl:.2f} / ${tp:.2f}"
     )
+    append_log("CHECK", {
+        "now": now,
+        "price": round(price, 2),
+        "equity": round(float(equity), 4) if equity is not None else None,
+        "decision": decision,
+        "reason": reason,
+        "personal_message": personal_message,
+        "sl": round(sl, 2) if sl else 0.0,
+        "tp": round(tp, 2) if tp else 0.0,
+        "ma200": round(ma200, 4) if ma200 is not None else None,
+        "ma_slope": slope_dir,
+        "ma_dist_pct": round(dist_pct, 6),
+        "rsi": rsi_tf,
+        "macd_momentum": macd_momentum,
+        "macd_hist_prev": round(macd_hist_prev, 8),
+        "macd_hist_last": round(macd_hist_last, 8),
+        "atr": atr_tf,
+        "atr_pct": round(atr_tf_pct, 6),
+        "interval": DECISION_INTERVAL,
+        "daily_pnl": round(daily_pnl, 4),
+        "consecutive_loss": float(state.get("consecutive_loss") or 0.0),
+        "total_pnl": float(state.get("total_pnl") or 0.0)
+    })
 
     if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
         side = "Buy" if decision == "LONG" else "Sell"
@@ -753,6 +851,7 @@ TP: $X.XX
         if not sl_is_safe(side, price, sl, LEVERAGE):
             liq = get_liquidation_price(side, price, LEVERAGE)
             send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liq ${liq}\nClaude: {decision} | {reason}")
+            append_log("BLOCK", {"type": "SL_TOO_CLOSE_TO_LIQ", "decision": decision, "reason": reason, "sl": sl, "liq": liq})
             return
 
         sl_dist = abs(price - sl)
@@ -760,6 +859,7 @@ TP: $X.XX
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
         if rr < 1.5:
             send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.5 minimum\nClaude: {decision} | {reason}")
+            append_log("BLOCK", {"type": "RR_TOO_LOW", "decision": decision, "reason": reason, "rr": rr, "sl": sl, "tp": tp})
             return
 
         set_leverage()
@@ -782,15 +882,35 @@ TP: $X.XX
             state["entry_price"] = price
             state["entry_side"] = side
             save_state(state)
+            append_log("ORDER", {
+                "side": side,
+                "decision": decision,
+                "price": round(price, 2),
+                "sl": sl,
+                "tp": tp,
+                "rr": rr,
+                "liq": liq,
+                "equity_before": round(float(equity_before), 4) if equity_before is not None else None
+            })
         else:
             send_telegram(f"❌ Order failed: {result.get('retMsg')}")
+            append_log("ORDER_FAIL", {
+                "side": side,
+                "decision": decision,
+                "price": round(price, 2),
+                "sl": sl,
+                "tp": tp,
+                "retCode": result.get("retCode"),
+                "retMsg": result.get("retMsg")
+            })
     elif decision == "SKIP":
         return
     else:
         send_telegram(f"⚠️ Claude output incomplete; skipping.\n{claude_text}")
 
 def main():
-    send_telegram(f"📈 <b>ETH Bot Started</b>\n45x | 0.04 ETH | 1h checks | Claude in charge (MACD+RSI+MA{MA_PERIOD})")
+    send_telegram(f"📈 <b>ETH Bot Started</b>\n45x | 0.04 ETH | {int(CHECK_INTERVAL/60)}m checks | Claude in charge ({DECISION_INTERVAL}m MACD/RSI/MA{MA_PERIOD})")
+    append_log("START", {"symbol": SYMBOL, "qty": QTY, "leverage": LEVERAGE, "check_interval": CHECK_INTERVAL})
     while True:
         try:
             run_cycle()
@@ -799,6 +919,7 @@ def main():
             send_telegram(err)
             print(err)
             print(traceback.format_exc())
+            append_log("ERROR", {"error": err, "traceback": traceback.format_exc()})
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
