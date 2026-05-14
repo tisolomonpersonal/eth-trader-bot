@@ -213,10 +213,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 </body>
 </html>'''
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
 def load_state():
     if STATE_FILE.exists():
         try:
@@ -415,6 +411,11 @@ def run_cycle():
             state["daily_pnl"] = 0
         state["position"] = position
         save_state(state)
+
+        # The dashboard Stop/Start controls toggle this flag.
+        if not state.get("trading_enabled", True):
+            send_telegram(f"STOPPED - ${price:.2f}\nTrading is disabled from the dashboard.")
+            return
 
         # Check pause
         if state.get("paused") and state.get("pause_until") and time.time() < state.get("pause_until"):
@@ -672,6 +673,11 @@ def api_status():
         "last_trade": state.get("last_trade"),
         "trades_today": state.get("trades_today"),
         "max_trades_per_day": state.get("max_trades_per_day"),
+        "trading_enabled": state.get("trading_enabled", True),
+        "win_count": state.get("win_count"),
+        "loss_count": state.get("loss_count"),
+        "avg_win": state.get("avg_win"),
+        "avg_loss": state.get("avg_loss"),
         "bot_running": bot_running,
         "bot_error": bot_error
     })
