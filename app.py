@@ -208,7 +208,11 @@ def run_cycle():
         if state.get("day") != today:
             state = {"day": today, "equity_start": equity, "daily_pnl": 0, "consecutive_loss": 0, "trades_today": 0, "max_trades_per_day": 10, "trading_enabled": True, "paused": False, "pause_until": None, "pause_reason": None, "had_position": False, "entry_equity": None, "lifetime_pnl": state.get("lifetime_pnl", 0), "last_trade": None, "win_count": state.get("win_count", 0), "loss_count": state.get("loss_count", 0), "avg_win": state.get("avg_win", 0), "avg_loss": state.get("avg_loss", 0), "last_5_trades": []}
         state["equity"] = equity
-        state["daily_pnl"] = equity - state.get("equity_start", equity)
+        equity_start = state.get("equity_start")
+        if equity is not None and equity_start is not None:
+            state["daily_pnl"] = equity - equity_start
+        else:
+            state["daily_pnl"] = 0
         state["position"] = position
         save_state(state)
 
