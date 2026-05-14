@@ -6,6 +6,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+import bot as trader_bot
 
 app = Flask(__name__)
 
@@ -627,13 +628,28 @@ Only trade if QUALITY is A or B and you're confident."""
 
 def bot_thread():
     global bot_running, bot_error
+    trader_bot.send_telegram(
+        f"📈 <b>ETH Bot Started</b>\n"
+        f"{trader_bot.LEVERAGE}x | {trader_bot.QTY} ETH | "
+        f"{int(trader_bot.CHECK_INTERVAL/60)}m checks | Claude in charge "
+        f"({trader_bot.DECISION_INTERVAL}m MACD/RSI/MA{trader_bot.MA_PERIOD})"
+    )
+    trader_bot.append_log("START", {
+        "symbol": trader_bot.SYMBOL,
+        "qty": trader_bot.QTY,
+        "leverage": trader_bot.LEVERAGE,
+        "check_interval": trader_bot.CHECK_INTERVAL
+    })
     while True:
         try:
-            run_cycle()
+            bot_running = True
+            bot_error = None
+            trader_bot.run_cycle()
         except Exception as e:
             bot_error = str(e)
+            trader_bot.send_telegram(f"⚠️ Error: {type(e).__name__}: {str(e)}")
         # Sleep for CHECK_INTERVAL (default 1 hour)
-        time.sleep(int(os.environ.get("CHECK_INTERVAL", "3600")))
+        time.sleep(trader_bot.CHECK_INTERVAL)
 
 # Start bot in background thread (after Flask is ready)
 import threading
@@ -662,22 +678,30 @@ def index():
 @app.route('/api/status')
 def api_status():
     state = load_state()
+    paused_until = int(state.get("paused_until") or state.get("pause_until") or 0)
+    is_paused = bool(state.get("paused")) or time.time() < paused_until
+    start_equity = state.get("start_equity") or state.get("equity_start")
+    equity = state.get("equity")
+    daily_pnl = state.get("daily_pnl")
+    if daily_pnl is None and equity is not None and start_equity is not None:
+        daily_pnl = float(equity) - float(start_equity)
+    perf = trader_bot.performance_summary(state)
     return jsonify({
-        "equity": state.get("equity"),
-        "daily_pnl": state.get("daily_pnl"),
+        "equity": equity,
+        "daily_pnl": daily_pnl,
         "consecutive_loss": state.get("consecutive_loss"),
-        "lifetime_pnl": state.get("lifetime_pnl"),
-        "paused": state.get("paused"),
-        "pause_reason": state.get("pause_reason"),
+        "lifetime_pnl": state.get("total_pnl", state.get("lifetime_pnl")),
+        "paused": is_paused,
+        "pause_reason": state.get("pause_reason", ""),
         "position": state.get("position"),
         "last_trade": state.get("last_trade"),
         "trades_today": state.get("trades_today"),
         "max_trades_per_day": state.get("max_trades_per_day"),
         "trading_enabled": state.get("trading_enabled", True),
-        "win_count": state.get("win_count"),
-        "loss_count": state.get("loss_count"),
-        "avg_win": state.get("avg_win"),
-        "avg_loss": state.get("avg_loss"),
+        "win_count": perf.get("wins"),
+        "loss_count": perf.get("losses"),
+        "avg_win": perf.get("avg_win"),
+        "avg_loss": perf.get("avg_loss"),
         "bot_running": bot_running,
         "bot_error": bot_error
     })
@@ -690,7 +714,8 @@ def api_pause():
     state = load_state()
     state["paused"] = True
     state["pause_reason"] = reason
-    state["pause_until"] = (datetime.now(timezone.utc).timestamp() + minutes * 60)
+    state["paused_until"] = int(datetime.now(timezone.utc).timestamp() + minutes * 60)
+    state["pause_until"] = state["paused_until"]
     save_state(state)
     return jsonify({"status": "paused", "minutes": minutes, "reason": reason})
 
@@ -699,6 +724,7 @@ def api_resume():
     state = load_state()
     state["paused"] = False
     state["pause_reason"] = None
+    state["paused_until"] = 0
     state["pause_until"] = None
     save_state(state)
     return jsonify({"status": "resumed"})

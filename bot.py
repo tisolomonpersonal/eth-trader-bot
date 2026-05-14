@@ -591,6 +591,13 @@ def run_cycle():
         send_telegram(f"⚠️ Not enough candle data\n{DECISION_INTERVAL}M: {len(candles)}")
         return
 
+    # Dashboard Stop/Start control. Existing positions are still reported, but no new
+    # entries are opened while trading is disabled.
+    if not state.get("trading_enabled", True) and not position:
+        send_telegram(f"STOPPED - ${price:.2f}\nTrading is disabled from the dashboard.")
+        append_log("STOPPED_SKIP", {"price": round(price, 2), "reason": "trading_enabled=false"})
+        return
+
     # ATR used for volatility pause (same timeframe as decision by default)
     atr_decision = calculate_atr(candles, period=ATR_PERIOD)
 
