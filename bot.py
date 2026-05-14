@@ -587,6 +587,8 @@ def run_cycle():
         save_state(state)
 
     state["equity"] = equity
+    state["price"] = price
+    state["position"] = position
     if equity is not None and state.get("start_equity") is not None:
         state["daily_pnl"] = float(equity) - float(state["start_equity"])
     else:

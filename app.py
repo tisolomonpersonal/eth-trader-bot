@@ -88,6 +88,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     <div class="stat-label">Consecutive Loss</div>
                     <div class="stat-value" id="consecutiveLoss">--</div>
                 </div>
+                <div class="stat">
+                    <div class="stat-label">Trade Mood</div>
+                    <div class="stat-value" id="tradeMood">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Live Trade PnL</div>
+                    <div class="stat-value" id="livePnl">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Trade Side</div>
+                    <div class="stat-value neutral" id="tradeSide">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Entry / Mark</div>
+                    <div class="stat-value neutral" id="entryMark">--</div>
+                </div>
             </div>
         </div>
 
@@ -144,6 +160,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
         }
 
+        function tradeMood(pnl) {
+            if (typeof pnl !== 'number' || !Number.isFinite(pnl)) return { icon: '😴', label: 'No trade', tone: 'neutral' };
+            if (pnl <= -4) return { icon: '😱', label: 'Very bad', tone: 'negative' };
+            if (pnl <= -2) return { icon: '😬', label: 'Bad', tone: 'negative' };
+            if (pnl < 0) return { icon: '😐', label: 'Slightly red', tone: 'negative' };
+            if (pnl < 1) return { icon: '🙂', label: 'Okay', tone: 'neutral' };
+            if (pnl < 3) return { icon: '😎', label: 'Good', tone: 'positive' };
+            return { icon: '🚀', label: 'Great', tone: 'positive' };
+        }
+
         async function fetchData() {
             try {
                 const res = await fetch('/api/status');
@@ -157,6 +183,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 document.getElementById('lifetimePnl').textContent = money(data.lifetime_pnl);
                 document.getElementById('tradesToday').textContent = data.trades_today || 0;
                 document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+
+                const pnl = data.live_pnl;
+                const mood = tradeMood(pnl);
+                const livePnlEl = document.getElementById('livePnl');
+                const moodEl = document.getElementById('tradeMood');
+                livePnlEl.textContent = money(pnl);
+                livePnlEl.className = `stat-value ${pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'neutral'}`;
+                moodEl.textContent = `${mood.icon} ${mood.label}`;
+                moodEl.className = `stat-value ${mood.tone}`;
+                document.getElementById('tradeSide').textContent = data.position_side || '--';
+                document.getElementById('entryMark').textContent = data.entry_price && data.mark_price ? `$${data.entry_price.toFixed(2)} / $${data.mark_price.toFixed(2)}` : '--';
                 
                 // Win rate
                 if (data.win_count || data.loss_count) {
@@ -719,6 +756,21 @@ def api_status():
     if daily_pnl is None and equity is not None and start_equity is not None:
         daily_pnl = float(equity) - float(start_equity)
     perf = trader_bot.performance_summary(state)
+    position = state.get("position") or {}
+    live_pnl = None
+    entry_price = None
+    mark_price = state.get("price")
+    position_side = None
+    position_size = None
+    try:
+        if position and float(position.get("size") or 0) > 0:
+            live_pnl = float(position.get("unrealisedPnl") or 0)
+            entry_price = float(position.get("avgPrice") or 0) or None
+            mark_price = float(position.get("markPrice") or mark_price or 0) or None
+            position_side = position.get("side")
+            position_size = float(position.get("size") or 0)
+    except (TypeError, ValueError):
+        pass
     return jsonify({
         "equity": equity,
         "daily_pnl": daily_pnl,
@@ -727,6 +779,11 @@ def api_status():
         "paused": is_paused,
         "pause_reason": state.get("pause_reason", ""),
         "position": state.get("position"),
+        "live_pnl": live_pnl,
+        "entry_price": entry_price,
+        "mark_price": mark_price,
+        "position_side": position_side,
+        "position_size": position_size,
         "last_trade": state.get("last_trade"),
         "trades_today": state.get("trades_today"),
         "max_trades_per_day": state.get("max_trades_per_day"),
