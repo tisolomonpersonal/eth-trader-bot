@@ -54,57 +54,71 @@ def get_candles(interval, limit):
         return []
 
 def calculate_ma(candles, period):
-    if len(candles) < period:
+    if not candles or len(candles) < period:
         return None
-    closes = [float(c[4]) for c in candles]
-    return sum(closes[-period:]) / period
+    try:
+        closes = [float(c[4]) for c in candles]
+        return sum(closes[-period:]) / period
+    except (TypeError, ValueError, IndexError):
+        return None
 
 def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1:
+    if not candles or len(candles) < period + 1:
         return None
-    closes = [float(c[4]) for c in candles]
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(0, diff))
-        losses.append(max(0, -diff))
-    if len(gains) < period:
+    try:
+        closes = [float(c[4]) for c in candles]
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i-1]
+            gains.append(max(0, diff))
+            losses.append(max(0, -diff))
+        if len(gains) < period:
+            return None
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    except (TypeError, ValueError, IndexError):
         return None
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
 def calculate_macd(candles, fast=12, slow=26, signal=9):
-    if len(candles) < slow + signal:
+    if not candles or len(candles) < slow + signal:
         return None, None, None
-    closes = [float(c[4]) for c in candles]
-    ema_fast = [sum(closes[:fast])/fast]
-    ema_slow = [sum(closes[:slow])/slow]
-    for i in range(fast, len(closes)):
-        ema_fast.append((closes[i] * 2/(fast+1)) + (ema_fast[-1] * (1 - 2/(fast+1))))
-    for i in range(slow, len(closes)):
-        ema_slow.append((closes[i] * 2/(slow+1)) + (ema_slow[-1] * (1 - 2/(slow+1))))
-    macd_line = [f - s for f, s in zip(ema_fast[slow-slow:], ema_slow)]
-    signal_line = [sum(macd_line[:signal])/signal] * len(macd_line)
-    for i in range(signal, len(macd_line)):
-        signal_line[i] = (macd_line[i] * 2/(signal+1)) + (signal_line[i-1] * (1 - 2/(signal+1)))
-    histogram = [m - s for m, s in zip(macd_line, signal_line)]
-    return macd_line[-1], signal_line[-1], histogram[-1]
+    try:
+        closes = [float(c[4]) for c in candles]
+        ema_fast = [sum(closes[:fast])/fast]
+        ema_slow = [sum(closes[:slow])/slow]
+        for i in range(fast, len(closes)):
+            ema_fast.append((closes[i] * 2/(fast+1)) + (ema_fast[-1] * (1 - 2/(fast+1))))
+        for i in range(slow, len(closes)):
+            ema_slow.append((closes[i] * 2/(slow+1)) + (ema_slow[-1] * (1 - 2/(slow+1))))
+        macd_line = [f - s for f, s in zip(ema_fast[slow-slow:], ema_slow)]
+        signal_line = [sum(macd_line[:signal])/signal] * len(macd_line)
+        for i in range(signal, len(macd_line)):
+            signal_line[i] = (macd_line[i] * 2/(signal+1)) + (signal_line[i-1] * (1 - 2/(signal+1)))
+        histogram = [m - s for m, s in zip(macd_line, signal_line)]
+        return macd_line[-1], signal_line[-1], histogram[-1]
+    except (TypeError, ValueError, IndexError, ZeroDivisionError):
+        return None, None, None
 
 def calculate_atr(candles, period=14):
-    if len(candles) < period + 1:
+    if not candles or len(candles) < period + 1:
         return None
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, c = float(candles[i][2]), float(candles[i][3]), float(candles[i][4])
-        prev_c = float(candles[i-1][4])
-        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-        trs.append(tr)
-    return sum(trs[-period:]) / period
+    try:
+        trs = []
+        for i in range(1, len(candles)):
+            h = float(candles[i][2])
+            l = float(candles[i][3])
+            c = float(candles[i][4])
+            prev_c = float(candles[i-1][4])
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        return sum(trs[-period:]) / period
+    except (TypeError, ValueError, IndexError):
+        return None
 
 def get_price():
     url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=ETHUSDT"
