@@ -647,8 +647,8 @@ Only trade if QUALITY is A or B and you're confident."""
             sl_dist = abs(price_now - sl)
             tp_dist = abs(tp - price_now)
             rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
-            if rr < 1.5:
-                send_telegram(f"⚠️ <b>SKIP</b> — R:R {rr} < 1.5\n{reason}")
+            if rr < 1.0:
+                send_telegram(f"⚠️ <b>SKIP</b> — R:R {rr} < 1.0\n{reason}")
                 return
 
             # Place order

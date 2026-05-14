@@ -819,7 +819,7 @@ Last 10 candles:
 === HARD CONSTRAINTS (the system will block trades that violate these) ===
 1) You MUST output a clear DECISION: LONG, SHORT, or SKIP.
 2) If LONG/SHORT, you MUST provide SL and TP (2 decimals).
-3) Aim for minimum R:R >= 1.5 (TP distance / SL distance).
+3) Aim for minimum R:R >= 1.0 (TP distance / SL distance).
 4) Avoid liquidation risk (45x leverage): keep SL far enough from liquidation.
 5) If today's PnL is near the daily limit or consecutive losses are high, be more conservative.
 
@@ -883,8 +883,8 @@ TP: $X.XX
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
-        if rr < 1.5:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.5 minimum\nClaude: {decision} | {reason}")
+        if rr < 1.0:
+            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.0 minimum\nClaude: {decision} | {reason}")
             append_log("BLOCK", {"type": "RR_TOO_LOW", "decision": decision, "reason": reason, "rr": rr, "sl": sl, "tp": tp})
             return
 
