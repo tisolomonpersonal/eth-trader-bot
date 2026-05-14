@@ -140,16 +140,21 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
 
     <script>
+        function money(value) {
+            return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
+        }
+
         async function fetchData() {
             try {
                 const res = await fetch('/api/status');
+                if (!res.ok) throw new Error(`Status ${res.status}`);
                 const data = await res.json();
                 
-                document.getElementById('equity').textContent = data.equity ? `$${data.equity.toFixed(2)}` : '--';
-                document.getElementById('dailyPnl').textContent = data.daily_pnl !== undefined ? `$${data.daily_pnl.toFixed(2)}` : '--';
+                document.getElementById('equity').textContent = money(data.equity);
+                document.getElementById('dailyPnl').textContent = money(data.daily_pnl);
                 document.getElementById('dailyPnl').className = 'stat-value ' + (data.daily_pnl > 0 ? 'positive' : data.daily_pnl < 0 ? 'negative' : 'neutral');
-                document.getElementById('consecutiveLoss').textContent = data.consecutive_loss !== undefined ? `$${data.consecutive_loss.toFixed(2)}` : '--';
-                document.getElementById('lifetimePnl').textContent = data.lifetime_pnl !== undefined ? `$${data.lifetime_pnl.toFixed(2)}` : '--';
+                document.getElementById('consecutiveLoss').textContent = money(data.consecutive_loss);
+                document.getElementById('lifetimePnl').textContent = money(data.lifetime_pnl);
                 document.getElementById('tradesToday').textContent = data.trades_today || 0;
                 document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
                 
@@ -187,9 +192,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 document.querySelector('.btn-warning').style.display = !data.paused && data.bot_running ? 'inline-block' : 'none';
                 document.querySelector('.btn-danger').style.display = data.bot_running ? 'inline-block' : 'none';
                 document.querySelector('.btn-primary').style.display = !data.bot_running ? 'inline-block' : 'none';
+                fetchLog();
                 
             } catch (e) {
                 console.error('Fetch error:', e);
+            }
+        }
+
+        async function fetchLog() {
+            try {
+                const res = await fetch('/api/log');
+                if (!res.ok) throw new Error(`Log ${res.status}`);
+                const data = await res.json();
+                const log = document.getElementById('activityLog');
+                const lines = data.log || [];
+                if (!lines.length) return;
+                log.innerHTML = lines.slice(-12).reverse().map((line) => {
+                    let text = line.trim();
+                    let time = '';
+                    let cls = 'log-msg';
+                    try {
+                        const item = JSON.parse(text);
+                        time = item.ts ? new Date(item.ts).toLocaleTimeString() : '';
+                        cls += ` ${(item.event || '').toLowerCase()}`;
+                        text = `${item.event || 'LOG'} ${JSON.stringify(item.payload || item)}`;
+                    } catch (e) {
+                        cls += text.toLowerCase().includes('error') ? ' error' : '';
+                    }
+                    return `<div class="log-entry"><span class="log-time">${time}</span><span class="${cls}">${text}</span></div>`;
+                }).join('');
+            } catch (e) {
+                console.error('Log fetch error:', e);
             }
         }
         

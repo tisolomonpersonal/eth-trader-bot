@@ -586,6 +586,17 @@ def run_cycle():
         }
         save_state(state)
 
+    state["equity"] = equity
+    if equity is not None and state.get("start_equity") is not None:
+        state["daily_pnl"] = float(equity) - float(state["start_equity"])
+    else:
+        state["daily_pnl"] = None
+    state["trades_today"] = len([
+        t for t in state.get("trade_history", [])
+        if str(t.get("exit_time", "")).startswith(today)
+    ])
+    save_state(state)
+
     candles = get_candles(DECISION_INTERVAL, DECISION_CANDLE_LIMIT)
     if len(candles) < (MA_PERIOD + MA_SLOPE_LOOKBACK + 5):
         send_telegram(f"⚠️ Not enough candle data\n{DECISION_INTERVAL}M: {len(candles)}")
