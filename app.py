@@ -41,11 +41,16 @@ def get_last_lines(n=20):
 import requests, hmac, hashlib
 
 def get_candles(interval, limit):
-    url = f"https://api.bybit.com/v5/market/kline?symbol=ETHUSDT&interval={interval}&limit={limit}"
+    url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol=ETHUSDT&interval={interval}&limit={limit}"
     try:
         r = requests.get(url, timeout=10)
-        return r.json().get("result", {}).get("list", [])
-    except:
+        data = r.json()
+        if data.get("retCode") != 0:
+            send_telegram(f"⚠️ Kline API error: {data.get('retMsg')}")
+            return []
+        return data.get("result", {}).get("list", [])
+    except Exception as e:
+        send_telegram(f"⚠️ Kline API error: {str(e)}")
         return []
 
 def calculate_ma(candles, period):
@@ -102,11 +107,16 @@ def calculate_atr(candles, period=14):
     return sum(trs[-period:]) / period
 
 def get_price():
-    url = "https://api.bybit.com/v5/market/tickers?symbol=ETHUSDT"
+    url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=ETHUSDT"
     try:
         r = requests.get(url, timeout=10)
-        return float(r.json()["result"]["list"][0]["markPrice"])
-    except:
+        data = r.json()
+        if data.get("retCode") != 0:
+            send_telegram(f"⚠️ Tickers API error: {data.get('retMsg')}")
+            return None
+        return float(data["result"]["list"][0]["markPrice"])
+    except Exception as e:
+        send_telegram(f"⚠️ Tickers API error: {str(e)}")
         return None
 
 def get_equity():
