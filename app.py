@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template_string
 import json
 import os
 import threading
@@ -16,6 +16,206 @@ LOG_FILE = Path(__file__).parent / "log.txt"
 # Bot state for API
 bot_running = False
 bot_error = None
+
+# HTML template
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETH Trader Bot</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; color: #38bdf8; }
+        .card { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 16px; border: 1px solid #334155; }
+        .card h2 { font-size: 1.1rem; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+        .stat { background: #0f172a; padding: 12px; border-radius: 8px; text-align: center; }
+        .stat-label { font-size: 0.75rem; color: #64748b; margin-bottom: 4px; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; }
+        .stat-value.positive { color: #4ade80; }
+        .stat-value.negative { color: #f87171; }
+        .stat-value.neutral { color: #38bdf8; }
+        .status-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
+        .status-running { background: #10b981; color: white; }
+        .status-paused { background: #f59e0b; color: white; }
+        .status-error { background: #ef4444; color: white; }
+        .controls { display: flex; gap: 10px; flex-wrap: wrap; }
+        button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; transition: all 0.2s; }
+        button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .btn-primary { background: #38bdf8; color: white; }
+        .btn-success { background: #4ade80; color: white; }
+        .btn-danger { background: #f87171; color: white; }
+        .btn-warning { background: #f59e0b; color: white; }
+        .log { background: #0f172a; border-radius: 8px; padding: 12px; max-height: 300px; overflow-y: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 0.85rem; }
+        .log-entry { padding: 4px 0; border-bottom: 1px solid #1e293b; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-time { color: #64748b; margin-right: 8px; }
+        .log-msg { color: #e2e8f0; }
+        .log-msg.skip { color: #94a3b8; }
+        .log-msg.long { color: #4ade80; }
+        .log-msg.short { color: #f87171; }
+        .log-msg.error { color: #ef4444; }
+        .log-msg.trade { color: #38bdf8; }
+        .info { background: #0f172a; padding: 12px; border-radius: 8px; font-size: 0.85rem; color: #94a3b8; }
+        .info strong { color: #e2e8f0; }
+        .last-update { text-align: center; color: #64748b; font-size: 0.85rem; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📈 ETH Trader Bot</h1>
+        
+        <div class="card">
+            <h2>Status</h2>
+            <div class="grid">
+                <div class="stat">
+                    <div class="stat-label">Bot Status</div>
+                    <div class="stat-value" id="botStatus">Checking...</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Equity</div>
+                    <div class="stat-value neutral" id="equity">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Daily PnL</div>
+                    <div class="stat-value" id="dailyPnl">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Consecutive Loss</div>
+                    <div class="stat-value" id="consecutiveLoss">--</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Performance</h2>
+            <div class="grid">
+                <div class="stat">
+                    <div class="stat-label">Lifetime PnL</div>
+                    <div class="stat-value" id="lifetimePnl">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Trades Today</div>
+                    <div class="stat-value" id="tradesToday">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Win Rate</div>
+                    <div class="stat-value" id="winRate">--</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Avg Win/Loss</div>
+                    <div class="stat-value" id="avgWinLoss">--</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Controls</h2>
+            <div class="controls">
+                <button class="btn-success" onclick="resumeTrading()">▶ Resume</button>
+                <button class="btn-warning" onclick="pauseTrading()">⏸ Pause</button>
+                <button class="btn-danger" onclick="stopTrading()">⏹ Stop</button>
+                <button class="btn-primary" onclick="startTrading()">▶ Start</button>
+            </div>
+            <div class="info" style="margin-top: 12px;">
+                <strong>Max Daily Loss:</strong> $<span id="maxDailyLoss">2</span> | 
+                <strong>Max Consecutive Loss:</strong> $<span id="maxConsecLoss">4</span> | 
+                <strong>Position:</strong> 0.04 ETH | 
+                <strong>Leverage:</strong> 45x
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Recent Activity</h2>
+            <div class="log" id="activityLog">
+                <div class="log-entry"><span class="log-time">--:--:--</span><span class="log-msg">Waiting for first cycle...</span></div>
+            </div>
+        </div>
+
+        <div class="last-update">Last updated: <span id="lastUpdate">--</span></div>
+    </div>
+
+    <script>
+        async function fetchData() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                document.getElementById('equity').textContent = data.equity ? `$${data.equity.toFixed(2)}` : '--';
+                document.getElementById('dailyPnl').textContent = data.daily_pnl !== undefined ? `$${data.daily_pnl.toFixed(2)}` : '--';
+                document.getElementById('dailyPnl').className = 'stat-value ' + (data.daily_pnl > 0 ? 'positive' : data.daily_pnl < 0 ? 'negative' : 'neutral');
+                document.getElementById('consecutiveLoss').textContent = data.consecutive_loss !== undefined ? `$${data.consecutive_loss.toFixed(2)}` : '--';
+                document.getElementById('lifetimePnl').textContent = data.lifetime_pnl !== undefined ? `$${data.lifetime_pnl.toFixed(2)}` : '--';
+                document.getElementById('tradesToday').textContent = data.trades_today || 0;
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                
+                // Win rate
+                if (data.win_count || data.loss_count) {
+                    const total = data.win_count + data.loss_count;
+                    const rate = total > 0 ? ((data.win_count / total) * 100).toFixed(1) : 0;
+                    document.getElementById('winRate').textContent = `${rate}%`;
+                } else {
+                    document.getElementById('winRate').textContent = '--';
+                }
+                
+                // Avg win/loss
+                if (data.avg_win || data.avg_loss) {
+                    document.getElementById('avgWinLoss').textContent = `W: $${data.avg_win || 0} / L: $${data.avg_loss || 0}`;
+                } else {
+                    document.getElementById('avgWinLoss').textContent = '--';
+                }
+                
+                // Bot status
+                const statusEl = document.getElementById('botStatus');
+                if (data.paused) {
+                    statusEl.textContent = 'Paused';
+                    statusEl.className = 'status-badge status-paused';
+                } else if (data.bot_running) {
+                    statusEl.textContent = 'Running';
+                    statusEl.className = 'status-badge status-running';
+                } else {
+                    statusEl.textContent = 'Error';
+                    statusEl.className = 'status-badge status-error';
+                }
+                
+                // Update controls visibility
+                document.querySelector('.btn-success').style.display = data.paused ? 'inline-block' : 'none';
+                document.querySelector('.btn-warning').style.display = !data.paused && data.bot_running ? 'inline-block' : 'none';
+                document.querySelector('.btn-danger').style.display = data.bot_running ? 'inline-block' : 'none';
+                document.querySelector('.btn-primary').style.display = !data.bot_running ? 'inline-block' : 'none';
+                
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+        
+        async function control(action) {
+            try {
+                await fetch(`/api/${action}`, { method: 'POST' });
+                fetchData();
+            } catch (e) {
+                console.error('Control error:', e);
+            }
+        }
+        
+        function resumeTrading() { control('resume'); }
+        function pauseTrading() { control('pause'); }
+        function stopTrading() { control('stop'); }
+        function startTrading() { control('start'); }
+        
+        // Fetch data every 5 seconds
+        setInterval(fetchData, 5000);
+        fetchData();
+    </script>
+</body>
+</html>'''
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
 def load_state():
     if STATE_FILE.exists():
@@ -296,14 +496,22 @@ Only trade if QUALITY is A or B and you're confident."""
 
         # Call Claude
         import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
-        claude_text = response.content[0].text
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            send_telegram("⚠️ ANTHROPIC_API_KEY not set, skipping Claude analysis")
+            return
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7
+            )
+            claude_text = response.content[0].text
+        except Exception as e:
+            send_telegram(f"⚠️ Claude API error: {str(e)}")
+            return
 
         # Parse response
         try:
