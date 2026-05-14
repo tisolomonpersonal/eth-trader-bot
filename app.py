@@ -634,20 +634,29 @@ def bot_thread():
         # Sleep for CHECK_INTERVAL (default 1 hour)
         time.sleep(int(os.environ.get("CHECK_INTERVAL", "3600")))
 
-# Start bot in background thread
-bot_thread_instance = threading.Thread(target=bot_thread, daemon=True)
-bot_thread_instance.start()
+# Start bot in background thread (after Flask is ready)
+import threading
+bot_thread_instance = None
+
+def start_bot_thread():
+    global bot_thread_instance
+    try:
+        bot_thread_instance = threading.Thread(target=bot_thread, daemon=True)
+        bot_thread_instance.start()
+        return True
+    except Exception as e:
+        print(f"Failed to start bot thread: {e}")
+        return False
+
+# Try to start bot thread on import (but don't block if it fails)
+try:
+    start_bot_thread()
+except Exception as e:
+    print(f"Bot thread startup error: {e}")
 
 @app.route('/')
 def index():
-    state = load_state()
-    return jsonify({
-        "status": "running",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "bot_running": bot_running,
-        "bot_error": bot_error,
-        "state": state
-    })
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/status')
 def api_status():
