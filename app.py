@@ -169,6 +169,15 @@ def run_cycle():
         equity = get_equity()
         position = get_position()
 
+        # Debug logging
+        debug_msg = f"📊 Data check:\n"
+        debug_msg += f"- candles_15m: {len(candles_15m)} candles\n"
+        debug_msg += f"- candles_1h: {len(candles_1h)} candles\n"
+        debug_msg += f"- price: {price}\n"
+        debug_msg += f"- equity: {equity}\n"
+        debug_msg += f"- position: {position is not None}\n"
+        send_telegram(debug_msg)
+
         if not price or not candles_15m or not candles_1h:
             send_telegram("⚠️ Incomplete data, skipping.")
             return
