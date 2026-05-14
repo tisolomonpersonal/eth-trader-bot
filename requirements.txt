@@ -1,2 +1,4 @@
 requests
 anthropic
+flask
+gunicorn
