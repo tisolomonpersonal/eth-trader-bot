@@ -756,7 +756,14 @@ def api_status():
     if daily_pnl is None and equity is not None and start_equity is not None:
         daily_pnl = float(equity) - float(start_equity)
     perf = trader_bot.performance_summary(state)
-    position = state.get("position") or {}
+    live_position_error = None
+    try:
+        position = trader_bot.get_position() or {}
+        state["position"] = position
+        save_state(state)
+    except Exception as e:
+        live_position_error = f"{type(e).__name__}: {str(e)}"
+        position = state.get("position") or {}
     live_pnl = None
     entry_price = None
     mark_price = state.get("price")
@@ -764,11 +771,19 @@ def api_status():
     position_size = None
     try:
         if position and float(position.get("size") or 0) > 0:
-            live_pnl = float(position.get("unrealisedPnl") or 0)
-            entry_price = float(position.get("avgPrice") or 0) or None
-            mark_price = float(position.get("markPrice") or mark_price or 0) or None
-            position_side = position.get("side")
             position_size = float(position.get("size") or 0)
+            entry_price = float(position.get("avgPrice") or 0) or None
+            position_side = position.get("side")
+            try:
+                mark_price = trader_bot.get_price()
+            except Exception:
+                mark_price = float(position.get("markPrice") or mark_price or 0) or None
+            bybit_pnl = position.get("unrealisedPnl")
+            if bybit_pnl not in (None, ""):
+                live_pnl = float(bybit_pnl)
+            elif entry_price and mark_price:
+                direction = 1 if position_side == "Buy" else -1
+                live_pnl = (mark_price - entry_price) * position_size * direction
     except (TypeError, ValueError):
         pass
     return jsonify({
@@ -784,6 +799,7 @@ def api_status():
         "mark_price": mark_price,
         "position_side": position_side,
         "position_size": position_size,
+        "live_position_error": live_position_error,
         "last_trade": state.get("last_trade"),
         "trades_today": state.get("trades_today"),
         "max_trades_per_day": state.get("max_trades_per_day"),
