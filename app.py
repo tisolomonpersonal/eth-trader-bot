@@ -138,10 +138,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <button class="btn-primary" onclick="startTrading()">▶ Start</button>
             </div>
             <div class="info" style="margin-top: 12px;">
-                <strong>Max Daily Loss:</strong> $<span id="maxDailyLoss">--</span> | 
-                <strong>Max Consecutive Loss:</strong> $<span id="maxConsecLoss">--</span> | 
-                <strong>Position:</strong> <span id="qty">--</span> ETH | 
-                <strong>Leverage:</strong> <span id="leverage">--</span>x
+                <strong>Max Daily Loss:</strong> $<span id="maxDailyLoss">2</span> | 
+                <strong>Max Consecutive Loss:</strong> $<span id="maxConsecLoss">4</span> | 
+                <strong>Position:</strong> 0.04 ETH | 
+                <strong>Leverage:</strong> 45x
             </div>
         </div>
 
@@ -158,20 +158,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <script>
         function money(value) {
             return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
-        }
-
-        async function fetchConfig() {
-            try {
-                const res = await fetch('/api/config');
-                if (!res.ok) throw new Error(`Config ${res.status}`);
-                const cfg = await res.json();
-                document.getElementById('maxDailyLoss').textContent = cfg.max_daily_loss_usd ?? '--';
-                document.getElementById('maxConsecLoss').textContent = cfg.max_consec_loss_usd ?? '--';
-                document.getElementById('qty').textContent = cfg.qty ?? '--';
-                document.getElementById('leverage').textContent = cfg.leverage ?? '--';
-            } catch (e) {
-                console.error('Config fetch error:', e);
-            }
         }
 
         function tradeMood(pnl) {
@@ -293,7 +279,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         // Fetch data every 5 seconds
         setInterval(fetchData, 5000);
-        fetchConfig();
         fetchData();
     </script>
 </body>
