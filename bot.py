@@ -11,8 +11,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL = "ETHUSDT"
-QTY = 0.04
-LEVERAGE = 45
+QTY = float(os.environ.get("QTY", "0.04"))
+LEVERAGE = int(os.environ.get("LEVERAGE", "45"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))  # seconds (default: 1 hour, saves tokens)
 
 # --- RISK / SAFETY GUARDS ---
@@ -48,6 +48,9 @@ ATR_PCT_MAX = float(os.environ.get("ATR_PCT_MAX", "0.02"))   # 2.0% (avoid chaos
 
 SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))
 TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
+
+# Trend filter: user requested Elliott Wave + Fibonacci on 15m, filtered by 200 EMA
+EMA_PERIOD = int(os.environ.get("EMA_PERIOD", "200"))
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")  # common: UNIFIED / CONTRACT
 STATE_FILE = Path(__file__).with_name("bot_state.json")
@@ -334,6 +337,35 @@ def calculate_sma(values, period):
         return None
     return sum(values[-period:]) / period
 
+def fibonacci_levels(high: float, low: float):
+    """
+    Returns common Fibonacci retracement/extension levels for the range [low, high].
+    We provide these to Claude as context; Claude decides how to use them.
+    """
+    try:
+        high = float(high)
+        low = float(low)
+    except:
+        return {}
+    if high <= low:
+        return {}
+    rng = high - low
+    # Retracements measured from high back down into the range (typical pullback levels).
+    retr = {
+        "0.236": round(high - 0.236 * rng, 2),
+        "0.382": round(high - 0.382 * rng, 2),
+        "0.500": round(high - 0.500 * rng, 2),
+        "0.618": round(high - 0.618 * rng, 2),
+        "0.786": round(high - 0.786 * rng, 2),
+    }
+    # Extensions measured beyond high (typical impulse targets).
+    ext = {
+        "1.272": round(high + 0.272 * rng, 2),
+        "1.618": round(high + 0.618 * rng, 2),
+        "2.000": round(high + 1.000 * rng, 2),
+    }
+    return {"high": round(high, 2), "low": round(low, 2), "retr": retr, "ext": ext}
+
 def calculate_macd(closes):
     """
     Returns (macd_line, signal_line, histogram) series lists (floats).
@@ -524,6 +556,8 @@ def parse_claude_trade_response(text):
     sl = 0.0
     tp = 0.0
     personal_message = ""
+    wave = ""
+    fib_level = ""
     for raw in (text or "").strip().splitlines():
         line = raw.strip()
         if line.upper().startswith("DECISION:"):
@@ -532,6 +566,12 @@ def parse_claude_trade_response(text):
             reason = line.split(":", 1)[1].strip()
         elif line.upper().startswith("PERSONAL_MESSAGE:"):
             personal_message = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("WAVE:"):
+            # Expect "3" or "C" (string) when trading; optional when SKIP.
+            wave = line.split(":", 1)[1].strip().upper()
+        elif line.upper().startswith("FIB_LEVEL_USED:"):
+            # Expect something like "0.618 retracement", "1.618 extension", etc.
+            fib_level = line.split(":", 1)[1].strip()
         elif line.upper().startswith("SL:"):
             try:
                 sl = float(line.split(":", 1)[1].replace("$", "").strip())
@@ -544,7 +584,7 @@ def parse_claude_trade_response(text):
                 pass
     if decision not in ("LONG", "SHORT", "SKIP"):
         decision = "SKIP"
-    return decision, reason, sl, tp, personal_message
+    return decision, reason, sl, tp, personal_message, wave, fib_level
 
 def run_cycle():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -744,6 +784,7 @@ def run_cycle():
     closes_tf = [c["close"] for c in candles]
     close_tf = closes_tf[-1]
     ma200 = calculate_sma(closes_tf, MA_PERIOD)
+    ema200 = calculate_ema(closes_tf, EMA_PERIOD)
     ma200_prev = sum(closes_tf[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
     slope = ma200 - ma200_prev
     slope_dir = "UP" if slope > 0 else "DOWN" if slope < 0 else "FLAT"
@@ -779,6 +820,13 @@ def run_cycle():
         for i, c in enumerate(last_candles)
     ]
 
+    # Fib range context for Elliott Wave / fib pullbacks & extensions (15m)
+    lookback = min(120, len(candles))
+    recent = candles[-lookback:]
+    recent_high = max(c["high"] for c in recent) if recent else close_tf
+    recent_low = min(c["low"] for c in recent) if recent else close_tf
+    fib = fibonacci_levels(recent_high, recent_low)
+
     prompt = f"""You are Claude, an autonomous crypto trader and account manager.
 Your job: study the market and decide whether to enter a trade right now.
 
@@ -798,11 +846,18 @@ Last trades:
 === {DECISION_INTERVAL}M INDICATORS ===
 Close: ${close_tf:.2f}
 MA{MA_PERIOD}: ${ma200:.2f}
+EMA{EMA_PERIOD}: ${ema200:.2f}
 MA{MA_PERIOD} slope ({MA_SLOPE_LOOKBACK} bars): {slope_dir} (delta {slope:.4f})
 Distance from MA{MA_PERIOD}: {dist_pct*100:.2f}%
 RSI({RSI_PERIOD}): {rsi_tf}
 MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} momentum={macd_momentum}
 ATR({ATR_PERIOD}): {atr_tf} ({atr_tf_pct*100:.2f}%)
+
+=== ELLIOTT WAVE + FIBONACCI CONTEXT (15m) ===
+You MUST base your setup on Elliott Wave structure on the 15m chart, and you MUST use Fibonacci levels for entries/targets/stops.
+Recent range (last {lookback} candles): high={fib.get('high')} low={fib.get('low')}
+Fib retracements (from range high): {fib.get('retr')}
+Fib extensions (above range high): {fib.get('ext')}
 
 Last 10 candles:
 {last_candles_summary[0]}
@@ -823,11 +878,27 @@ Last 10 candles:
 4) Avoid liquidation risk (45x leverage): keep SL far enough from liquidation.
 5) If today's PnL is near the daily limit or consecutive losses are high, be more conservative.
 
+=== REQUIRED STRATEGY RULES (do not violate) ===
+A) Trend filter using EMA{EMA_PERIOD}:
+   - Only LONG if price is above EMA{EMA_PERIOD} and structure supports an impulsive bullish Elliott Wave count.
+   - Only SHORT if price is below EMA{EMA_PERIOD} and structure supports an impulsive bearish Elliott Wave count.
+   - If price is chopping around EMA{EMA_PERIOD} (no clear separation), SKIP.
+B) Elliott Wave (15m):
+   - Identify whether price is in an impulse (1-2-3-4-5) or correction (A-B-C). Prefer trading wave 3 or wave 5 continuations, or wave C completions, only if structure is clear.
+C) Allowed trades (strict):
+   - You are ONLY allowed to trade Wave 3 continuations or Wave C completions.
+   - If you cannot confidently label the current setup as Wave 3 or Wave C, you MUST SKIP.
+C) Fibonacci (mandatory):
+   - Use fib retracement levels (0.382/0.5/0.618/0.786) for pullback entries and fib extensions (1.272/1.618) for TP targets when consistent with the wave count.
+   - Place SL at a logical invalidation level for the wave count (e.g., below the wave-2 low for longs / above wave-2 high for shorts), and sanity-check it versus liquidation risk.
+
 You may use any analysis method you want (trend, range, structure, momentum, mean reversion).
 Only propose a trade if you believe the setup has a real edge; otherwise SKIP.
 
 Respond ONLY in this exact format:
 DECISION: LONG or SHORT or SKIP
+WAVE: 3 or C (required if LONG/SHORT)
+FIB_LEVEL_USED: (required if LONG/SHORT; e.g., "0.618 retracement" or "1.618 extension")
 REASON: (max 2 sentences)
 PERSONAL_MESSAGE: (one short sentence to the user, optional)
 SL: $X.XX
@@ -835,7 +906,7 @@ TP: $X.XX
 """
 
     claude_text = ask_claude(prompt)
-    decision, reason, sl, tp, personal_message = parse_claude_trade_response(claude_text)
+    decision, reason, sl, tp, personal_message, wave, fib_level = parse_claude_trade_response(claude_text)
 
     # Always notify every check (decision + reason)
     send_telegram(
@@ -868,11 +939,29 @@ TP: $X.XX
         "interval": DECISION_INTERVAL,
         "daily_pnl": round(daily_pnl, 4),
         "consecutive_loss": float(state.get("consecutive_loss") or 0.0),
-        "total_pnl": float(state.get("total_pnl") or 0.0)
+        "total_pnl": float(state.get("total_pnl") or 0.0),
+        "ew_wave": wave,
+        "fib_level_used": fib_level
     })
 
     if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
         side = "Buy" if decision == "LONG" else "Sell"
+
+        # Enforce user's requirement: ONLY Wave 3 or Wave C trades, and Fibonacci must be explicitly used.
+        if (wave not in ("3", "C")) or (not fib_level.strip()):
+            send_telegram(
+                f"🚫 <b>TRADE BLOCKED</b>\n"
+                f"Only Wave 3 or Wave C trades are allowed, and FIB_LEVEL_USED is required.\n"
+                f"Claude: {decision} wave={wave or '(missing)'} fib={fib_level or '(missing)'}"
+            )
+            append_log("BLOCK", {
+                "type": "EW_WAVE_OR_FIB_MISSING",
+                "decision": decision,
+                "wave": wave,
+                "fib_level_used": fib_level,
+                "reason": reason
+            })
+            return
 
         if not sl_is_safe(side, price, sl, LEVERAGE):
             liq = get_liquidation_price(side, price, LEVERAGE)
