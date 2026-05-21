@@ -499,8 +499,16 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
           headers: {'Content-Type':'application/json'},
           body: JSON.stringify({message: t})
         });
-        const data = await res.json();
-        add('assistant', data.reply || 'No reply');
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        let data = null;
+        if (ct.includes('application/json')) {
+          data = await res.json();
+          add('assistant', data.reply || 'No reply');
+        } else {
+          const txt = await res.text();
+          const snippet = (txt || '').slice(0, 300);
+          add('assistant', `Server returned non-JSON (HTTP ${res.status}).\\n${snippet}`);
+        }
       }catch(e){
         add('assistant', 'Error sending message: ' + (e?.message || e));
       }
@@ -1103,39 +1111,43 @@ def _call_claude_chat(messages):
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
-    data = request.get_json() or {}
-    text = (data.get("message") or "").strip()
-    if not text:
-        return jsonify({"reply": "Send a message."})
+    try:
+        data = request.get_json(silent=True) or {}
+        text = (data.get("message") or "").strip()
+        if not text:
+            return jsonify({"reply": "Send a message.", "used_claude": False})
 
-    # First: local commands (no Claude call).
-    handled, reply = _handle_chat_command(text)
-    if handled:
-        resp = jsonify({"reply": reply, "used_claude": False})
-        # Ensure chat_id cookie exists
+        # First: local commands (no Claude call).
+        handled, reply = _handle_chat_command(text)
+        if handled:
+            resp = jsonify({"reply": reply, "used_claude": False})
+            # Ensure chat_id cookie exists
+            if not request.cookies.get("chat_id"):
+                resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
+            return resp
+
+        # Otherwise: small-memory chat with Claude.
+        cid = _get_chat_id()
+        mem = _chat_memory(cid)
+        mem.append({"role": "user", "content": text})
+        _trim_memory(mem)
+
+        # Pass only recent memory; keep it small to reduce token usage.
+        reply_text = _call_claude_chat(mem)
+        reply_text = (reply_text or "").strip()
+        if not reply_text:
+            reply_text = "No response."
+
+        mem.append({"role": "assistant", "content": reply_text})
+        _trim_memory(mem)
+
+        resp = jsonify({"reply": reply_text, "used_claude": True, "model": CHAT_MODEL})
         if not request.cookies.get("chat_id"):
-            resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
+            resp.set_cookie("chat_id", cid, max_age=60*60*24*30, httponly=True, samesite="Lax")
         return resp
-
-    # Otherwise: small-memory chat with Claude.
-    cid = _get_chat_id()
-    mem = _chat_memory(cid)
-    mem.append({"role": "user", "content": text})
-    _trim_memory(mem)
-
-    # Pass only recent memory; keep it small to reduce token usage.
-    reply_text = _call_claude_chat(mem)
-    reply_text = (reply_text or "").strip()
-    if not reply_text:
-        reply_text = "No response."
-
-    mem.append({"role": "assistant", "content": reply_text})
-    _trim_memory(mem)
-
-    resp = jsonify({"reply": reply_text, "used_claude": True, "model": CHAT_MODEL})
-    if not request.cookies.get("chat_id"):
-        resp.set_cookie("chat_id", cid, max_age=60*60*24*30, httponly=True, samesite="Lax")
-    return resp
+    except Exception as e:
+        # Always return JSON (prevents browser JSON parse errors showing HTML).
+        return jsonify({"reply": f"Server error: {type(e).__name__}: {str(e)}", "used_claude": False}), 500
 
 @app.route('/api/status')
 def api_status():
