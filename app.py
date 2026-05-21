@@ -26,7 +26,9 @@ LOG_FILE = Path(__file__).parent / "log.txt"
 CHAT_SESSIONS = {}  # chat_id -> [{"role": "user"|"assistant", "content": "..."}]
 CHAT_MAX_TURNS = int(os.environ.get("CHAT_MAX_TURNS", "8"))  # user+assistant messages total
 
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-3-5-haiku-latest")
+# Default to a generally-available model name; allow override via CHAT_MODEL.
+# (If a model name is invalid for your account, the server will fall back to an alternative.)
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-4-7")
 CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("CHAT_MAX_OUTPUT_TOKENS", "180"))
 CHAT_TEMPERATURE = float(os.environ.get("CHAT_TEMPERATURE", "0.2"))
 
@@ -312,26 +314,27 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Bot Chat</title>
+  <title>ETH Bot Chat</title>
   <style>
     :root{
-      --bg:#0b1020;
-      --panel:#111827;
-      --border:#1f2937;
-      --text:#e5e7eb;
-      --muted:#9ca3af;
-      --me:#1d4ed8;
+      --bg:#f4f5ff;
+      --panel:#ffffff;
+      --border:rgba(0,0,0,.06);
+      --text:#111827;
+      --muted:#6b7280;
+      --me:#4f46e5;
+      --me2:#6d28d9;
       --meText:#ffffff;
-      --bot:#111827;
-      --botText:#e5e7eb;
-      --input:#0f172a;
-      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --bot:#eef2ff;
+      --botText:#111827;
+      --input:#f3f4f6;
+      --shadow: 0 18px 50px rgba(17,24,39,.18);
     }
     *{box-sizing:border-box;}
     body{
       margin:0;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      background: radial-gradient(1200px 700px at 50% -200px, #1d4ed8 0%, rgba(29,78,216,0) 50%), var(--bg);
+      background: radial-gradient(1000px 600px at 40% -10%, rgba(99,102,241,.35), rgba(0,0,0,0) 60%), var(--bg);
       color:var(--text);
       height:100vh;
       display:flex;
@@ -344,36 +347,34 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
       height:min(840px, 100%);
       background:var(--panel);
       border:1px solid var(--border);
-      border-radius:20px;
+      border-radius:28px;
       overflow:hidden;
       box-shadow:var(--shadow);
       display:flex;
       flex-direction:column;
     }
     .topbar{
-      padding:14px 16px;
-      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0));
-      border-bottom:1px solid var(--border);
+      padding:16px 16px;
+      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
       display:flex;
       gap:12px;
       align-items:center;
     }
     .avatar{
-      width:34px;height:34px;border-radius:50%;
-      background: radial-gradient(circle at 30% 30%, #60a5fa, #1d4ed8);
+      width:36px;height:36px;border-radius:50%;
+      background: rgba(255,255,255,.18);
+      border:1px solid rgba(255,255,255,.35);
       display:flex;align-items:center;justify-content:center;
       font-weight:800;color:white;
     }
     .titlewrap{display:flex;flex-direction:column;line-height:1.1}
-    .title{font-weight:700}
-    .subtitle{font-size:12px;color:var(--muted)}
+    .title{font-weight:750;color:white}
+    .subtitle{font-size:12px;color:rgba(255,255,255,.85)}
     .msgs{
       flex:1;
       padding:14px 12px;
       overflow:auto;
-      background:
-        radial-gradient(800px 400px at 10% 10%, rgba(59,130,246,.10), rgba(0,0,0,0) 60%),
-        radial-gradient(800px 400px at 90% 20%, rgba(16,185,129,.08), rgba(0,0,0,0) 60%);
+      background: linear-gradient(180deg, #ffffff 0%, #fbfbff 100%);
     }
     .row{display:flex; margin:8px 0;}
     .row.me{justify-content:flex-end;}
@@ -387,13 +388,13 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
       word-wrap:break-word;
     }
     .row.me .bubble{
-      background:linear-gradient(180deg, #2563eb, #1d4ed8);
+      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
       color:var(--meText);
       border-bottom-right-radius:6px;
     }
     .row.bot .bubble{
-      background:rgba(255,255,255,.04);
-      border:1px solid rgba(255,255,255,.06);
+      background:var(--bot);
+      border:1px solid rgba(0,0,0,.05);
       color:var(--botText);
       border-bottom-left-radius:6px;
     }
@@ -403,11 +404,11 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
       gap:8px;
       flex-wrap:wrap;
       border-top:1px solid var(--border);
-      background:rgba(0,0,0,.1);
+      background:#fff;
     }
     .chip{
-      border:1px solid rgba(255,255,255,.12);
-      background:rgba(255,255,255,.04);
+      border:1px solid rgba(0,0,0,.08);
+      background:#fff;
       color:var(--text);
       padding:7px 10px;
       border-radius:999px;
@@ -417,7 +418,7 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
     .composer{
       border-top:1px solid var(--border);
       padding:10px 12px;
-      background:rgba(0,0,0,.2);
+      background:#fff;
       display:flex;
       gap:10px;
       align-items:center;
@@ -425,7 +426,7 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
     .input{
       flex:1;
       background:var(--input);
-      border:1px solid rgba(255,255,255,.10);
+      border:1px solid rgba(0,0,0,.08);
       border-radius:999px;
       padding:10px 12px;
       color:var(--text);
@@ -435,12 +436,11 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
     .send{
       width:40px;height:40px;border-radius:50%;
       border:none;
-      background:linear-gradient(180deg, #2563eb, #1d4ed8);
+      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
       color:white;
       cursor:pointer;
       font-weight:800;
     }
-    a{color:#60a5fa;text-decoration:none;}
     .hint{
       color:var(--muted);
       font-size:12px;
@@ -454,16 +454,14 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
       <div class="avatar">B</div>
       <div class="titlewrap">
         <div class="title">ETH Bot Assistant</div>
-        <div class="subtitle">Commands: /balance, /start, /stop, /status, /help</div>
+        <div class="subtitle">Online • /balance /start /stop /status</div>
       </div>
     </div>
-    <div class="hint">Tip: Use the buttons for zero-token actions.</div>
     <div class="chips">
       <button class="chip" onclick="sendText('/balance')">Balance</button>
       <button class="chip" onclick="sendText('/status')">Status</button>
       <button class="chip" onclick="sendText('/stop')">Stop trading</button>
       <button class="chip" onclick="sendText('/start')">Start trading</button>
-      <a class="chip" href="/" style="display:inline-block;">Dashboard</a>
     </div>
     <div class="msgs" id="msgs"></div>
     <div class="composer">
@@ -520,7 +518,7 @@ CHAT_TEMPLATE = '''<!DOCTYPE html>
     });
 
     // welcome
-    add('assistant', 'Hi. I can answer questions and also run commands like /balance, /start, /stop, /status.');
+    add('assistant', 'Hi — chat is the only UI. Try /balance or ask a question.');
   </script>
 </body>
 </html>
@@ -984,16 +982,17 @@ except Exception as e:
     print(f"Bot thread startup error: {e}")
 
 @app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/chat')
 def chat_ui():
     resp = make_response(render_template_string(CHAT_TEMPLATE))
     # Ensure the browser has a chat_id cookie to scope memory.
     if not request.cookies.get("chat_id"):
         resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
     return resp
+
+@app.route('/chat')
+def chat_redirect():
+    # Backwards-compatible route; keep chat as the only UI.
+    return chat_ui()
 
 def _get_chat_id():
     cid = request.cookies.get("chat_id")
@@ -1090,24 +1089,36 @@ def _call_claude_chat(messages):
     if anthropic is None:
         return "Anthropic SDK is not available in this runtime."
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # Let the SDK read ANTHROPIC_API_KEY from env (matches Anthropic docs),
+    # but we still check it above to give a friendly error.
+    client = anthropic.Anthropic()
     system = (
         "You are a concise assistant for a crypto trading bot dashboard.\n"
         "Keep replies short (1-5 sentences).\n"
         "If the user asks for balance/start/stop/status, suggest the commands /balance /start /stop /status.\n"
         "Do NOT output long explanations unless asked."
     )
-    resp = client.messages.create(
-        model=CHAT_MODEL,
-        max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-        temperature=CHAT_TEMPERATURE,
-        system=system,
-        messages=messages,
-    )
-    try:
-        return resp.content[0].text
-    except Exception:
-        return str(resp)
+    # Some model aliases are not enabled on all accounts. If the chosen model
+    # is not found, fall back to a more widely-available option.
+    candidates = [CHAT_MODEL, "claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022"]
+    last_err = None
+    for model in candidates:
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=CHAT_MAX_OUTPUT_TOKENS,
+                temperature=CHAT_TEMPERATURE,
+                system=system,
+                messages=messages,
+            )
+            return resp.content[0].text
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            # If it's NOT a model-not-found issue, don't keep retrying other models.
+            if "not_found_error" not in msg and "model:" not in msg:
+                break
+    return f"Claude API error: {type(last_err).__name__}: {str(last_err)}"
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
