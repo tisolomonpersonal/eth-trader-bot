@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, make_response
 import json
 import os
 import threading
@@ -7,12 +7,28 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 import bot as trader_bot
+import uuid
+import re
+
+try:
+    import anthropic
+except Exception:
+    anthropic = None
 
 app = Flask(__name__)
 
 # Paths
 STATE_FILE = Path(__file__).parent / "bot_state.json"
 LOG_FILE = Path(__file__).parent / "log.txt"
+
+# In-memory chat storage (kept small to reduce token usage + cookie bloat).
+# Note: if the process restarts, chat history resets.
+CHAT_SESSIONS = {}  # chat_id -> [{"role": "user"|"assistant", "content": "..."}]
+CHAT_MAX_TURNS = int(os.environ.get("CHAT_MAX_TURNS", "8"))  # user+assistant messages total
+
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-3-5-haiku-latest")
+CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("CHAT_MAX_OUTPUT_TOKENS", "180"))
+CHAT_TEMPERATURE = float(os.environ.get("CHAT_TEMPERATURE", "0.2"))
 
 # Bot state for API
 bot_running = False
@@ -68,6 +84,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <h1>📈 ETH Trader Bot</h1>
+
+        <div class="card">
+            <h2>Chat</h2>
+            <div class="info">
+                <strong>Chat UI:</strong> <a href="/chat" style="color:#38bdf8">Open Messenger-style chat</a>
+            </div>
+        </div>
         
         <div class="card">
             <h2>Status</h2>
@@ -283,6 +306,217 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </script>
 </body>
 </html>'''
+
+CHAT_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bot Chat</title>
+  <style>
+    :root{
+      --bg:#0b1020;
+      --panel:#111827;
+      --border:#1f2937;
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --me:#1d4ed8;
+      --meText:#ffffff;
+      --bot:#111827;
+      --botText:#e5e7eb;
+      --input:#0f172a;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    *{box-sizing:border-box;}
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 700px at 50% -200px, #1d4ed8 0%, rgba(29,78,216,0) 50%), var(--bg);
+      color:var(--text);
+      height:100vh;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding:16px;
+    }
+    .phone{
+      width:min(420px, 100%);
+      height:min(840px, 100%);
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:20px;
+      overflow:hidden;
+      box-shadow:var(--shadow);
+      display:flex;
+      flex-direction:column;
+    }
+    .topbar{
+      padding:14px 16px;
+      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0));
+      border-bottom:1px solid var(--border);
+      display:flex;
+      gap:12px;
+      align-items:center;
+    }
+    .avatar{
+      width:34px;height:34px;border-radius:50%;
+      background: radial-gradient(circle at 30% 30%, #60a5fa, #1d4ed8);
+      display:flex;align-items:center;justify-content:center;
+      font-weight:800;color:white;
+    }
+    .titlewrap{display:flex;flex-direction:column;line-height:1.1}
+    .title{font-weight:700}
+    .subtitle{font-size:12px;color:var(--muted)}
+    .msgs{
+      flex:1;
+      padding:14px 12px;
+      overflow:auto;
+      background:
+        radial-gradient(800px 400px at 10% 10%, rgba(59,130,246,.10), rgba(0,0,0,0) 60%),
+        radial-gradient(800px 400px at 90% 20%, rgba(16,185,129,.08), rgba(0,0,0,0) 60%);
+    }
+    .row{display:flex; margin:8px 0;}
+    .row.me{justify-content:flex-end;}
+    .bubble{
+      max-width:78%;
+      padding:10px 12px;
+      border-radius:18px;
+      font-size:14px;
+      line-height:1.35;
+      white-space:pre-wrap;
+      word-wrap:break-word;
+    }
+    .row.me .bubble{
+      background:linear-gradient(180deg, #2563eb, #1d4ed8);
+      color:var(--meText);
+      border-bottom-right-radius:6px;
+    }
+    .row.bot .bubble{
+      background:rgba(255,255,255,.04);
+      border:1px solid rgba(255,255,255,.06);
+      color:var(--botText);
+      border-bottom-left-radius:6px;
+    }
+    .chips{
+      padding:8px 12px;
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      border-top:1px solid var(--border);
+      background:rgba(0,0,0,.1);
+    }
+    .chip{
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.04);
+      color:var(--text);
+      padding:7px 10px;
+      border-radius:999px;
+      font-size:12px;
+      cursor:pointer;
+    }
+    .composer{
+      border-top:1px solid var(--border);
+      padding:10px 12px;
+      background:rgba(0,0,0,.2);
+      display:flex;
+      gap:10px;
+      align-items:center;
+    }
+    .input{
+      flex:1;
+      background:var(--input);
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:999px;
+      padding:10px 12px;
+      color:var(--text);
+      outline:none;
+      font-size:14px;
+    }
+    .send{
+      width:40px;height:40px;border-radius:50%;
+      border:none;
+      background:linear-gradient(180deg, #2563eb, #1d4ed8);
+      color:white;
+      cursor:pointer;
+      font-weight:800;
+    }
+    a{color:#60a5fa;text-decoration:none;}
+    .hint{
+      color:var(--muted);
+      font-size:12px;
+      padding:10px 12px 0 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="phone">
+    <div class="topbar">
+      <div class="avatar">B</div>
+      <div class="titlewrap">
+        <div class="title">ETH Bot Assistant</div>
+        <div class="subtitle">Commands: /balance, /start, /stop, /status, /help</div>
+      </div>
+    </div>
+    <div class="hint">Tip: Use the buttons for zero-token actions.</div>
+    <div class="chips">
+      <button class="chip" onclick="sendText('/balance')">Balance</button>
+      <button class="chip" onclick="sendText('/status')">Status</button>
+      <button class="chip" onclick="sendText('/stop')">Stop trading</button>
+      <button class="chip" onclick="sendText('/start')">Start trading</button>
+      <a class="chip" href="/" style="display:inline-block;">Dashboard</a>
+    </div>
+    <div class="msgs" id="msgs"></div>
+    <div class="composer">
+      <input class="input" id="text" placeholder="Type a message…" autocomplete="off" />
+      <button class="send" id="sendBtn">➤</button>
+    </div>
+  </div>
+
+  <script>
+    const msgs = document.getElementById('msgs');
+    const input = document.getElementById('text');
+    const btn = document.getElementById('sendBtn');
+
+    function add(role, text){
+      const row = document.createElement('div');
+      row.className = 'row ' + (role === 'user' ? 'me' : 'bot');
+      const b = document.createElement('div');
+      b.className = 'bubble';
+      b.textContent = text;
+      row.appendChild(b);
+      msgs.appendChild(row);
+      msgs.scrollTop = msgs.scrollHeight;
+    }
+
+    async function sendText(text){
+      const t = (text ?? input.value ?? '').trim();
+      if(!t) return;
+      input.value = '';
+      add('user', t);
+      try{
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({message: t})
+        });
+        const data = await res.json();
+        add('assistant', data.reply || 'No reply');
+      }catch(e){
+        add('assistant', 'Error sending message: ' + (e?.message || e));
+      }
+    }
+
+    btn.addEventListener('click', () => sendText());
+    input.addEventListener('keydown', (e) => {
+      if(e.key === 'Enter') sendText();
+    });
+
+    // welcome
+    add('assistant', 'Hi. I can answer questions and also run commands like /balance, /start, /stop, /status.');
+  </script>
+</body>
+</html>
+'''
 
 def load_state():
     if STATE_FILE.exists():
@@ -744,6 +978,164 @@ except Exception as e:
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/chat')
+def chat_ui():
+    resp = make_response(render_template_string(CHAT_TEMPLATE))
+    # Ensure the browser has a chat_id cookie to scope memory.
+    if not request.cookies.get("chat_id"):
+        resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
+    return resp
+
+def _get_chat_id():
+    cid = request.cookies.get("chat_id")
+    if not cid:
+        cid = str(uuid.uuid4())
+    return cid
+
+def _chat_memory(cid: str):
+    mem = CHAT_SESSIONS.get(cid)
+    if not mem:
+        mem = []
+        CHAT_SESSIONS[cid] = mem
+    return mem
+
+def _trim_memory(mem):
+    # Keep only last N messages to reduce token usage.
+    if len(mem) > CHAT_MAX_TURNS:
+        del mem[:-CHAT_MAX_TURNS]
+
+def _set_trading_enabled(enabled: bool):
+    state = load_state()
+    state["trading_enabled"] = bool(enabled)
+    save_state(state)
+    return state
+
+def _format_money(v):
+    try:
+        return f"${float(v):.2f}"
+    except:
+        return "n/a"
+
+def _handle_chat_command(text: str):
+    """
+    Returns (handled: bool, reply: str)
+    Commands are handled locally (no Claude call) to save tokens.
+    """
+    t = (text or "").strip()
+    low = t.lower()
+
+    if low in ("/help", "help"):
+        return True, (
+            "Commands:\n"
+            "/balance - show Bybit USDT equity\n"
+            "/status - show bot + trading flags\n"
+            "/stop - disable new entries\n"
+            "/start - enable new entries\n"
+            "Tip: these commands do not use Claude tokens."
+        )
+
+    if low in ("/stop", "stop", "stop trading", "stop bot"):
+        st = _set_trading_enabled(False)
+        return True, f"Trading disabled. trading_enabled={st.get('trading_enabled')}"
+
+    if low in ("/start", "start", "start trading", "start bot"):
+        st = _set_trading_enabled(True)
+        return True, f"Trading enabled. trading_enabled={st.get('trading_enabled')}"
+
+    if low in ("/balance", "balance", "bybit balance", "check balance"):
+        try:
+            equity = trader_bot.get_wallet_equity_usdt()
+            if equity is None:
+                return True, "Could not fetch Bybit equity (check BYBIT_API_KEY/BYBIT_API_SECRET + account type)."
+            return True, f"Bybit USDT equity: {_format_money(equity)}"
+        except Exception as e:
+            return True, f"Balance check failed: {type(e).__name__}: {str(e)}"
+
+    if low in ("/status", "status"):
+        st = load_state()
+        paused_until = int(st.get("paused_until") or st.get("pause_until") or 0)
+        is_paused = bool(st.get("paused")) or time.time() < paused_until
+        equity = st.get("equity")
+        pos = st.get("position") or {}
+        size = None
+        side = None
+        try:
+            size = float(pos.get("size") or 0)
+            side = pos.get("side")
+        except:
+            pass
+        return True, (
+            f"Bot thread: {'running' if bot_running else 'not running'}\n"
+            f"Trading enabled: {st.get('trading_enabled', True)}\n"
+            f"Paused: {is_paused}\n"
+            f"Equity (cached): {_format_money(equity)}\n"
+            f"Position: {side or 'none'} size={size or 0}"
+        )
+
+    return False, ""
+
+def _call_claude_chat(messages):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return "ANTHROPIC_API_KEY is not set. Set it as an environment variable to enable chat."
+    if anthropic is None:
+        return "Anthropic SDK is not available in this runtime."
+
+    client = anthropic.Anthropic(api_key=api_key)
+    system = (
+        "You are a concise assistant for a crypto trading bot dashboard.\n"
+        "Keep replies short (1-5 sentences).\n"
+        "If the user asks for balance/start/stop/status, suggest the commands /balance /start /stop /status.\n"
+        "Do NOT output long explanations unless asked."
+    )
+    resp = client.messages.create(
+        model=CHAT_MODEL,
+        max_tokens=CHAT_MAX_OUTPUT_TOKENS,
+        temperature=CHAT_TEMPERATURE,
+        system=system,
+        messages=messages,
+    )
+    try:
+        return resp.content[0].text
+    except Exception:
+        return str(resp)
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    data = request.get_json() or {}
+    text = (data.get("message") or "").strip()
+    if not text:
+        return jsonify({"reply": "Send a message."})
+
+    # First: local commands (no Claude call).
+    handled, reply = _handle_chat_command(text)
+    if handled:
+        resp = jsonify({"reply": reply, "used_claude": False})
+        # Ensure chat_id cookie exists
+        if not request.cookies.get("chat_id"):
+            resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
+        return resp
+
+    # Otherwise: small-memory chat with Claude.
+    cid = _get_chat_id()
+    mem = _chat_memory(cid)
+    mem.append({"role": "user", "content": text})
+    _trim_memory(mem)
+
+    # Pass only recent memory; keep it small to reduce token usage.
+    reply_text = _call_claude_chat(mem)
+    reply_text = (reply_text or "").strip()
+    if not reply_text:
+        reply_text = "No response."
+
+    mem.append({"role": "assistant", "content": reply_text})
+    _trim_memory(mem)
+
+    resp = jsonify({"reply": reply_text, "used_claude": True, "model": CHAT_MODEL})
+    if not request.cookies.get("chat_id"):
+        resp.set_cookie("chat_id", cid, max_age=60*60*24*30, httponly=True, samesite="Lax")
+    return resp
 
 @app.route('/api/status')
 def api_status():
