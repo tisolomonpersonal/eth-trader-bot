@@ -1,0 +1,143 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "expo.modules.audio",
+    "module": "expo.modules.audio",
+    "version": "1.1.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14.3"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "expo.modules.audio-1.1.0.aar",
+          "url": "expo.modules.audio-1.1.0.aar",
+          "size": 257011,
+          "sha512": "8b4103be253c0fcf9202ff5bec04b8e51f2178afafba2cc677e8dd1021f000262c7f73a4f67fc35d00fdecbce9257f82670a7c6187d589960c923d193ea0ca82",
+          "sha256": "8f524d770bcc3e93938e2e34034dd1964a20e2d2dfe003a907a6c7fbf2c7ea4b",
+          "sha1": "eff14cf9e092dfd21a3380992fdf11b2d49dda8e",
+          "md5": "3af89778fbcaf88922ddd633de7f0fb4"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib-jdk7",
+          "version": {
+            "requires": "2.1.20"
+          }
+        },
+        {
+          "group": "androidx.appcompat",
+          "module": "appcompat",
+          "version": {
+            "requires": "1.7.1"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-session",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-ui",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-exoplayer",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-exoplayer-dash",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-datasource-okhttp",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-exoplayer-hls",
+          "version": {
+            "requires": "1.8.0"
+          }
+        },
+        {
+          "group": "androidx.media3",
+          "module": "media3-exoplayer-smoothstreaming",
+          "version": {
+            "requires": "1.8.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "expo.modules.audio-1.1.0.aar",
+          "url": "expo.modules.audio-1.1.0.aar",
+          "size": 257011,
+          "sha512": "8b4103be253c0fcf9202ff5bec04b8e51f2178afafba2cc677e8dd1021f000262c7f73a4f67fc35d00fdecbce9257f82670a7c6187d589960c923d193ea0ca82",
+          "sha256": "8f524d770bcc3e93938e2e34034dd1964a20e2d2dfe003a907a6c7fbf2c7ea4b",
+          "sha1": "eff14cf9e092dfd21a3380992fdf11b2d49dda8e",
+          "md5": "3af89778fbcaf88922ddd633de7f0fb4"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "expo.modules.audio-1.1.0-sources.jar",
+          "url": "expo.modules.audio-1.1.0-sources.jar",
+          "size": 20435,
+          "sha512": "3e2d63d13769736a93f26ffa5f706211ace6fdc6fd9ad4b897d9aa6aa7980377d51ffb2ac5bb84e1346797c63813b7453fca94229c6f0fc9092af5a70e64dba0",
+          "sha256": "fac3684506f3f2ba7c412da318b4f6f35deef8ab953118f6520d6bd801a081a1",
+          "sha1": "37e1561412a1cdb45a770959a1f493aca4373082",
+          "md5": "2581b1b0da1549241cb1d73938662406"
+        }
+      ]
+    }
+  ]
+}
