@@ -30,7 +30,7 @@ CHAT_MAX_TURNS = int(os.environ.get("CHAT_MAX_TURNS", "8"))  # user+assistant me
 # (If a model name is invalid for your account, the server will fall back to an alternative.)
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-4-7")
 CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("CHAT_MAX_OUTPUT_TOKENS", "180"))
-CHAT_TEMPERATURE = float(os.environ.get("CHAT_TEMPERATURE", "0.2"))
+CHAT_TEMPERATURE = float(os.environ.get("CHAT_TEMPERATURE", "0.2"))  # not sent for some newer models
 
 # Bot state for API
 bot_running = False
@@ -1034,7 +1034,7 @@ def _handle_chat_command(text: str):
 
     if low in ("/help", "help"):
         return True, (
-            "Commands:\n"
+            "😼 Commands:\n"
             "/balance - show Bybit USDT equity\n"
             "/status - show bot + trading flags\n"
             "/stop - disable new entries\n"
@@ -1044,20 +1044,20 @@ def _handle_chat_command(text: str):
 
     if low in ("/stop", "stop", "stop trading", "stop bot"):
         st = _set_trading_enabled(False)
-        return True, f"Trading disabled. trading_enabled={st.get('trading_enabled')}"
+        return True, f"🛑 Trading disabled. trading_enabled={st.get('trading_enabled')}"
 
     if low in ("/start", "start", "start trading", "start bot"):
         st = _set_trading_enabled(True)
-        return True, f"Trading enabled. trading_enabled={st.get('trading_enabled')}"
+        return True, f"✅ Trading enabled. trading_enabled={st.get('trading_enabled')}"
 
     if low in ("/balance", "balance", "bybit balance", "check balance"):
         try:
             equity = trader_bot.get_wallet_equity_usdt()
             if equity is None:
-                return True, "Could not fetch Bybit equity (check BYBIT_API_KEY/BYBIT_API_SECRET + account type)."
-            return True, f"Bybit USDT equity: {_format_money(equity)}"
+                return True, "😾 Could not fetch Bybit equity (check BYBIT_API_KEY/BYBIT_API_SECRET + account type)."
+            return True, f"🧾 Bybit USDT equity: {_format_money(equity)}"
         except Exception as e:
-            return True, f"Balance check failed: {type(e).__name__}: {str(e)}"
+            return True, f"😾 Balance check failed: {type(e).__name__}: {str(e)}"
 
     if low in ("/status", "status"):
         st = load_state()
@@ -1073,6 +1073,7 @@ def _handle_chat_command(text: str):
         except:
             pass
         return True, (
+            "📡 Status\n"
             f"Bot thread: {'running' if bot_running else 'not running'}\n"
             f"Trading enabled: {st.get('trading_enabled', True)}\n"
             f"Paused: {is_paused}\n"
@@ -1093,9 +1094,10 @@ def _call_claude_chat(messages):
     # but we still check it above to give a friendly error.
     client = anthropic.Anthropic()
     system = (
-        "You are a concise assistant for a crypto trading bot dashboard.\n"
-        "Keep replies short (1-5 sentences).\n"
-        "If the user asks for balance/start/stop/status, suggest the commands /balance /start /stop /status.\n"
+        "You are a tsundere personal assistant inside a crypto trading bot chat.\n"
+        "You must start EVERY reply with exactly ONE emoji, then a space.\n"
+        "Keep replies short (1-4 sentences). Be a little sassy, but still helpful.\n"
+        "If the user asks for balance/start/stop/status, tell them to use /balance /start /stop /status.\n"
         "Do NOT output long explanations unless asked."
     )
     # Some model aliases are not enabled on all accounts. If the chosen model
@@ -1104,10 +1106,11 @@ def _call_claude_chat(messages):
     last_err = None
     for model in candidates:
         try:
+            # NOTE: Some newer models reject `temperature` (deprecated). To avoid 400s,
+            # we omit it by default. If you want randomness, adjust your prompt.
             resp = client.messages.create(
                 model=model,
                 max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-                temperature=CHAT_TEMPERATURE,
                 system=system,
                 messages=messages,
             )
@@ -1119,6 +1122,19 @@ def _call_claude_chat(messages):
             if "not_found_error" not in msg and "model:" not in msg:
                 break
     return f"Claude API error: {type(last_err).__name__}: {str(last_err)}"
+
+def _ensure_emoji_prefix(text: str) -> str:
+    """
+    Ensure the reply starts with an emoji and a space.
+    Fallback uses a tsundere-ish emoji.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "😼 ..."
+    # Basic heuristic: if first char is non-ascii, assume emoji/symbol is present.
+    if t and ord(t[0]) > 127:
+        return t
+    return "😼 " + t
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
@@ -1145,9 +1161,7 @@ def api_chat():
 
         # Pass only recent memory; keep it small to reduce token usage.
         reply_text = _call_claude_chat(mem)
-        reply_text = (reply_text or "").strip()
-        if not reply_text:
-            reply_text = "No response."
+        reply_text = _ensure_emoji_prefix(reply_text)
 
         mem.append({"role": "assistant", "content": reply_text})
         _trim_memory(mem)
