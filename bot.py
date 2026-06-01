@@ -1,807 +1,497 @@
-from flask import Flask, jsonify, request, render_template_string, make_response, send_from_directory
-import json
-import os
-import threading
-import time
+import requests, json, os, time, hmac, hashlib
 import traceback
-import random
 from datetime import datetime, timezone
+import anthropic
 from pathlib import Path
-import bot as trader_bot
-import uuid
 
-try:
-    import anthropic
-except Exception:
-    anthropic = None
+# --- CONFIG ---
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SYMBOL = "ETHUSDT"
+LEVERAGE = 10
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))  # 30 min
 
-app = Flask(__name__)
+# Grid settings
+GRID_LEVELS = int(os.environ.get("GRID_LEVELS", "5"))           # number of grid levels each side
+GRID_SPACING_PCT = float(os.environ.get("GRID_SPACING_PCT", "0.004"))  # 0.4% between levels
+QTY_PER_LEVEL = float(os.environ.get("QTY_PER_LEVEL", "0.01"))  # ETH per grid order
 
-# Paths
-STATE_FILE = Path(__file__).parent / "bot_state.json"
-LOG_FILE = Path(__file__).parent / "log.txt"
-EMOTIONS_DIR = Path(__file__).parent / "static" / "emotions"
+# Trend filter — only run grid when market is NOT trending strongly
+ADX_PERIOD = int(os.environ.get("ADX_PERIOD", "14"))
+ADX_SIDEWAYS_MAX = float(os.environ.get("ADX_SIDEWAYS_MAX", "25"))  # ADX < 25 = sideways
+BB_WIDTH_MIN = float(os.environ.get("BB_WIDTH_MIN", "0.005"))   # BB width > 0.5% = enough movement
+BB_WIDTH_MAX = float(os.environ.get("BB_WIDTH_MAX", "0.025"))   # BB width < 2.5% = not chaotic
 
-# In-memory chat storage
-CHAT_SESSIONS = {}  # chat_id -> [{"role": "user"|"assistant", "content": "..."}]
-CHAT_MAX_TURNS = int(os.environ.get("CHAT_MAX_TURNS", "8"))
+STATE_FILE = Path(__file__).with_name("grid_state.json")
+LOG_FILE = Path(__file__).with_name("grid_log.txt")
 
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-haiku-4-5-20251001")
-CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("CHAT_MAX_OUTPUT_TOKENS", "180"))
-CHAT_TEMPERATURE = float(os.environ.get("CHAT_TEMPERATURE", "0.7"))
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-bot_running = False
-bot_thread = None
-bot_error = None
+def send_telegram(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except:
+        pass
 
+def append_log(event, payload):
+    try:
+        record = {"ts": utc_now(), "event": event}
+        if isinstance(payload, dict):
+            record.update(payload)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except:
+        pass
 
-@app.route('/static/emotions/<path:filename>')
-def serve_emotion(filename):
-    return send_from_directory(EMOTIONS_DIR, filename)
+def get_server_time():
+    r = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
+    return str(int(float(r.json()["result"]["timeNano"]) / 1000000))
 
-
-def get_random_emotion():
-    if not EMOTIONS_DIR.exists():
-        return None
-    files = [f for f in os.listdir(EMOTIONS_DIR) if f.endswith(('.jpg', '.png', '.jpeg'))]
-    return random.choice(files) if files else None
-
-
-# HTML template
-HTML_TEMPLATE = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ETH Trader Bot</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 20px; color: #38bdf8; }
-        .card { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 16px; border: 1px solid #334155; }
-        .card h2 { font-size: 1.1rem; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-        .stat { background: #0f172a; padding: 12px; border-radius: 8px; text-align: center; }
-        .stat-label { font-size: 0.75rem; color: #64748b; margin-bottom: 4px; }
-        .stat-value { font-size: 1.5rem; font-weight: bold; }
-        .stat-value.positive { color: #4ade80; }
-        .stat-value.negative { color: #f87171; }
-        .stat-value.neutral { color: #38bdf8; }
-        .status-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
-        .status-running { background: #10b981; color: white; }
-        .status-paused { background: #f59e0b; color: white; }
-        .status-error { background: #ef4444; color: white; }
-        .controls { display: flex; gap: 10px; flex-wrap: wrap; }
-        button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; transition: all 0.2s; }
-        button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
-        .btn-primary { background: #38bdf8; color: white; }
-        .btn-success { background: #4ade80; color: white; }
-        .btn-danger { background: #f87171; color: white; }
-        .btn-warning { background: #f59e0b; color: white; }
-        .log { background: #0f172a; border-radius: 8px; padding: 12px; max-height: 300px; overflow-y: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 0.85rem; }
-        .log-entry { padding: 4px 0; border-bottom: 1px solid #1e293b; }
-        .log-entry:last-child { border-bottom: none; }
-        .log-time { color: #64748b; margin-right: 8px; }
-        .log-msg { color: #e2e8f0; }
-        .log-msg.error { color: #ef4444; }
-        .info { background: #0f172a; padding: 12px; border-radius: 8px; font-size: 0.85rem; color: #94a3b8; }
-        .info strong { color: #e2e8f0; }
-        .last-update { text-align: center; color: #64748b; font-size: 0.85rem; margin-top: 20px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📈 ETH Trader Bot</h1>
-
-        <div class="card">
-            <h2>Chat</h2>
-            <div class="info">
-                <strong>Chat UI:</strong> <a href="/chat" style="color:#38bdf8">Open Messenger-style chat</a>
-            </div>
-        </div>
-        
-        <div class="card">
-            <h2>Status</h2>
-            <div class="grid">
-                <div class="stat">
-                    <div class="stat-label">Bot Status</div>
-                    <div class="stat-value" id="botStatus">Checking...</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Equity</div>
-                    <div class="stat-value neutral" id="equity">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Daily PnL</div>
-                    <div class="stat-value" id="dailyPnl">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Consecutive Loss</div>
-                    <div class="stat-value" id="consecutiveLoss">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Trade Mood</div>
-                    <div class="stat-value" id="tradeMood">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Live Trade PnL</div>
-                    <div class="stat-value" id="livePnl">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Trade Side</div>
-                    <div class="stat-value neutral" id="tradeSide">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Entry / Mark</div>
-                    <div class="stat-value neutral" id="entryMark">--</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Performance</h2>
-            <div class="grid">
-                <div class="stat">
-                    <div class="stat-label">Lifetime PnL</div>
-                    <div class="stat-value" id="lifetimePnl">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Trades Today</div>
-                    <div class="stat-value" id="tradesToday">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Win Rate</div>
-                    <div class="stat-value" id="winRate">--</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">Avg Win / Avg Loss</div>
-                    <div class="stat-value" id="avgWinLoss">--</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Controls</h2>
-            <div class="controls">
-                <button class="btn-success" id="btnResume" onclick="resumeTrading()">▶ Resume</button>
-                <button class="btn-warning" id="btnPause" onclick="pauseTrading()">⏸ Pause</button>
-                <button class="btn-danger" id="btnStop" onclick="stopTrading()">⏹ Stop</button>
-                <button class="btn-primary" id="btnStart" onclick="startTrading()">▶ Start</button>
-            </div>
-            <div class="info" style="margin-top: 12px;">
-                <strong>Max Daily Loss:</strong> $100 | 
-                <strong>Max Consecutive Loss:</strong> $100 | 
-                <strong>Position:</strong> 0.04 ETH | 
-                <strong>Leverage:</strong> 45x
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Recent Activity</h2>
-            <div class="log" id="activityLog">
-                <div class="log-entry"><span class="log-time">--:--:--</span><span class="log-msg">Waiting for first cycle...</span></div>
-            </div>
-        </div>
-
-        <div class="last-update">Last updated: <span id="lastUpdate">--</span></div>
-    </div>
-
-    <script>
-        function money(value) {
-            return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
-        }
-
-        function tradeMood(pnl) {
-            if (typeof pnl !== 'number' || !Number.isFinite(pnl)) return { icon: '😴', label: 'No trade', tone: 'neutral' };
-            if (pnl <= -4) return { icon: '😱', label: 'Very bad', tone: 'negative' };
-            if (pnl <= -2) return { icon: '😬', label: 'Bad', tone: 'negative' };
-            if (pnl < 0) return { icon: '😐', label: 'Slightly red', tone: 'negative' };
-            if (pnl < 1) return { icon: '🙂', label: 'Okay', tone: 'neutral' };
-            if (pnl < 3) return { icon: '😎', label: 'Good', tone: 'positive' };
-            return { icon: '🚀', label: 'Great', tone: 'positive' };
-        }
-
-        async function fetchData() {
-            try {
-                const res = await fetch('/api/status');
-                if (!res.ok) throw new Error(`Status ${res.status}`);
-                const data = await res.json();
-                
-                document.getElementById('equity').textContent = money(data.equity);
-                
-                const dpEl = document.getElementById('dailyPnl');
-                dpEl.textContent = money(data.daily_pnl);
-                dpEl.className = 'stat-value ' + (data.daily_pnl > 0 ? 'positive' : data.daily_pnl < 0 ? 'negative' : 'neutral');
-
-                document.getElementById('consecutiveLoss').textContent = money(data.consecutive_loss);
-
-                const lifetimeEl = document.getElementById('lifetimePnl');
-                lifetimeEl.textContent = money(data.total_pnl);
-                lifetimeEl.className = 'stat-value ' + (data.total_pnl > 0 ? 'positive' : data.total_pnl < 0 ? 'negative' : 'neutral');
-
-                document.getElementById('tradesToday').textContent = data.trades_today ?? 0;
-                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-
-                const pnl = data.live_pnl;
-                const mood = tradeMood(pnl);
-                const livePnlEl = document.getElementById('livePnl');
-                const moodEl = document.getElementById('tradeMood');
-                livePnlEl.textContent = money(pnl);
-                livePnlEl.className = `stat-value ${pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'neutral'}`;
-                moodEl.textContent = `${mood.icon} ${mood.label}`;
-                moodEl.className = `stat-value ${mood.tone}`;
-
-                document.getElementById('tradeSide').textContent = data.position_side || '--';
-                document.getElementById('entryMark').textContent =
-                    data.entry_price && data.mark_price
-                        ? `$${data.entry_price.toFixed(2)} / $${data.mark_price.toFixed(2)}`
-                        : '--';
-
-                // Win rate
-                if (data.win_count != null || data.loss_count != null) {
-                    const total = (data.win_count || 0) + (data.loss_count || 0);
-                    const rate = total > 0 ? (((data.win_count || 0) / total) * 100).toFixed(1) : 0;
-                    document.getElementById('winRate').textContent = total > 0 ? `${rate}%` : '--';
-                } else {
-                    document.getElementById('winRate').textContent = '--';
-                }
-
-                // Avg win/loss
-                if (data.avg_win != null || data.avg_loss != null) {
-                    document.getElementById('avgWinLoss').textContent =
-                        `W: $${(data.avg_win || 0).toFixed(2)} / L: $${(data.avg_loss || 0).toFixed(2)}`;
-                } else {
-                    document.getElementById('avgWinLoss').textContent = '--';
-                }
-
-                // Bot status badge
-                const statusEl = document.getElementById('botStatus');
-                if (data.paused) {
-                    statusEl.textContent = 'Paused';
-                    statusEl.className = 'stat-value status-badge status-paused';
-                } else if (data.bot_running) {
-                    statusEl.textContent = 'Running';
-                    statusEl.className = 'stat-value status-badge status-running';
-                } else {
-                    statusEl.textContent = 'Stopped';
-                    statusEl.className = 'stat-value status-badge status-error';
-                }
-
-                // Control buttons
-                document.getElementById('btnResume').style.display = data.paused ? 'inline-block' : 'none';
-                document.getElementById('btnPause').style.display = (!data.paused && data.bot_running) ? 'inline-block' : 'none';
-                document.getElementById('btnStop').style.display = data.bot_running ? 'inline-block' : 'none';
-                document.getElementById('btnStart').style.display = !data.bot_running ? 'inline-block' : 'none';
-
-                fetchLog();
-            } catch (e) {
-                console.error('Fetch error:', e);
-            }
-        }
-
-        async function fetchLog() {
-            try {
-                const res = await fetch('/api/log');
-                if (!res.ok) throw new Error(`Log ${res.status}`);
-                const data = await res.json();
-                const log = document.getElementById('activityLog');
-                const lines = data.log || [];
-                if (!lines.length) return;
-                log.innerHTML = lines.slice(-12).reverse().map((line) => {
-                    let text = line.trim();
-                    let time = '';
-                    let cls = 'log-msg';
-                    try {
-                        const item = JSON.parse(text);
-                        time = item.ts ? new Date(item.ts).toLocaleTimeString() : '';
-                        const ev = (item.event || '').toLowerCase();
-                        if (ev === 'error') cls += ' error';
-                        text = `[${item.event || 'LOG'}] ${item.reason || item.retMsg || item.decision || ''}`;
-                    } catch (e) {
-                        if (text.toLowerCase().includes('error')) cls += ' error';
-                    }
-                    return `<div class="log-entry"><span class="log-time">${time}</span><span class="${cls}">${text}</span></div>`;
-                }).join('');
-            } catch (e) {
-                console.error('Log fetch error:', e);
-            }
-        }
-
-        async function control(action) {
-            try {
-                await fetch(`/api/${action}`, { method: 'POST' });
-                fetchData();
-            } catch (e) {
-                console.error('Control error:', e);
-            }
-        }
-
-        function resumeTrading() { control('resume'); }
-        function pauseTrading() { control('pause'); }
-        function stopTrading() { control('stop'); }
-        function startTrading() { control('start'); }
-
-        setInterval(fetchData, 5000);
-        fetchData();
-    </script>
-</body>
-</html>'''
-
-CHAT_TEMPLATE = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ETH Bot Chat</title>
-  <style>
-    :root{
-      --bg:#f4f5ff;
-      --panel:#ffffff;
-      --border:rgba(0,0,0,.06);
-      --text:#111827;
-      --muted:#6b7280;
-      --me:#4f46e5;
-      --me2:#6d28d9;
-      --meText:#ffffff;
-      --bot:#eef2ff;
-      --botText:#111827;
-      --input:#f3f4f6;
-      --shadow: 0 18px 50px rgba(17,24,39,.18);
+def sign_request(params):
+    timestamp = get_server_time()
+    body = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+    param_str = timestamp + BYBIT_API_KEY + "5000" + body
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": "5000",
+        "Content-Type": "application/json"
     }
-    *{box-sizing:border-box;}
-    body{
-      margin:0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      background: radial-gradient(1000px 600px at 40% -10%, rgba(99,102,241,.35), rgba(0,0,0,0) 60%), var(--bg);
-      color:var(--text);
-      height:100vh;
-      display:flex;
-      justify-content:center;
-      align-items:center;
-      padding:16px;
-    }
-    .phone{
-      width:min(420px, 100%);
-      height:min(840px, 100%);
-      background:var(--panel);
-      border:1px solid var(--border);
-      border-radius:28px;
-      overflow:hidden;
-      box-shadow:var(--shadow);
-      display:flex;
-      flex-direction:column;
-    }
-    .topbar{
-      padding:16px;
-      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
-      display:flex;
-      gap:12px;
-      align-items:center;
-    }
-    .avatar{
-      width:36px;height:36px;border-radius:50%;
-      background: rgba(255,255,255,.18);
-      border:1px solid rgba(255,255,255,.35);
-      display:flex;align-items:center;justify-content:center;
-      font-weight:800;color:white;
-    }
-    .titlewrap{display:flex;flex-direction:column;line-height:1.1}
-    .title{font-weight:750;color:white}
-    .subtitle{font-size:12px;color:rgba(255,255,255,.85)}
-    .msgs{
-      flex:1;
-      padding:14px 12px;
-      overflow:auto;
-      background: linear-gradient(180deg, #ffffff 0%, #fbfbff 100%);
-    }
-    .row{display:flex; margin:8px 0; flex-direction: column;}
-    .row.me{align-items:flex-end;}
-    .row.bot{align-items:flex-start;}
-    .bubble{
-      max-width:78%;
-      padding:10px 12px;
-      border-radius:18px;
-      font-size:14px;
-      line-height:1.35;
-      white-space:pre-wrap;
-      word-wrap:break-word;
-    }
-    .row.me .bubble{
-      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
-      color:var(--meText);
-      border-bottom-right-radius:6px;
-    }
-    .row.bot .bubble{
-      background:var(--bot);
-      border:1px solid rgba(0,0,0,.05);
-      color:var(--botText);
-      border-bottom-left-radius:6px;
-    }
-    .emotion-img {
-      max-width: 150px;
-      border-radius: 12px;
-      margin-top: 4px;
-      border: 1px solid var(--border);
-    }
-    .chips{
-      padding:8px 12px;
-      display:flex;
-      gap:8px;
-      flex-wrap:wrap;
-      border-top:1px solid var(--border);
-      background:#fff;
-    }
-    .chip{
-      border:1px solid rgba(0,0,0,.08);
-      background:#fff;
-      color:var(--text);
-      padding:7px 10px;
-      border-radius:999px;
-      font-size:12px;
-      cursor:pointer;
-    }
-    .composer{
-      border-top:1px solid var(--border);
-      padding:10px 12px;
-      background:#fff;
-      display:flex;
-      gap:10px;
-      align-items:center;
-    }
-    .input{
-      flex:1;
-      background:var(--input);
-      border:1px solid rgba(0,0,0,.08);
-      border-radius:999px;
-      padding:10px 12px;
-      color:var(--text);
-      outline:none;
-      font-size:14px;
-    }
-    .send{
-      width:40px;height:40px;border-radius:50%;
-      border:none;
-      background: linear-gradient(135deg, var(--me) 0%, var(--me2) 100%);
-      color:white;
-      cursor:pointer;
-      font-weight:800;
-    }
-  </style>
-</head>
-<body>
-  <div class="phone">
-    <div class="topbar">
-      <div class="avatar">B</div>
-      <div class="titlewrap">
-        <div class="title">ETH Bot Assistant</div>
-        <div class="subtitle">Online • /balance /start /stop /status</div>
-      </div>
-    </div>
-    <div class="chips">
-      <button class="chip" onclick="sendText('/balance')">Balance</button>
-      <button class="chip" onclick="sendText('/status')">Status</button>
-      <button class="chip" onclick="sendText('/stop')">Stop trading</button>
-      <button class="chip" onclick="sendText('/start')">Start trading</button>
-    </div>
-    <div class="msgs" id="msgs"></div>
-    <div class="composer">
-      <input class="input" id="text" placeholder="Type a message…" autocomplete="off" />
-      <button class="send" id="sendBtn">➤</button>
-    </div>
-  </div>
+    return headers, body
 
-  <script>
-    const msgs = document.getElementById('msgs');
-    const input = document.getElementById('text');
-    const btn = document.getElementById('sendBtn');
-
-    function add(role, text, emotion){
-      const row = document.createElement('div');
-      row.className = 'row ' + (role === 'user' ? 'me' : 'bot');
-      const b = document.createElement('div');
-      b.className = 'bubble';
-      b.textContent = text;
-      row.appendChild(b);
-      if (emotion) {
-        const img = document.createElement('img');
-        img.src = '/static/emotions/' + emotion;
-        img.className = 'emotion-img';
-        row.appendChild(img);
-      }
-      msgs.appendChild(row);
-      msgs.scrollTop = msgs.scrollHeight;
+def sign_get(query):
+    timestamp = get_server_time()
+    param_str = timestamp + BYBIT_API_KEY + "5000" + query
+    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    return {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-RECV-WINDOW": "5000"
     }
 
-    async function sendText(text){
-      const t = (text ?? input.value ?? '').trim();
-      if(!t) return;
-      input.value = '';
-      add('user', t);
-      try{
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({message: t})
-        });
-        const data = await res.json();
-        add('assistant', data.reply || 'No reply', data.emotion);
-      }catch(e){
-        add('assistant', 'Error: ' + (e?.message || e));
-      }
+def set_leverage():
+    params = {"category": "linear", "symbol": SYMBOL,
+              "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
+    headers, body = sign_request(params)
+    requests.post("https://api.bybit.com/v5/position/set-leverage",
+                  data=body, headers=headers, timeout=10)
+
+def get_price():
+    r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={SYMBOL}", timeout=10)
+    return float(r.json()["result"]["list"][0]["lastPrice"])
+
+def get_candles(interval="60", limit=100):
+    try:
+        r = requests.get(
+            f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={interval}&limit={limit}",
+            timeout=10
+        )
+        data = r.json()
+        if not data.get("result") or not data["result"].get("list"):
+            return []
+        return [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]),
+                 "close": float(c[4]), "volume": float(c[5])}
+                for c in reversed(data["result"]["list"])]
+    except:
+        return []
+
+def get_open_orders():
+    query = f"category=linear&symbol={SYMBOL}&limit=50"
+    headers = sign_get(query)
+    r = requests.get(f"https://api.bybit.com/v5/order/realtime?{query}",
+                     headers=headers, timeout=10)
+    data = r.json()
+    if data.get("result") and data["result"].get("list"):
+        return data["result"]["list"]
+    return []
+
+def cancel_all_orders():
+    params = {"category": "linear", "symbol": SYMBOL}
+    headers, body = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/order/cancel-all",
+                      data=body, headers=headers, timeout=10)
+    return r.json()
+
+def place_limit_order(side, price_level, qty):
+    position_idx = 1 if side == "Buy" else 2
+    params = {
+        "category": "linear",
+        "symbol": SYMBOL,
+        "side": side,
+        "orderType": "Limit",
+        "qty": str(round(qty, 3)),
+        "price": str(round(price_level, 2)),
+        "positionIdx": position_idx,
+        "timeInForce": "GTC"
+    }
+    headers, body = sign_request(params)
+    r = requests.post("https://api.bybit.com/v5/order/create",
+                      data=body, headers=headers, timeout=10)
+    return r.json()
+
+def calculate_ema(values, period):
+    if len(values) < period:
+        return values[-1] if values else 0
+    k = 2 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+    return round(ema, 6)
+
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return 0
+    trs = []
+    for i in range(1, len(candles)):
+        tr = max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - candles[i-1]["close"]),
+            abs(candles[i]["low"] - candles[i-1]["close"])
+        )
+        trs.append(tr)
+    return round(sum(trs[-period:]) / period, 4)
+
+def calculate_adx(candles, period=14):
+    """Calculate ADX — measures trend strength. Low ADX = sideways."""
+    if len(candles) < period * 2:
+        return 50  # assume trending if not enough data
+    plus_dm_list, minus_dm_list, tr_list = [], [], []
+    for i in range(1, len(candles)):
+        high_diff = candles[i]["high"] - candles[i-1]["high"]
+        low_diff = candles[i-1]["low"] - candles[i]["low"]
+        plus_dm = high_diff if high_diff > low_diff and high_diff > 0 else 0
+        minus_dm = low_diff if low_diff > high_diff and low_diff > 0 else 0
+        tr = max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - candles[i-1]["close"]),
+            abs(candles[i]["low"] - candles[i-1]["close"])
+        )
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+        tr_list.append(tr)
+
+    # Smooth with Wilder's moving average
+    def wilder_smooth(values, p):
+        smooth = sum(values[:p])
+        result = [smooth]
+        for v in values[p:]:
+            smooth = smooth - smooth / p + v
+            result.append(smooth)
+        return result
+
+    tr_smooth = wilder_smooth(tr_list, period)
+    plus_smooth = wilder_smooth(plus_dm_list, period)
+    minus_smooth = wilder_smooth(minus_dm_list, period)
+
+    dx_list = []
+    for i in range(len(tr_smooth)):
+        if tr_smooth[i] == 0:
+            continue
+        plus_di = 100 * plus_smooth[i] / tr_smooth[i]
+        minus_di = 100 * minus_smooth[i] / tr_smooth[i]
+        di_sum = plus_di + minus_di
+        dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return 50
+    adx = sum(dx_list[-period:]) / period
+    return round(adx, 2)
+
+def calculate_bollinger(closes, period=20):
+    if len(closes) < period:
+        c = closes[-1] if closes else 0
+        return c, c, c
+    recent = closes[-period:]
+    sma = sum(recent) / period
+    std = (sum((p - sma) ** 2 for p in recent) / period) ** 0.5
+    return round(sma, 2), round(sma + 2 * std, 2), round(sma - 2 * std, 2)
+
+def is_sideways_market(candles, price):
+    """
+    Returns (is_sideways: bool, reason: str, indicators: dict)
+    Sideways = ADX < threshold AND BB width in valid range
+    """
+    closes = [c["close"] for c in candles]
+    adx = calculate_adx(candles, ADX_PERIOD)
+    bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
+    bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
+
+    indicators = {
+        "adx": adx,
+        "bb_width_pct": round(bb_width * 100, 3),
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
+        "bb_mid": bb_mid
     }
 
-    btn.addEventListener('click', () => sendText());
-    input.addEventListener('keydown', (e) => {
-      if(e.key === 'Enter') sendText();
-    });
+    if adx >= ADX_SIDEWAYS_MAX:
+        return False, f"ADX {adx} >= {ADX_SIDEWAYS_MAX} (trending)", indicators
 
-    add('assistant', 'Hi! Try /balance, /status, /stop, or /start — or just ask me anything.');
-  </script>
-</body>
-</html>
-'''
+    if bb_width < BB_WIDTH_MIN:
+        return False, f"BB width {bb_width*100:.2f}% too tight (< {BB_WIDTH_MIN*100:.1f}%)", indicators
 
+    if bb_width > BB_WIDTH_MAX:
+        return False, f"BB width {bb_width*100:.2f}% too wide (> {BB_WIDTH_MAX*100:.1f}%)", indicators
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+    return True, f"ADX {adx} < {ADX_SIDEWAYS_MAX} + BB width {bb_width*100:.2f}% in range", indicators
 
+def ask_claude_grid(price, indicators, open_orders_count, state):
+    """Ask Claude to assess grid parameters for current market."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    prompt = f"""You are managing a grid trading bot for ETH/USDT perpetual on Bybit.
 
-@app.route('/chat')
-def chat():
-    return render_template_string(CHAT_TEMPLATE)
+Current price: ${price:.2f}
+Time: {utc_now()}
 
+Market indicators:
+- ADX: {indicators['adx']} (< {ADX_SIDEWAYS_MAX} = sideways confirmed)
+- BB Upper: ${indicators['bb_upper']} | Mid: ${indicators['bb_mid']} | Lower: ${indicators['bb_lower']}
+- BB Width: {indicators['bb_width_pct']}%
+
+Grid config:
+- Levels each side: {GRID_LEVELS}
+- Spacing: {GRID_SPACING_PCT*100:.2f}% between levels
+- Qty per level: {QTY_PER_LEVEL} ETH
+- Leverage: {LEVERAGE}x
+
+Current open orders: {open_orders_count}
+Grid profit today: ${state.get('total_profit', 0):.4f}
+Fills today: {state.get('total_fills', 0)}
+
+Grid range would be: ${price * (1 - GRID_LEVELS * GRID_SPACING_PCT):.2f} to ${price * (1 + GRID_LEVELS * GRID_SPACING_PCT):.2f}
+
+Should we PLACE the grid, SKIP this cycle, or CANCEL and rebuild?
+- PLACE: market is sideways and grid is not active or needs rebuild
+- SKIP: grid is already placed and working fine
+- CANCEL: grid needs to be cancelled (price moved outside range, market changed)
+
+Respond in this exact format:
+DECISION: PLACE or SKIP or CANCEL
+REASON: (1-2 sentences)
+CENTER_PRICE: $X.XX"""
+
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = message.content[0].text
+        decision = "SKIP"
+        reason = ""
+        center = price
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if line.upper().startswith("DECISION:"):
+                decision = line.split(":", 1)[1].strip().upper()
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("CENTER_PRICE:"):
+                try:
+                    center = float(line.split(":", 1)[1].replace("$", "").strip())
+                except:
+                    center = price
+        return decision, reason, center
+    except Exception as e:
+        return "SKIP", f"Claude error: {e}", price
+
+def place_grid(center_price):
+    """Place buy and sell limit orders around center price."""
+    placed_buys = []
+    placed_sells = []
+
+    for i in range(1, GRID_LEVELS + 1):
+        # Buy below
+        buy_price = center_price * (1 - i * GRID_SPACING_PCT)
+        result = place_limit_order("Buy", buy_price, QTY_PER_LEVEL)
+        if result.get("retCode") == 0:
+            placed_buys.append(round(buy_price, 2))
+        else:
+            send_telegram(f"❌ Grid buy order failed at ${buy_price:.2f}: {result.get('retMsg')}")
+
+        # Sell above
+        sell_price = center_price * (1 + i * GRID_SPACING_PCT)
+        result = place_limit_order("Sell", sell_price, QTY_PER_LEVEL)
+        if result.get("retCode") == 0:
+            placed_sells.append(round(sell_price, 2))
+        else:
+            send_telegram(f"❌ Grid sell order failed at ${sell_price:.2f}: {result.get('retMsg')}")
+
+        time.sleep(0.1)  # rate limit safety
+
+    return placed_buys, placed_sells
 
 def load_state():
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
+    try:
+        if STATE_FILE.exists():
+            with STATE_FILE.open("r") as f:
                 return json.load(f)
-        except:
-            pass
-    return {}
-
+    except:
+        pass
+    return {
+        "grid_active": False,
+        "center_price": None,
+        "grid_upper": None,
+        "grid_lower": None,
+        "total_profit": 0.0,
+        "total_fills": 0,
+        "last_placed": None
+    }
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
-
-
-def get_last_lines(n=50):
-    if not LOG_FILE.exists():
-        return []
-    with open(LOG_FILE, 'r') as f:
-        lines = f.readlines()
-    return lines[-n:]
-
-
-def _get_chat_id():
-    cid = request.cookies.get("chat_id")
-    if not cid:
-        cid = str(uuid.uuid4())
-    return cid
-
-
-def _chat_memory(cid: str):
-    mem = CHAT_SESSIONS.get(cid)
-    if not mem:
-        mem = []
-        CHAT_SESSIONS[cid] = mem
-    return mem
-
-
-def _trim_memory(mem):
-    if len(mem) > CHAT_MAX_TURNS * 2:
-        del mem[:-CHAT_MAX_TURNS * 2]
-
-
-def _set_trading_enabled(enabled: bool):
-    state = load_state()
-    state["trading_enabled"] = bool(enabled)
-    save_state(state)
-    return state
-
-
-def _format_money(v):
     try:
-        return f"${float(v):.2f}"
+        with STATE_FILE.open("w") as f:
+            json.dump(state, f, indent=2)
     except:
-        return "n/a"
+        pass
 
+def run_cycle():
+    now = utc_now()
+    price = get_price()
+    candles = get_candles("60", 100)
+    state = load_state()
 
-def _handle_chat_command(text: str):
-    t = (text or "").strip()
-    low = t.lower()
-    if low in ("/help", "help"):
-        return True, "😼 Commands:\n/balance - show Bybit USDT equity\n/status - show bot + trading flags\n/stop - disable new entries\n/start - enable new entries"
-    if low in ("/stop", "stop", "stop trading", "stop bot"):
-        st = _set_trading_enabled(False)
-        return True, f"🛑 Trading disabled. trading_enabled={st.get('trading_enabled')}"
-    if low in ("/start", "start", "start trading", "start bot"):
-        st = _set_trading_enabled(True)
-        return True, f"✅ Trading enabled. trading_enabled={st.get('trading_enabled')}"
-    if low in ("/balance", "balance", "bybit balance", "check balance"):
-        try:
-            equity = trader_bot.get_wallet_equity_usdt()
-            if equity is None:
-                return True, "😾 Could not fetch Bybit equity."
-            return True, f"🧾 Bybit USDT equity: {_format_money(equity)}"
-        except Exception as e:
-            return True, f"😾 Balance check failed: {str(e)}"
-    if low in ("/status", "status"):
-        st = load_state()
-        paused_until = int(st.get("paused_until") or 0)
-        is_paused = bool(st.get("paused")) or time.time() < paused_until
-        equity = st.get("equity")
-        pos = st.get("position") or {}
-        side = pos.get("side") if isinstance(pos, dict) else None
-        size = pos.get("size") if isinstance(pos, dict) else None
-        return True, (
-            f"📡 Status\n"
-            f"Bot thread: {'running' if bot_running else 'not running'}\n"
-            f"Trading enabled: {st.get('trading_enabled', True)}\n"
-            f"Paused: {is_paused}\n"
-            f"Equity (cached): {_format_money(equity)}\n"
-            f"Position: {side or 'none'} size={size or 0}"
-        )
-    return False, ""
+    if len(candles) < 30:
+        send_telegram(f"⚠️ Not enough candle data: {len(candles)}")
+        return
 
+    # Check if market is sideways
+    sideways, regime_reason, indicators = is_sideways_market(candles, price)
 
-def _call_claude_chat(messages):
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return "ANTHROPIC_API_KEY is not set."
-    if anthropic is None:
-        return "Anthropic SDK is not available."
-    client = anthropic.Anthropic(api_key=api_key)
-    system = "You are a tsundere personal assistant inside a crypto trading bot chat. Keep replies short (1-4 sentences). Be a little sassy but actually helpful."
-    # Try primary model, then fallbacks
-    candidates = [CHAT_MODEL, "claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"]
-    for model in candidates:
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-                system=system,
-                messages=messages
+    if not sideways:
+        # Market is trending — cancel grid if active
+        if state.get("grid_active"):
+            cancel_result = cancel_all_orders()
+            state["grid_active"] = False
+            state["center_price"] = None
+            save_state(state)
+            send_telegram(
+                f"🚫 <b>GRID CANCELLED</b> — Market trending\n"
+                f"Price: ${price:.2f}\n"
+                f"Reason: {regime_reason}"
             )
-            return resp.content[0].text
-        except Exception as e:
-            if "model" in str(e).lower() or "not found" in str(e).lower():
-                continue
-            return f"Claude API error: {str(e)}"
-    return "Could not reach Claude API."
+            append_log("GRID_CANCEL", {"reason": regime_reason, "price": price})
+        else:
+            send_telegram(
+                f"⏭ <b>SKIP</b> — Trending market\n"
+                f"Price: ${price:.2f}\n"
+                f"Reason: {regime_reason}\n"
+                f"ADX: {indicators['adx']} | BB Width: {indicators['bb_width_pct']}%"
+            )
+        return
 
+    # Market is sideways — check open orders
+    open_orders = get_open_orders()
+    open_count = len(open_orders)
 
-@app.route('/api/chat', methods=['POST'])
-def api_chat():
-    try:
-        data = request.get_json(silent=True) or {}
-        text = (data.get("message") or "").strip()
-        if not text:
-            return jsonify({"reply": "Send a message."})
-        handled, reply = _handle_chat_command(text)
-        emotion = get_random_emotion()
-        if handled:
-            resp = jsonify({"reply": reply, "emotion": emotion})
-            if not request.cookies.get("chat_id"):
-                resp.set_cookie("chat_id", str(uuid.uuid4()), max_age=60*60*24*30, httponly=True, samesite="Lax")
-            return resp
-        cid = _get_chat_id()
-        mem = _chat_memory(cid)
-        mem.append({"role": "user", "content": text})
-        _trim_memory(mem)
-        reply_text = _call_claude_chat(mem)
-        mem.append({"role": "assistant", "content": reply_text})
-        _trim_memory(mem)
-        resp = jsonify({"reply": reply_text, "emotion": emotion})
-        if not request.cookies.get("chat_id"):
-            resp.set_cookie("chat_id", cid, max_age=60*60*24*30, httponly=True, samesite="Lax")
-        return resp
-    except Exception as e:
-        return jsonify({"reply": f"Server error: {str(e)}"}), 500
+    # Check if price moved outside grid range
+    if state.get("grid_active") and state.get("grid_upper") and state.get("grid_lower"):
+        if price > state["grid_upper"] or price < state["grid_lower"]:
+            cancel_result = cancel_all_orders()
+            state["grid_active"] = False
+            save_state(state)
+            send_telegram(
+                f"🔄 <b>GRID REBUILD</b> — Price left range\n"
+                f"Price: ${price:.2f} | Range: ${state['grid_lower']:.2f}-${state['grid_upper']:.2f}"
+            )
+            open_count = 0
 
+    # Ask Claude what to do
+    decision, reason, center_price = ask_claude_grid(price, indicators, open_count, state)
 
-@app.route('/api/status')
-def api_status():
-    state = load_state()
-    paused_until = int(state.get("paused_until") or 0)
-    is_paused = bool(state.get("paused")) or time.time() < paused_until
-    equity = state.get("equity")
-    daily_pnl = state.get("daily_pnl")
-    perf = trader_bot.performance_summary(state)
-    position = state.get("position") or {}
-    return jsonify({
-        "equity": equity,
-        "daily_pnl": daily_pnl,
-        "consecutive_loss": state.get("consecutive_loss"),
-        "total_pnl": state.get("total_pnl"),          # FIX: was "lifetime_pnl" → state key is total_pnl
-        "paused": is_paused,
-        "position": position,
-        "trades_today": state.get("trades_today"),
-        "trading_enabled": state.get("trading_enabled", True),
-        "win_count": perf.get("wins"),
-        "loss_count": perf.get("losses"),
-        "avg_win": perf.get("avg_win"),
-        "avg_loss": perf.get("avg_loss"),
-        "bot_running": bot_running,
-        # Live position fields
-        "live_pnl": state.get("live_pnl"),
-        "position_side": state.get("position_side"),
-        "entry_price": state.get("entry_price_live"),
-        "mark_price": state.get("mark_price"),
+    if decision == "CANCEL":
+        if open_count > 0:
+            cancel_all_orders()
+        state["grid_active"] = False
+        save_state(state)
+        send_telegram(
+            f"🚫 <b>GRID CANCELLED by Claude</b>\n"
+            f"Price: ${price:.2f}\n"
+            f"Reason: {reason}"
+        )
+        append_log("GRID_CANCEL_CLAUDE", {"reason": reason, "price": price})
+
+    elif decision == "PLACE":
+        # Cancel existing first
+        if open_count > 0:
+            cancel_all_orders()
+            time.sleep(1)
+
+        set_leverage()
+        placed_buys, placed_sells = place_grid(center_price)
+
+        grid_upper = center_price * (1 + GRID_LEVELS * GRID_SPACING_PCT)
+        grid_lower = center_price * (1 - GRID_LEVELS * GRID_SPACING_PCT)
+
+        state["grid_active"] = True
+        state["center_price"] = center_price
+        state["grid_upper"] = round(grid_upper, 2)
+        state["grid_lower"] = round(grid_lower, 2)
+        state["last_placed"] = now
+        save_state(state)
+
+        send_telegram(
+            f"🟢 <b>GRID PLACED</b>\n"
+            f"Center: ${center_price:.2f} | {GRID_LEVELS} levels × {GRID_SPACING_PCT*100:.2f}%\n"
+            f"Range: ${grid_lower:.2f} — ${grid_upper:.2f}\n"
+            f"Buys: {placed_buys}\n"
+            f"Sells: {placed_sells}\n"
+            f"ADX: {indicators['adx']} | BB: {indicators['bb_width_pct']}%\n"
+            f"Reason: {reason}"
+        )
+        append_log("GRID_PLACED", {
+            "center": center_price,
+            "grid_upper": grid_upper,
+            "grid_lower": grid_lower,
+            "buys": placed_buys,
+            "sells": placed_sells,
+            "adx": indicators["adx"],
+            "bb_width": indicators["bb_width_pct"]
+        })
+
+    else:  # SKIP
+        send_telegram(
+            f"✅ <b>GRID ACTIVE</b> | ${price:.2f}\n"
+            f"Center: ${state.get('center_price', 'N/A')} | Orders: {open_count}\n"
+            f"ADX: {indicators['adx']} | BB: {indicators['bb_width_pct']}%\n"
+            f"Profit: ${state.get('total_profit', 0):.4f} | Fills: {state.get('total_fills', 0)}\n"
+            f"Claude: {reason}"
+        )
+
+def main():
+    send_telegram(
+        f"🤖 <b>ETH Grid Bot Started</b>\n"
+        f"{GRID_LEVELS} levels × {GRID_SPACING_PCT*100:.2f}% | {QTY_PER_LEVEL} ETH/level\n"
+        f"{LEVERAGE}x | Checks every {CHECK_INTERVAL//60}min\n"
+        f"Sideways filter: ADX < {ADX_SIDEWAYS_MAX}"
+    )
+    append_log("START", {
+        "symbol": SYMBOL, "leverage": LEVERAGE,
+        "grid_levels": GRID_LEVELS, "spacing_pct": GRID_SPACING_PCT,
+        "qty_per_level": QTY_PER_LEVEL, "adx_max": ADX_SIDEWAYS_MAX
     })
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            err = f"⚠️ Error: {type(e).__name__}: {str(e)}"
+            send_telegram(err)
+            print(err)
+            print(traceback.format_exc())
+            append_log("ERROR", {"error": err})
+        time.sleep(CHECK_INTERVAL)
 
-
-@app.route('/api/resume', methods=['POST'])
-def api_resume():
-    state = load_state()
-    state["paused"] = False
-    state["paused_until"] = 0
-    save_state(state)
-    return jsonify({"status": "resumed"})
-
-
-@app.route('/api/pause', methods=['POST'])
-def api_pause():
-    state = load_state()
-    state["paused"] = True
-    state["paused_until"] = int(time.time() + 30 * 60)
-    save_state(state)
-    return jsonify({"status": "paused"})
-
-
-@app.route('/api/stop', methods=['POST'])
-def api_stop():
-    global bot_running
-    state = load_state()
-    state["trading_enabled"] = False
-    save_state(state)
-    bot_running = False
-    return jsonify({"status": "stopped"})
-
-
-@app.route('/api/start', methods=['POST'])
-def api_start():
-    state = load_state()
-    state["trading_enabled"] = True
-    save_state(state)
-    _ensure_bot_running()
-    return jsonify({"status": "started"})
-
-
-@app.route('/api/log')
-def api_log():
-    return jsonify({"log": get_last_lines(50)})
-
-
-def _bot_loop():
-    """Background thread that runs the trading bot loop."""
-    global bot_running, bot_error
-    bot_running = True
-    bot_error = None
-    try:
-        trader_bot.main()
-    except Exception as e:
-        bot_error = str(e)
-        print(f"Bot loop crashed: {e}")
-        print(traceback.format_exc())
-    finally:
-        bot_running = False
-
-
-def _ensure_bot_running():
-    """Start the bot thread if it's not already running."""
-    global bot_thread, bot_running
-    if bot_thread is None or not bot_thread.is_alive():
-        bot_thread = threading.Thread(target=_bot_loop, daemon=True)
-        bot_thread.start()
-        bot_running = True
-
-
-if __name__ == '__main__':
-    # Auto-start the bot loop when the Flask app launches
-    _ensure_bot_running()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == "__main__":
+    main()
