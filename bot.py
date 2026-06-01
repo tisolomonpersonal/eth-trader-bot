@@ -159,33 +159,68 @@ def sign_get_request(query: str):
 
 
 def get_wallet_equity_usdt():
-    query = f"accountType={BYBIT_ACCOUNT_TYPE}&coin=USDT"
-    headers = sign_get_request(query)
-    r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}", headers=headers, timeout=10)
-    data = r.json()
-    if not data.get("result") or not data["result"].get("list"):
-        return None
-    item = data["result"]["list"][0]
-    if "totalEquity" in item and item["totalEquity"] not in (None, ""):
+    # Try both account types automatically
+    for acct_type in [BYBIT_ACCOUNT_TYPE, "CONTRACT", "UNIFIED", "SPOT"]:
         try:
-            return float(item["totalEquity"])
-        except:
-            pass
-    coins = item.get("coin") or []
-    for c in coins:
-        if (c.get("coin") or "").upper() == "USDT":
-            for k in ("equity", "walletBalance", "availableToWithdraw", "availableBalance"):
-                if k in c and c[k] not in (None, ""):
+            query = f"accountType={acct_type}&coin=USDT"
+            headers = sign_get_request(query)
+            r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}", headers=headers, timeout=10)
+            data = r.json()
+            print(f"[wallet] accountType={acct_type} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+
+            if data.get("retCode") != 0:
+                continue
+            result_list = data.get("result", {}).get("list", [])
+            if not result_list:
+                continue
+
+            item = result_list[0]
+
+            # Shape A: top-level totalEquity
+            val = item.get("totalEquity")
+            if val not in (None, ""):
+                try:
+                    equity = float(val)
+                    if equity > 0:
+                        print(f"[wallet] found totalEquity={equity} via accountType={acct_type}")
+                        return equity
+                except:
+                    pass
+
+            # Shape B: totalWalletBalance / totalMarginBalance
+            for k in ("totalWalletBalance", "totalMarginBalance"):
+                val = item.get(k)
+                if val not in (None, ""):
                     try:
-                        return float(c[k])
+                        equity = float(val)
+                        if equity > 0:
+                            print(f"[wallet] found {k}={equity} via accountType={acct_type}")
+                            return equity
                     except:
-                        continue
-    for k in ("totalWalletBalance", "totalMarginBalance"):
-        if k in item and item[k] not in (None, ""):
-            try:
-                return float(item[k])
-            except:
-                pass
+                        pass
+
+            # Shape C: coin list
+            coins = item.get("coin") or []
+            for c in coins:
+                if (c.get("coin") or "").upper() == "USDT":
+                    for k in ("equity", "walletBalance", "availableToWithdraw", "availableBalance"):
+                        val = c.get(k)
+                        if val not in (None, ""):
+                            try:
+                                equity = float(val)
+                                if equity >= 0:
+                                    print(f"[wallet] found coin.{k}={equity} via accountType={acct_type}")
+                                    return equity
+                            except:
+                                pass
+
+            print(f"[wallet] accountType={acct_type} — no usable equity field. item keys: {list(item.keys())}")
+
+        except Exception as e:
+            print(f"[wallet] accountType={acct_type} error: {e}")
+            continue
+
+    print("[wallet] all account types exhausted — returning None")
     return None
 
 
