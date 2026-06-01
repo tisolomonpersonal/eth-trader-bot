@@ -267,11 +267,15 @@ def get_position():
         "X-BAPI-SIGN": sign,
         "X-BAPI-RECV-WINDOW": "5000",
     }
-    r = requests.get(f"https://api.bybit.com/v5/position/list?{query}", headers=headers, timeout=10)
-    positions = r.json()["result"]["list"]
-    for p in positions:
-        if float(p["size"]) > 0:
-            return p
+    try:
+        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}", headers=headers, timeout=10)
+        data = r.json()
+        positions = data.get("result", {}).get("list", [])
+        for p in positions:
+            if float(p.get("size", 0)) > 0:
+                return p
+    except Exception as e:
+        print(f"get_position error: {e}")
     return None
 
 
