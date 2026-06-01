@@ -1,53 +1,39 @@
 import requests, json, os, time, hmac, hashlib
 import traceback
 from datetime import datetime, timezone
-import anthropic
 from pathlib import Path
 
+try:
+    import anthropic
+except Exception:
+    anthropic = None
+
 # --- CONFIG ---
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SYMBOL = "ETHUSDT"
-QTY = 0.04
-LEVERAGE = 45
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))
+SYMBOL           = "ETHUSDT"
+LEVERAGE         = int(os.environ.get("LEVERAGE", "10"))
+CHECK_INTERVAL   = int(os.environ.get("CHECK_INTERVAL", "1800"))  # 30 min
 
-MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "2"))
-MAX_CONSEC_LOSS_USD = float(os.environ.get("MAX_CONSEC_LOSS_USD", "4"))
-VOL_SPIKE_ATR_PCT = float(os.environ.get("VOL_SPIKE_ATR_PCT", "0.02"))
-VOL_PAUSE_SECONDS = int(os.environ.get("VOL_PAUSE_SECONDS", "1800"))
+# Grid settings
+GRID_LEVELS      = int(os.environ.get("GRID_LEVELS", "5"))
+GRID_SPACING_PCT = float(os.environ.get("GRID_SPACING_PCT", "0.004"))  # 0.4% per level
+QTY_PER_LEVEL    = float(os.environ.get("QTY_PER_LEVEL", "0.01"))      # ETH per order
 
-DECISION_INTERVAL = os.environ.get("DECISION_INTERVAL", "15")
-DECISION_CANDLE_LIMIT = int(os.environ.get("DECISION_CANDLE_LIMIT", "500"))
-MA_PERIOD = int(os.environ.get("MA_PERIOD", "200"))
-MA_SLOPE_LOOKBACK = int(os.environ.get("MA_SLOPE_LOOKBACK", "10"))
-MA_DISTANCE_PCT = float(os.environ.get("MA_DISTANCE_PCT", "0.003"))
-
-MACD_FAST = int(os.environ.get("MACD_FAST", "12"))
-MACD_SLOW = int(os.environ.get("MACD_SLOW", "26"))
-MACD_SIGNAL = int(os.environ.get("MACD_SIGNAL", "9"))
-
-RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
-RSI_LONG_MIN = float(os.environ.get("RSI_LONG_MIN", "50"))
-RSI_LONG_MAX = float(os.environ.get("RSI_LONG_MAX", "70"))
-RSI_SHORT_MIN = float(os.environ.get("RSI_SHORT_MIN", "30"))
-RSI_SHORT_MAX = float(os.environ.get("RSI_SHORT_MAX", "50"))
-
-ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
-ATR_PCT_MIN = float(os.environ.get("ATR_PCT_MIN", "0.003"))
-ATR_PCT_MAX = float(os.environ.get("ATR_PCT_MAX", "0.02"))
-
-SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.5"))
-TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
+# Sideways filter
+ADX_PERIOD        = int(os.environ.get("ADX_PERIOD", "14"))
+ADX_SIDEWAYS_MAX  = float(os.environ.get("ADX_SIDEWAYS_MAX", "25"))
+BB_WIDTH_MIN      = float(os.environ.get("BB_WIDTH_MIN", "0.005"))
+BB_WIDTH_MAX      = float(os.environ.get("BB_WIDTH_MAX", "0.025"))
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 STATE_FILE = Path(__file__).with_name("bot_state.json")
-LOG_FILE = Path(__file__).with_name("log.txt")
+LOG_FILE   = Path(__file__).with_name("log.txt")
 
-# ─── thread-stop flag (set by app.py) ───────────────────────────────────────
+# ── thread-stop flag (used by app.py) ───────────────────────────────────────
 _stop_flag = False
 
 def request_stop():
@@ -63,9 +49,7 @@ def is_stop_requested():
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def utc_now_ts():
-    return int(datetime.now(timezone.utc).timestamp())
-
+# ── state helpers ────────────────────────────────────────────────────────────
 
 def load_state():
     try:
@@ -75,22 +59,22 @@ def load_state():
     except:
         pass
     return {
-        "day": None,
-        "start_equity": None,
-        "entry_equity": None,
-        "entry_time": None,
-        "entry_price": None,
-        "entry_side": None,
-        "had_position": False,
-        "consecutive_loss": 0.0,
-        "total_pnl": 0.0,
+        "grid_active": False,
+        "center_price": None,
+        "grid_upper": None,
+        "grid_lower": None,
+        "total_profit": 0.0,
         "lifetime_pnl": 0.0,
+        "total_fills": 0,
         "trade_history": [],
+        "last_placed": None,
+        "trading_enabled": True,
         "paused_until": 0,
         "pause_reason": "",
-        "trading_enabled": True,
+        "equity": None,
+        "daily_pnl": None,
+        "consecutive_loss": 0.0,
     }
-
 
 def save_state(state):
     try:
@@ -99,13 +83,9 @@ def save_state(state):
     except:
         pass
 
-
-def append_log(event_type, payload):
+def append_log(event, payload):
     try:
-        record = {
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "event": event_type,
-        }
+        record = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "event": event}
         if isinstance(payload, dict):
             record.update(payload)
         with LOG_FILE.open("a", encoding="utf-8") as f:
@@ -113,719 +93,455 @@ def append_log(event_type, payload):
     except:
         pass
 
-
 def performance_summary(state):
-    hist = state.get("trade_history") or []
-    pnls = []
+    """Required by app.py."""
+    hist  = state.get("trade_history") or []
+    pnls  = []
     for t in hist:
         try:
             pnls.append(float(t.get("pnl") or 0.0))
         except:
             pass
-    wins = [p for p in pnls if p > 0]
+    wins   = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
-    total = len(pnls)
-    winrate = (len(wins) / total) * 100 if total else 0.0
-    avg_win = (sum(wins) / len(wins)) if wins else 0.0
-    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
-    last_pnl = pnls[-1] if pnls else 0.0
+    total  = len(pnls)
     return {
-        "trades": total,
-        "wins": len(wins),
-        "losses": len(losses),
-        "winrate": round(winrate, 2),
-        "avg_win": round(avg_win, 4),
-        "avg_loss": round(avg_loss, 4),
-        "last_pnl": round(last_pnl, 4),
+        "trades":   total,
+        "wins":     len(wins),
+        "losses":   len(losses),
+        "winrate":  round((len(wins) / total) * 100, 2) if total else 0.0,
+        "avg_win":  round(sum(wins) / len(wins), 4)   if wins   else 0.0,
+        "avg_loss": round(sum(losses) / len(losses), 4) if losses else 0.0,
+        "last_pnl": round(pnls[-1], 4) if pnls else 0.0,
     }
 
+
+# ── Bybit helpers ────────────────────────────────────────────────────────────
 
 def get_server_time():
     r = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
     return str(int(float(r.json()["result"]["timeNano"]) / 1000000))
 
+def sign_get(query):
+    ts = get_server_time()
+    sig = hmac.new(BYBIT_API_SECRET.encode(),
+                   (ts + BYBIT_API_KEY + "5000" + query).encode(), hashlib.sha256).hexdigest()
+    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000"}
 
-def sign_get_request(query: str):
-    timestamp = get_server_time()
-    recv_window = "5000"
-    param_str = timestamp + BYBIT_API_KEY + recv_window + query
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": recv_window,
-    }
-
+def sign_post(params):
+    ts   = get_server_time()
+    body = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+    sig  = hmac.new(BYBIT_API_SECRET.encode(),
+                    (ts + BYBIT_API_KEY + "5000" + body).encode(), hashlib.sha256).hexdigest()
+    headers = {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
+               "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000",
+               "Content-Type": "application/json"}
+    return headers, body
 
 def get_wallet_equity_usdt():
-    # Try both account types automatically
-    for acct_type in [BYBIT_ACCOUNT_TYPE, "CONTRACT", "UNIFIED", "SPOT"]:
+    """Required by app.py. Tries multiple account types automatically."""
+    for acct in [BYBIT_ACCOUNT_TYPE, "CONTRACT", "UNIFIED", "SPOT"]:
         try:
-            query = f"accountType={acct_type}&coin=USDT"
-            headers = sign_get_request(query)
-            r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}", headers=headers, timeout=10)
+            query   = f"accountType={acct}&coin=USDT"
+            headers = sign_get(query)
+            r    = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}",
+                                headers=headers, timeout=10)
             data = r.json()
-            print(f"[wallet] accountType={acct_type} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
-
+            print(f"[wallet] accountType={acct} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") != 0:
                 continue
-            result_list = data.get("result", {}).get("list", [])
-            if not result_list:
+            items = data.get("result", {}).get("list", [])
+            if not items:
                 continue
-
-            item = result_list[0]
-
-            # Shape A: top-level totalEquity
-            val = item.get("totalEquity")
-            if val not in (None, ""):
-                try:
-                    equity = float(val)
-                    if equity > 0:
-                        print(f"[wallet] found totalEquity={equity} via accountType={acct_type}")
-                        return equity
-                except:
-                    pass
-
-            # Shape B: totalWalletBalance / totalMarginBalance
-            for k in ("totalWalletBalance", "totalMarginBalance"):
-                val = item.get(k)
-                if val not in (None, ""):
+            item = items[0]
+            for k in ("totalEquity", "totalWalletBalance", "totalMarginBalance"):
+                v = item.get(k)
+                if v not in (None, ""):
                     try:
-                        equity = float(val)
-                        if equity > 0:
-                            print(f"[wallet] found {k}={equity} via accountType={acct_type}")
-                            return equity
+                        eq = float(v)
+                        if eq >= 0:
+                            print(f"[wallet] {k}={eq} via {acct}")
+                            return eq
                     except:
                         pass
-
-            # Shape C: coin list
-            coins = item.get("coin") or []
-            for c in coins:
+            for c in (item.get("coin") or []):
                 if (c.get("coin") or "").upper() == "USDT":
                     for k in ("equity", "walletBalance", "availableToWithdraw", "availableBalance"):
-                        val = c.get(k)
-                        if val not in (None, ""):
+                        v = c.get(k)
+                        if v not in (None, ""):
                             try:
-                                equity = float(val)
-                                if equity >= 0:
-                                    print(f"[wallet] found coin.{k}={equity} via accountType={acct_type}")
-                                    return equity
+                                eq = float(v)
+                                if eq >= 0:
+                                    print(f"[wallet] coin.{k}={eq} via {acct}")
+                                    return eq
                             except:
                                 pass
-
-            print(f"[wallet] accountType={acct_type} — no usable equity field. item keys: {list(item.keys())}")
-
         except Exception as e:
-            print(f"[wallet] accountType={acct_type} error: {e}")
-            continue
-
-    print("[wallet] all account types exhausted — returning None")
+            print(f"[wallet] {acct} error: {e}")
+    print("[wallet] all types failed — returning None")
     return None
 
-
-def send_telegram(message):
+def send_telegram(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         )
     except:
         pass
 
-
-def sign_request(params):
-    timestamp = get_server_time()
-    body = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
-    param_str = timestamp + BYBIT_API_KEY + "5000" + body
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/json",
-    }
-    return headers, body
-
-
-def set_leverage():
-    params = {"category": "linear", "symbol": SYMBOL, "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
-    headers, body = sign_request(params)
-    requests.post("https://api.bybit.com/v5/position/set-leverage", data=body, headers=headers, timeout=10)
-
-
 def get_price():
-    r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={SYMBOL}", timeout=10)
+    r = requests.get(
+        f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={SYMBOL}", timeout=10)
     return float(r.json()["result"]["list"][0]["lastPrice"])
 
-
-def get_candles(interval, limit):
+def get_candles(interval="60", limit=100):
     try:
         r = requests.get(
-            f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}&interval={interval}&limit={limit}",
-            timeout=10,
-        )
+            f"https://api.bybit.com/v5/market/kline?category=linear&symbol={SYMBOL}"
+            f"&interval={interval}&limit={limit}", timeout=10)
         data = r.json()
         if not data.get("result") or not data["result"].get("list"):
             return []
-        candles = data["result"]["list"]
-        if not candles:
-            return []
         return [
-            {"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])}
-            for c in reversed(candles)
+            {"open": float(c[1]), "high": float(c[2]),
+             "low": float(c[3]),  "close": float(c[4]), "volume": float(c[5])}
+            for c in reversed(data["result"]["list"])
         ]
-    except Exception as e:
-        print(f"Candle fetch error ({interval}): {e}")
+    except:
         return []
 
-
-def get_fear_greed():
+def get_open_orders():
+    query = f"category=linear&symbol={SYMBOL}&limit=50"
+    r = requests.get(f"https://api.bybit.com/v5/order/realtime?{query}",
+                     headers=sign_get(query), timeout=10)
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        data = r.json()["data"][0]
-        return f"{data['value']} ({data['value_classification']})"
+        return r.json().get("result", {}).get("list", [])
     except:
-        return "unavailable"
+        return []
 
+def cancel_all_orders():
+    params = {"category": "linear", "symbol": SYMBOL}
+    headers, body = sign_post(params)
+    r = requests.post("https://api.bybit.com/v5/order/cancel-all",
+                      data=body, headers=headers, timeout=10)
+    return r.json()
 
-def get_position():
-    timestamp = get_server_time()
-    query = f"category=linear&symbol={SYMBOL}"
-    param_str = timestamp + BYBIT_API_KEY + "5000" + query
-    sign = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": "5000",
-    }
-    try:
-        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}", headers=headers, timeout=10)
-        data = r.json()
-        positions = data.get("result", {}).get("list", [])
-        for p in positions:
-            if float(p.get("size", 0)) > 0:
-                return p
-    except Exception as e:
-        print(f"get_position error: {e}")
-    return None
+def set_leverage():
+    params = {"category": "linear", "symbol": SYMBOL,
+              "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
+    headers, body = sign_post(params)
+    requests.post("https://api.bybit.com/v5/position/set-leverage",
+                  data=body, headers=headers, timeout=10)
 
-
-def place_order(side, sl, tp):
-    position_idx = 1 if side == "Buy" else 2
+def place_limit_order(side, price_level, qty):
     params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(QTY),
-        "positionIdx": position_idx,
-        "stopLoss": str(round(sl, 2)),
-        "takeProfit": str(round(tp, 2)),
-        "slTriggerBy": "MarkPrice",
-        "tpTriggerBy": "MarkPrice",
+        "category":    "linear",
+        "symbol":      SYMBOL,
+        "side":        side,
+        "orderType":   "Limit",
+        "qty":         str(round(qty, 3)),
+        "price":       str(round(price_level, 2)),
+        "positionIdx": 1 if side == "Buy" else 2,
+        "timeInForce": "GTC",
     }
-    headers, body = sign_request(params)
-    r = requests.post("https://api.bybit.com/v5/order/create", data=body, headers=headers, timeout=10)
+    headers, body = sign_post(params)
+    r = requests.post("https://api.bybit.com/v5/order/create",
+                      data=body, headers=headers, timeout=10)
     return r.json()
 
 
-def calculate_ema_series(values, period):
-    if not values:
-        return []
-    k = 2 / (period + 1)
-    ema = values[0]
-    out = [ema]
-    for v in values[1:]:
-        ema = v * k + ema * (1 - k)
-        out.append(ema)
-    return out
+# ── indicators ───────────────────────────────────────────────────────────────
 
-
-def calculate_sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
+def calculate_adx(candles, period=14):
+    if len(candles) < period * 2:
         return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-
-def calculate_macd(closes):
-    if len(closes) < MACD_SLOW + MACD_SIGNAL + 5:
-        return [], [], []
-    ema_fast = calculate_ema_series(closes, MACD_FAST)
-    ema_slow = calculate_ema_series(closes, MACD_SLOW)
-    macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
-    signal_line = calculate_ema_series(macd_line, MACD_SIGNAL)
-    hist = [m - s for m, s in zip(macd_line, signal_line)]
-    return macd_line, signal_line, hist
-
-
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return 0
-    trs = []
+    plus_dm_list, minus_dm_list, tr_list = [], [], []
     for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return round(sum(trs[-period:]) / period, 4)
+        hd = candles[i]["high"] - candles[i-1]["high"]
+        ld = candles[i-1]["low"] - candles[i]["low"]
+        plus_dm_list.append(hd if hd > ld and hd > 0 else 0)
+        minus_dm_list.append(ld if ld > hd and ld > 0 else 0)
+        tr_list.append(max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - candles[i-1]["close"]),
+            abs(candles[i]["low"]  - candles[i-1]["close"]),
+        ))
+
+    def wilder(vals, p):
+        s = sum(vals[:p])
+        out = [s]
+        for v in vals[p:]:
+            s = s - s / p + v
+            out.append(s)
+        return out
+
+    tr_s   = wilder(tr_list,       period)
+    plus_s = wilder(plus_dm_list,  period)
+    minus_s= wilder(minus_dm_list, period)
+    dx_list = []
+    for i in range(len(tr_s)):
+        if tr_s[i] == 0:
+            continue
+        plus_di  = 100 * plus_s[i]  / tr_s[i]
+        minus_di = 100 * minus_s[i] / tr_s[i]
+        di_sum   = plus_di + minus_di
+        dx_list.append(100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0)
+    if len(dx_list) < period:
+        return 50
+    return round(sum(dx_list[-period:]) / period, 2)
+
+def calculate_bollinger(closes, period=20):
+    if len(closes) < period:
+        c = closes[-1] if closes else 0
+        return c, c, c
+    recent = closes[-period:]
+    sma = sum(recent) / period
+    std = (sum((p - sma) ** 2 for p in recent) / period) ** 0.5
+    return round(sma, 2), round(sma + 2*std, 2), round(sma - 2*std, 2)
+
+def is_sideways(candles, price):
+    closes = [c["close"] for c in candles]
+    adx    = calculate_adx(candles, ADX_PERIOD)
+    mid, upper, lower = calculate_bollinger(closes)
+    bb_width = (upper - lower) / mid if mid > 0 else 0
+    indicators = {"adx": adx, "bb_width_pct": round(bb_width*100, 3),
+                  "bb_upper": upper, "bb_lower": lower, "bb_mid": mid}
+    if adx >= ADX_SIDEWAYS_MAX:
+        return False, f"ADX {adx} >= {ADX_SIDEWAYS_MAX} (trending)", indicators
+    if bb_width < BB_WIDTH_MIN:
+        return False, f"BB width {bb_width*100:.2f}% too tight", indicators
+    if bb_width > BB_WIDTH_MAX:
+        return False, f"BB width {bb_width*100:.2f}% too wide", indicators
+    return True, f"ADX {adx} + BB {bb_width*100:.2f}% — sideways confirmed", indicators
 
 
-def get_liquidation_price(side, entry, leverage):
-    if side == "Buy":
-        return round(entry * (1 - 1 / leverage), 2)
-    else:
-        return round(entry * (1 + 1 / leverage), 2)
+# ── Claude grid decision ─────────────────────────────────────────────────────
 
+def ask_claude_grid(price, indicators, open_count, state):
+    if not ANTHROPIC_API_KEY or anthropic is None:
+        # fallback: place if no active grid, skip if active
+        if not state.get("grid_active") or open_count == 0:
+            return "PLACE", "No Claude key — auto placing grid.", price
+        return "SKIP", "No Claude key — grid already active.", price
 
-def sl_is_safe(side, entry, sl, leverage):
-    liq = get_liquidation_price(side, entry, leverage)
-    if side == "Buy":
-        return sl > liq * 1.01
-    else:
-        return sl < liq * 0.99
-
-
-def ask_claude(prompt, retries=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    for attempt in range(retries):
-        try:
-            message = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=700,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return message.content[0].text
-        except Exception as e:
-            if "overloaded" in str(e).lower() and attempt < retries - 1:
-                time.sleep(20)
-            else:
-                raise e
+    prompt = f"""You are managing a grid trading bot for ETH/USDT perpetual on Bybit.
 
+Current price: ${price:.2f}
+Time: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 
-def parse_claude_trade_response(text):
-    decision = "SKIP"
-    reason = ""
-    sl = 0.0
-    tp = 0.0
-    personal_message = ""
-    for raw in (text or "").strip().splitlines():
-        line = raw.strip()
-        if line.upper().startswith("DECISION:"):
-            decision = line.split(":", 1)[1].strip().upper()
-        elif line.upper().startswith("REASON:"):
-            reason = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("PERSONAL_MESSAGE:"):
-            personal_message = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("SL:"):
-            try:
-                sl = float(line.split(":", 1)[1].replace("$", "").strip())
-            except:
-                pass
-        elif line.upper().startswith("TP:"):
-            try:
-                tp = float(line.split(":", 1)[1].replace("$", "").strip())
-            except:
-                pass
-    if decision not in ("LONG", "SHORT", "SKIP"):
+Market indicators:
+- ADX: {indicators['adx']} (< {ADX_SIDEWAYS_MAX} = sideways confirmed)
+- BB Upper: ${indicators['bb_upper']} | Mid: ${indicators['bb_mid']} | Lower: ${indicators['bb_lower']}
+- BB Width: {indicators['bb_width_pct']}%
+
+Grid config: {GRID_LEVELS} levels each side | {GRID_SPACING_PCT*100:.2f}% spacing | {QTY_PER_LEVEL} ETH/order | {LEVERAGE}x
+Grid range: ${price*(1-GRID_LEVELS*GRID_SPACING_PCT):.2f} — ${price*(1+GRID_LEVELS*GRID_SPACING_PCT):.2f}
+Open orders: {open_count}
+Grid profit so far: ${state.get('total_profit', 0):.4f} | Fills: {state.get('total_fills', 0)}
+
+Decide:
+- PLACE: place/rebuild the grid now
+- SKIP: grid is working fine, leave it
+- CANCEL: cancel grid (price moving out of range, market changing)
+
+Respond ONLY in this format:
+DECISION: PLACE or SKIP or CANCEL
+REASON: (1-2 sentences)
+CENTER_PRICE: $X.XX"""
+
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-4-5", max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text     = msg.content[0].text
         decision = "SKIP"
-    return decision, reason, sl, tp, personal_message
+        reason   = ""
+        center   = price
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if line.upper().startswith("DECISION:"):
+                decision = line.split(":", 1)[1].strip().upper()
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("CENTER_PRICE:"):
+                try:
+                    center = float(line.split(":", 1)[1].replace("$", "").strip())
+                except:
+                    center = price
+        return decision, reason, center
+    except Exception as e:
+        return "SKIP", f"Claude error: {e}", price
 
+
+# ── grid placement ───────────────────────────────────────────────────────────
+
+def place_grid(center_price):
+    placed_buys, placed_sells = [], []
+    for i in range(1, GRID_LEVELS + 1):
+        buy_price  = center_price * (1 - i * GRID_SPACING_PCT)
+        sell_price = center_price * (1 + i * GRID_SPACING_PCT)
+
+        res = place_limit_order("Buy", buy_price, QTY_PER_LEVEL)
+        if res.get("retCode") == 0:
+            placed_buys.append(round(buy_price, 2))
+        else:
+            send_telegram(f"❌ Grid buy failed ${buy_price:.2f}: {res.get('retMsg')}")
+
+        res = place_limit_order("Sell", sell_price, QTY_PER_LEVEL)
+        if res.get("retCode") == 0:
+            placed_sells.append(round(sell_price, 2))
+        else:
+            send_telegram(f"❌ Grid sell failed ${sell_price:.2f}: {res.get('retMsg')}")
+
+        time.sleep(0.15)
+
+    return placed_buys, placed_sells
+
+
+# ── main cycle ───────────────────────────────────────────────────────────────
 
 def run_cycle():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    today = datetime.now(timezone.utc).date().isoformat()
-
+    now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     price = get_price()
-    fear_greed = get_fear_greed()
-    position = get_position()
-    equity = get_wallet_equity_usdt()
-
-    if not ANTHROPIC_API_KEY and not position:
-        send_telegram("⚠️ ANTHROPIC_API_KEY is missing. Skipping entries this cycle.")
-        return
-
-    if equity is None and not position:
-        send_telegram("⚠️ Could not fetch wallet equity (USDT). Skipping entries this cycle.")
-        return
-
     state = load_state()
 
-    # Reset daily state
-    if state.get("day") != today or state.get("start_equity") is None:
-        trade_history = state.get("trade_history") or []
-        total_pnl = float(state.get("total_pnl") or 0.0)
-        lifetime_pnl = float(state.get("lifetime_pnl") or total_pnl)
-        state = {
-            "day": today,
-            "start_equity": equity,
-            "entry_equity": None,
-            "entry_time": None,
-            "entry_price": None,
-            "entry_side": None,
-            "had_position": False,
-            "consecutive_loss": 0.0,
-            "total_pnl": total_pnl,
-            "lifetime_pnl": lifetime_pnl,
-            "trade_history": trade_history[-50:],
-            "paused_until": 0,
-            "pause_reason": "",
-            "trading_enabled": True,
-        }
-        save_state(state)
-
-    # Update live fields for dashboard
+    # Refresh equity for dashboard
+    equity = get_wallet_equity_usdt()
     state["equity"] = equity
-    state["price"] = price
-    # Live PnL for active position
-    if position:
-        state["live_pnl"] = float(position.get("unrealisedPnl", 0))
-        state["position_side"] = position.get("side")
-        state["entry_price"] = float(position.get("avgPrice", 0))
-        state["mark_price"] = price
-    else:
-        state["live_pnl"] = None
-        state["position_side"] = None
-        state["entry_price"] = None
-        state["mark_price"] = None
-
-    if equity is not None and state.get("start_equity") is not None:
-        state["daily_pnl"] = float(equity) - float(state["start_equity"])
-    else:
-        state["daily_pnl"] = None
-
-    state["trades_today"] = len([
-        t for t in state.get("trade_history", [])
-        if str(t.get("exit_time", "")).startswith(today)
-    ])
+    state["price"]  = price
     save_state(state)
 
-    candles = get_candles(DECISION_INTERVAL, DECISION_CANDLE_LIMIT)
-    if len(candles) < (MA_PERIOD + MA_SLOPE_LOOKBACK + 5):
-        send_telegram(f"⚠️ Not enough candle data\n{DECISION_INTERVAL}M: {len(candles)}")
+    # Dashboard kill-switch
+    if not state.get("trading_enabled", True):
+        send_telegram(f"⏹ Trading disabled by dashboard. Price: ${price:.2f}")
         return
 
-    # Dashboard stop control
-    if not state.get("trading_enabled", True) and not position:
-        send_telegram(f"STOPPED - ${price:.2f}\nTrading is disabled from the dashboard.")
-        append_log("STOPPED_SKIP", {"price": round(price, 2), "reason": "trading_enabled=false"})
+    candles = get_candles("60", 100)
+    if len(candles) < 30:
+        send_telegram(f"⚠️ Not enough candle data: {len(candles)}")
         return
 
-    atr_decision = calculate_atr(candles, period=ATR_PERIOD)
-    liq_long = get_liquidation_price("Buy", price, LEVERAGE)
-    liq_short = get_liquidation_price("Sell", price, LEVERAGE)
+    sideways_ok, regime_reason, indicators = is_sideways(candles, price)
 
-    # Volatility pause
-    atr_pct = (atr_decision / price) if price > 0 else 0
-    if atr_pct >= VOL_SPIKE_ATR_PCT:
-        pause_until = utc_now_ts() + VOL_PAUSE_SECONDS
-        if pause_until > int(state.get("paused_until") or 0):
-            state["paused_until"] = pause_until
-            state["pause_reason"] = f"VOL_SPIKE (ATR%={atr_pct*100:.2f}%)"
+    # ── TRENDING: cancel grid ────────────────────────────────────────────────
+    if not sideways_ok:
+        if state.get("grid_active"):
+            cancel_all_orders()
+            state["grid_active"]   = False
+            state["center_price"]  = None
             save_state(state)
             send_telegram(
-                f"⏸ <b>PAUSE</b> — Volatility spike\n"
-                f"ATR: {atr_decision} ({atr_pct*100:.2f}%) | Price: ${price:.2f}\n"
-                f"Pausing for {int(VOL_PAUSE_SECONDS/60)}m."
+                f"🚫 <b>GRID CANCELLED</b> — Market trending\n"
+                f"Price: ${price:.2f}\nReason: {regime_reason}"
             )
-            append_log("PAUSE", {"reason": state.get("pause_reason"), "price": round(price, 2)})
-
-    # Position closed detection
-    if state.get("had_position") and not position:
-        if equity is not None and state.get("entry_equity") is not None:
-            trade_pnl = float(equity) - float(state["entry_equity"])
-            if trade_pnl < 0:
-                state["consecutive_loss"] = round(float(state.get("consecutive_loss", 0.0)) + abs(trade_pnl), 4)
-            else:
-                state["consecutive_loss"] = 0.0
-            state["total_pnl"] = round(float(state.get("total_pnl", 0.0)) + trade_pnl, 4)
-            state["lifetime_pnl"] = round(float(state.get("lifetime_pnl", 0.0)) + trade_pnl, 4)
-            hist = state.get("trade_history") or []
-            hist.append({
-                "entry_time": state.get("entry_time"),
-                "exit_time": now,
-                "side": state.get("entry_side"),
-                "entry_price": state.get("entry_price"),
-                "exit_price": price,
-                "pnl": round(trade_pnl, 4),
-            })
-            state["trade_history"] = hist[-50:]
-            append_log("CLOSE", {
-                "side": state.get("entry_side"),
-                "entry_time": state.get("entry_time"),
-                "exit_time": now,
-                "entry_price": state.get("entry_price"),
-                "exit_price": round(price, 2),
-                "pnl": round(trade_pnl, 4),
-                "equity": round(float(equity), 4) if equity is not None else None,
-            })
-        state["had_position"] = False
-        state["entry_equity"] = None
-        state["entry_time"] = None
-        state["entry_price"] = None
-        state["entry_side"] = None
-        save_state(state)
-
-    # Daily loss limit
-    if equity is not None and state.get("start_equity") is not None:
-        daily_loss = max(0.0, float(state["start_equity"]) - float(equity))
-        if daily_loss >= MAX_DAILY_LOSS_USD:
-            tomorrow = datetime.now(timezone.utc).date().toordinal() + 1
-            pause_until = int(datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc).timestamp())
-            state["paused_until"] = max(int(state.get("paused_until") or 0), pause_until)
-            state["pause_reason"] = f"DAILY_LOSS_LIMIT (down ${daily_loss:.2f})"
-            save_state(state)
-
-    # Consecutive loss limit
-    if float(state.get("consecutive_loss") or 0.0) >= MAX_CONSEC_LOSS_USD:
-        tomorrow = datetime.now(timezone.utc).date().toordinal() + 1
-        pause_until = int(datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc).timestamp())
-        state["paused_until"] = max(int(state.get("paused_until") or 0), pause_until)
-        state["pause_reason"] = f"CONSEC_LOSS_LIMIT (${state['consecutive_loss']:.2f})"
-        save_state(state)
-
-    # Paused check
-    if utc_now_ts() < int(state.get("paused_until") or 0) and not position:
-        reason = state.get("pause_reason") or "PAUSED"
-        eq_txt = f"${equity:.2f}" if equity is not None else "n/a"
-        send_telegram(
-            f"⏸ <b>PAUSED</b> — ${price:.2f}\n"
-            f"Reason: {reason}\n"
-            f"Equity: {eq_txt}"
-        )
-        append_log("PAUSED_SKIP", {"reason": reason, "price": round(price, 2)})
+            append_log("GRID_CANCEL", {"reason": regime_reason, "price": price})
+        else:
+            send_telegram(
+                f"⏭ <b>SKIP</b> — Trending market\n"
+                f"Price: ${price:.2f}\n{regime_reason}\n"
+                f"ADX: {indicators['adx']} | BB: {indicators['bb_width_pct']}%"
+            )
         return
 
-    # Active position — just report
-    if position:
-        side = position["side"]
-        entry = float(position["avgPrice"])
-        pnl = float(position["unrealisedPnl"])
-        pnl_pct = ((price - entry) / entry) * 100 * (1 if side == "Buy" else -1)
-        liq = get_liquidation_price(side, entry, LEVERAGE)
-        liq_dist = round(abs(price - liq) / price * 100, 2)
-        send_telegram(
-            f"📊 <b>ACTIVE {side}</b> | ${price:.2f}\n"
-            f"Entry: ${entry:.2f} | PnL: ${pnl:.4f} ({pnl_pct:.2f}%)\n"
-            f"Liq: ${liq} ({liq_dist}% away)\n"
-            f"Waiting for SL/TP..."
-        )
-        if not state.get("had_position"):
-            state["had_position"] = True
-            if state.get("entry_equity") is None and equity is not None:
-                state["entry_equity"] = float(equity)
-            state["entry_time"] = state.get("entry_time") or now
-            state["entry_price"] = state.get("entry_price") or entry
-            state["entry_side"] = state.get("entry_side") or side
+    # ── SIDEWAYS ─────────────────────────────────────────────────────────────
+    open_orders = get_open_orders()
+    open_count  = len(open_orders)
+
+    # Rebuild if price left grid range
+    if state.get("grid_active") and state.get("grid_upper") and state.get("grid_lower"):
+        if price > state["grid_upper"] or price < state["grid_lower"]:
+            cancel_all_orders()
+            state["grid_active"] = False
+            open_count = 0
             save_state(state)
-        return
+            send_telegram(
+                f"🔄 <b>GRID REBUILD</b> — Price left range\n"
+                f"Price: ${price:.2f} | Range: ${state['grid_lower']:.2f}–${state['grid_upper']:.2f}"
+            )
 
-    # --- Build Claude prompt ---
-    closes_tf = [c["close"] for c in candles]
-    close_tf = closes_tf[-1]
-    ma200 = calculate_sma(closes_tf, MA_PERIOD)
-    ma200_prev = sum(closes_tf[-(MA_PERIOD + MA_SLOPE_LOOKBACK):-MA_SLOPE_LOOKBACK]) / MA_PERIOD
-    slope = ma200 - ma200_prev
-    slope_dir = "UP" if slope > 0 else "DOWN" if slope < 0 else "FLAT"
-    dist_pct = abs(close_tf - ma200) / ma200 if ma200 else 0
+    decision, reason, center_price = ask_claude_grid(price, indicators, open_count, state)
 
-    rsi_tf = calculate_rsi(closes_tf, period=RSI_PERIOD)
-    macd_line, sig_line, hist = calculate_macd(closes_tf)
-    macd_hist_last = hist[-1] if hist else 0
-    macd_hist_prev = hist[-2] if len(hist) >= 2 else 0
-    macd_momentum = "UP" if macd_hist_last > macd_hist_prev else "DOWN" if macd_hist_last < macd_hist_prev else "FLAT"
+    if decision == "CANCEL":
+        if open_count > 0:
+            cancel_all_orders()
+        state["grid_active"] = False
+        save_state(state)
+        send_telegram(f"🚫 <b>GRID CANCELLED by Claude</b>\nPrice: ${price:.2f}\n{reason}")
+        append_log("GRID_CANCEL_CLAUDE", {"reason": reason, "price": price})
 
-    atr_tf = calculate_atr(candles, period=ATR_PERIOD)
-    atr_tf_pct = (atr_tf / close_tf) if close_tf > 0 else 0
-
-    hist_list = state.get("trade_history") or []
-    last5 = hist_list[-5:]
-    perf_lines = []
-    for t in last5:
-        try:
-            perf_lines.append(f"{t.get('side')} pnl={t.get('pnl')} at {t.get('exit_time')}")
-        except:
-            pass
-    perf_text = "\n".join(perf_lines) if perf_lines else "No closed trades recorded yet."
-    daily_pnl = (float(equity) - float(state.get("start_equity"))) if (equity is not None and state.get("start_equity") is not None) else 0.0
-    perf = performance_summary(state)
-
-    last_candles = candles[-10:]
-    last_candles_summary = [
-        f"C{i+1}: O{c['open']:.2f} H{c['high']:.2f} L{c['low']:.2f} C{c['close']:.2f} V{c['volume']:.0f}"
-        for i, c in enumerate(last_candles)
-    ]
-
-    prompt = f"""You are Claude, an autonomous crypto trader and account manager.
-Your job: study the market and decide whether to enter a trade right now.
-
-SYMBOL: {SYMBOL} perpetual (Bybit)
-Time: {now}
-Current price: ${price:.2f}
-Fear & Greed: {fear_greed}
-
-=== PERFORMANCE MEMORY ===
-Today's PnL (equity-based): ${daily_pnl:.2f}
-Consecutive loss: ${float(state.get("consecutive_loss") or 0.0):.2f}
-Lifetime PnL: ${float(state.get("lifetime_pnl") or 0.0):.2f}
-Stats: trades={perf['trades']} winrate={perf['winrate']}% avg_win={perf['avg_win']} avg_loss={perf['avg_loss']} last_pnl={perf['last_pnl']}
-Last trades:
-{perf_text}
-
-=== {DECISION_INTERVAL}M INDICATORS ===
-Close: ${close_tf:.2f}
-MA{MA_PERIOD}: ${ma200:.2f}
-MA{MA_PERIOD} slope ({MA_SLOPE_LOOKBACK} bars): {slope_dir} (delta {slope:.4f})
-Distance from MA{MA_PERIOD}: {dist_pct*100:.2f}%
-RSI({RSI_PERIOD}): {rsi_tf}
-MACD({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}) histogram: prev={macd_hist_prev:.6f} last={macd_hist_last:.6f} momentum={macd_momentum}
-ATR({ATR_PERIOD}): {atr_tf} ({atr_tf_pct*100:.2f}%)
-
-Last 10 candles:
-{chr(10).join(last_candles_summary)}
-
-=== HARD CONSTRAINTS ===
-1) You MUST output a clear DECISION: LONG, SHORT, or SKIP.
-2) If LONG/SHORT, you MUST provide SL and TP (2 decimals).
-3) Aim for minimum R:R >= 1.0.
-4) Avoid liquidation risk (45x leverage): keep SL far from liquidation.
-5) If today's PnL is near the daily limit or consecutive losses are high, be conservative.
-
-Respond ONLY in this exact format:
-DECISION: LONG or SHORT or SKIP
-REASON: (max 2 sentences)
-PERSONAL_MESSAGE: (one short sentence to the user, optional)
-SL: $X.XX
-TP: $X.XX
-"""
-
-    claude_text = ask_claude(prompt)
-    decision, reason, sl, tp, personal_message = parse_claude_trade_response(claude_text)
-
-    send_telegram(
-        f"🧠 <b>CLAUDE CHECK</b> — {now}\n"
-        f"Price: ${price:.2f} | Decision: <b>{decision}</b>\n"
-        f"Reason: {reason if reason else '(none)'}\n"
-        f"{('Message: ' + personal_message + chr(10)) if personal_message else ''}"
-        f"MA{MA_PERIOD}: ${ma200:.2f} | Dist: {dist_pct*100:.2f}% | Slope: {slope_dir}\n"
-        f"RSI: {rsi_tf} | MACD: {macd_momentum} | ATR%: {atr_tf_pct*100:.2f}%\n"
-        f"Proposed SL/TP: ${sl:.2f} / ${tp:.2f}"
-    )
-    append_log("CHECK", {
-        "now": now,
-        "price": round(price, 2),
-        "equity": round(float(equity), 4) if equity is not None else None,
-        "decision": decision,
-        "reason": reason,
-        "personal_message": personal_message,
-        "sl": round(sl, 2) if sl else 0.0,
-        "tp": round(tp, 2) if tp else 0.0,
-        "ma200": round(ma200, 4) if ma200 is not None else None,
-        "ma_slope": slope_dir,
-        "rsi": rsi_tf,
-        "macd_momentum": macd_momentum,
-        "atr_pct": round(atr_tf_pct, 6),
-        "daily_pnl": round(daily_pnl, 4),
-        "consecutive_loss": float(state.get("consecutive_loss") or 0.0),
-        "lifetime_pnl": float(state.get("lifetime_pnl") or 0.0),
-    })
-
-    if decision in ("LONG", "SHORT") and sl > 0 and tp > 0:
-        side = "Buy" if decision == "LONG" else "Sell"
-
-        if not sl_is_safe(side, price, sl, LEVERAGE):
-            liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nSL ${sl} too close to liq ${liq}\nClaude: {decision} | {reason}")
-            append_log("BLOCK", {"type": "SL_TOO_CLOSE_TO_LIQ", "decision": decision, "sl": sl, "liq": liq})
-            return
-
-        sl_dist = abs(price - sl)
-        tp_dist = abs(tp - price)
-        rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
-        if rr < 1.0:
-            send_telegram(f"🚫 <b>TRADE BLOCKED</b>\nR:R {rr} below 1.0 minimum\nClaude: {decision} | {reason}")
-            append_log("BLOCK", {"type": "RR_TOO_LOW", "rr": rr, "sl": sl, "tp": tp})
-            return
+    elif decision == "PLACE":
+        if open_count > 0:
+            cancel_all_orders()
+            time.sleep(1)
 
         set_leverage()
-        equity_before = equity
-        result = place_order(side, sl, tp)
-        if result.get("retCode") == 0:
-            liq = get_liquidation_price(side, price, LEVERAGE)
-            send_telegram(
-                f"🎯 <b>CLAUDE {decision}</b>\n"
-                f"Time: {now}\n"
-                f"Price: ${price:.2f} | SL: ${sl} | TP: ${tp}\n"
-                f"R:R: 1:{rr} | Liq: ${liq}\n"
-                f"Reason: {reason}\n\n{claude_text}"
-            )
-            state["had_position"] = True
-            if equity_before is not None:
-                state["entry_equity"] = float(equity_before)
-            state["entry_time"] = now
-            state["entry_price"] = price
-            state["entry_side"] = side
-            save_state(state)
-            append_log("ORDER", {
-                "side": side,
-                "decision": decision,
-                "price": round(price, 2),
-                "sl": sl,
-                "tp": tp,
-                "rr": rr,
-                "liq": liq,
-            })
-        else:
-            send_telegram(f"❌ Order failed: {result.get('retMsg')}")
-            append_log("ORDER_FAIL", {
-                "side": side,
-                "retCode": result.get("retCode"),
-                "retMsg": result.get("retMsg"),
-            })
-    elif decision == "SKIP":
-        return
-    else:
-        send_telegram(f"⚠️ Claude output incomplete; skipping.\n{claude_text}")
+        placed_buys, placed_sells = place_grid(center_price)
 
+        grid_upper = round(center_price * (1 + GRID_LEVELS * GRID_SPACING_PCT), 2)
+        grid_lower = round(center_price * (1 - GRID_LEVELS * GRID_SPACING_PCT), 2)
+
+        state["grid_active"]  = True
+        state["center_price"] = center_price
+        state["grid_upper"]   = grid_upper
+        state["grid_lower"]   = grid_lower
+        state["last_placed"]  = now
+        save_state(state)
+
+        send_telegram(
+            f"🟢 <b>GRID PLACED</b>\n"
+            f"Center: ${center_price:.2f} | {GRID_LEVELS} levels × {GRID_SPACING_PCT*100:.2f}%\n"
+            f"Range: ${grid_lower} — ${grid_upper}\n"
+            f"Buys:  {placed_buys}\n"
+            f"Sells: {placed_sells}\n"
+            f"ADX: {indicators['adx']} | BB: {indicators['bb_width_pct']}%\n"
+            f"Claude: {reason}"
+        )
+        append_log("GRID_PLACED", {
+            "center": center_price, "grid_upper": grid_upper, "grid_lower": grid_lower,
+            "buys": placed_buys, "sells": placed_sells,
+            "adx": indicators["adx"], "bb_width": indicators["bb_width_pct"],
+        })
+
+    else:  # SKIP
+        send_telegram(
+            f"✅ <b>GRID ACTIVE</b> | ${price:.2f}\n"
+            f"Center: ${state.get('center_price', 'N/A')} | Orders: {open_count}\n"
+            f"Range: ${state.get('grid_lower','?')} — ${state.get('grid_upper','?')}\n"
+            f"ADX: {indicators['adx']} | BB: {indicators['bb_width_pct']}%\n"
+            f"Profit: ${state.get('total_profit', 0):.4f} | Fills: {state.get('total_fills', 0)}\n"
+            f"Claude: {reason}"
+        )
+
+
+# ── run loop (called by app.py thread) ───────────────────────────────────────
 
 def run_loop():
-    """Called by app.py in a background thread."""
     clear_stop()
     send_telegram(
-        f"📈 <b>ETH Bot Started</b>\n"
-        f"45x | {QTY} ETH | {int(CHECK_INTERVAL/60)}m checks | Claude ({DECISION_INTERVAL}m MA{MA_PERIOD}/MACD/RSI)"
+        f"🤖 <b>ETH Grid Bot Started</b>\n"
+        f"{GRID_LEVELS} levels × {GRID_SPACING_PCT*100:.2f}% | {QTY_PER_LEVEL} ETH/order\n"
+        f"{LEVERAGE}x leverage | checks every {CHECK_INTERVAL//60}min\n"
+        f"Sideways filter: ADX < {ADX_SIDEWAYS_MAX}"
     )
-    append_log("START", {"symbol": SYMBOL, "qty": QTY, "leverage": LEVERAGE, "check_interval": CHECK_INTERVAL})
+    append_log("START", {
+        "symbol": SYMBOL, "leverage": LEVERAGE,
+        "grid_levels": GRID_LEVELS, "spacing_pct": GRID_SPACING_PCT,
+        "qty_per_level": QTY_PER_LEVEL, "adx_max": ADX_SIDEWAYS_MAX,
+    })
     while not is_stop_requested():
         try:
             run_cycle()
         except Exception as e:
-            err = f"⚠️ Error: {type(e).__name__}: {str(e)}"
+            err = f"⚠️ Error: {type(e).__name__}: {e}"
             send_telegram(err)
             print(err)
             print(traceback.format_exc())
-            append_log("ERROR", {"error": err, "traceback": traceback.format_exc()})
-        # Sleep in small chunks so stop flag is checked promptly
+            append_log("ERROR", {"error": err})
         for _ in range(CHECK_INTERVAL):
             if is_stop_requested():
                 break
@@ -834,7 +550,6 @@ def run_loop():
 
 
 def main():
-    """Standalone entry point (python bot.py)."""
     run_loop()
 
 
