@@ -18,8 +18,8 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))  # seconds (defau
 # --- RISK / SAFETY GUARDS ---
 # NOTE: These are *equity-based* limits (USDT). With very small accounts + 45x leverage,
 # equity can swing quickly. Consider lowering leverage in production.
-MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", ""))
-MAX_CONSEC_LOSS_USD = float(os.environ.get("MAX_CONSEC_LOSS_USD", ""))
+MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "100"))
+MAX_CONSEC_LOSS_USD = float(os.environ.get("MAX_CONSEC_LOSS_USD", "100"))
 
 # Pause after volatility spikes (15m ATR as % of price)
 VOL_SPIKE_ATR_PCT = float(os.environ.get("VOL_SPIKE_ATR_PCT", "0.02"))  # 2%
