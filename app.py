@@ -328,8 +328,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="info" style="margin-top: 12px;">
                 <strong>Max Daily Loss:</strong> $2 |
                 <strong>Max Consecutive Loss:</strong> $4 |
-                <strong>Position:</strong> 0.04 ETH |
-                <strong>Leverage:</strong> 45x
+                <strong>Position:</strong> 0.04 ETH/level |
+                <strong>Leverage:</strong> 30x
             </div>
         </div>
 
