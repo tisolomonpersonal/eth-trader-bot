@@ -1,22 +1,36 @@
-from flask import Flask, jsonify, request, render_template_string, make_response, send_from_directory
-import json
-import os
-import threading
-import time
-import traceback
-import random
-import requests
-from datetime import datetime, timezone
-from pathlib import Path
-import bot as trader_bot
-import uuid
-
 try:
-    import anthropic
-except Exception:
-    anthropic = None
+    from flask import Flask, jsonify, request, render_template_string, make_response, send_from_directory
+    import json
+    import os
+    import threading
+    import time
+    import traceback
+    import random
+    import requests
+    from datetime import datetime, timezone
+    from pathlib import Path
+    import uuid
 
-app = Flask(__name__)
+    try:
+        import anthropic
+    except Exception:
+        anthropic = None
+
+    try:
+        import bot as trader_bot
+    except Exception as _bot_err:
+        import traceback as _tb
+        print(f"[startup] FATAL: failed to import bot.py: {_bot_err}")
+        _tb.print_exc()
+        raise
+
+    app = Flask(__name__)
+
+except Exception as _startup_err:
+    import traceback as _tb
+    print(f"[startup] FATAL import error: {_startup_err}")
+    _tb.print_exc()
+    raise
 
 # Paths (shared with bot.py)
 STATE_FILE = Path(__file__).parent / "bot_state.json"
@@ -55,8 +69,11 @@ def _stop_bot_thread():
         trader_bot.request_stop()
 
 
-# Auto-start bot on app launch
-_start_bot_thread()
+# Auto-start bot on app launch (gunicorn safe — only runs in the main worker)
+try:
+    _start_bot_thread()
+except Exception as _e:
+    print(f"[startup] bot thread failed to start: {_e}")
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
