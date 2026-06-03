@@ -19,7 +19,7 @@ LEVERAGE          = int(os.environ.get("LEVERAGE", "30"))
 CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "1800"))  # 30 min
 
 # Grid settings
-GRID_LEVELS       = int(os.environ.get("GRID_LEVELS", "3"))
+GRID_LEVELS       = int(os.environ.get("GRID_LEVELS", "2"))
 GRID_SPACING_PCT  = float(os.environ.get("GRID_SPACING_PCT", "0.004"))   # 0.4% per level
 QTY_PER_LEVEL     = float(os.environ.get("QTY_PER_LEVEL", "0.04"))       # ETH per order
 
@@ -596,19 +596,59 @@ def check_and_place_counter_orders(state, price):
     return state
 
 
+# ── margin helpers ────────────────────────────────────────────────────────────
+
+def get_available_margin():
+    """Return free USDT margin available for new orders."""
+    try:
+        query   = "accountType=UNIFIED&coin=USDT"
+        headers = sign_get(query)
+        r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}",
+                         headers=headers, timeout=10)
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None
+        items = data.get("result", {}).get("list", [])
+        if not items:
+            return None
+        for c in (items[0].get("coin") or []):
+            if (c.get("coin") or "").upper() == "USDT":
+                for k in ("availableToWithdraw", "availableBalance"):
+                    v = c.get(k)
+                    if v not in (None, ""):
+                        try:
+                            return float(v)
+                        except:
+                            pass
+        # fallback to total equity
+        v = items[0].get("totalEquity")
+        return float(v) if v not in (None, "") else None
+    except Exception as e:
+        print(f"[margin] error: {e}")
+        return None
+
+def margin_required(price, qty):
+    """Estimated margin for one order at given price/qty with leverage."""
+    return (price * qty) / LEVERAGE
+
 # ── grid placement functions ──────────────────────────────────────────────────
 
 def place_neutral_grid(center_price, state):
-    """
-    Standard symmetric grid: buy orders below, sell orders above.
-    Used in sideways markets.
-    """
+    """Symmetric grid: buys below + sells above. TP placed on each fill."""
     tracked = {}
     placed_buys, placed_sells = [], []
+    available = get_available_margin()
+    skipped = 0
 
     for i in range(1, GRID_LEVELS + 1):
         buy_price  = center_price * (1 - i * GRID_SPACING_PCT)
         sell_price = center_price * (1 + i * GRID_SPACING_PCT)
+
+        needed = margin_required(buy_price, QTY_PER_LEVEL)
+        if available is not None and available < needed * 2 + 0.5:  # buffer for both sides
+            skipped += 1
+            append_log("MARGIN_SKIP", {"level": i, "available": available, "needed": needed * 2})
+            continue
 
         res = place_limit_order("Buy", buy_price, QTY_PER_LEVEL, pos_idx=1)
         if res.get("retCode") == 0:
@@ -617,7 +657,7 @@ def place_neutral_grid(center_price, state):
             tracked[oid] = {"side": "Buy", "price": round(buy_price, 2),
                             "qty": QTY_PER_LEVEL, "pos_idx": 1, "center": center_price}
         else:
-            send_telegram(f"❌ Neutral buy failed ${buy_price:.2f}: {res.get('retMsg')}")
+            append_log("ORDER_FAIL", {"side": "Buy", "price": buy_price, "msg": res.get("retMsg")})
 
         res = place_limit_order("Sell", sell_price, QTY_PER_LEVEL, pos_idx=2)
         if res.get("retCode") == 0:
@@ -626,9 +666,12 @@ def place_neutral_grid(center_price, state):
             tracked[oid] = {"side": "Sell", "price": round(sell_price, 2),
                             "qty": QTY_PER_LEVEL, "pos_idx": 2, "center": center_price}
         else:
-            send_telegram(f"❌ Neutral sell failed ${sell_price:.2f}: {res.get('retMsg')}")
+            append_log("ORDER_FAIL", {"side": "Sell", "price": sell_price, "msg": res.get("retMsg")})
 
         time.sleep(0.15)
+
+    if skipped:
+        send_telegram(f"⚠️ Neutral grid: skipped {skipped} level(s) — insufficient margin (${available:.2f} free)")
 
     state["tracked_orders"] = tracked
     state["counter_placed"] = {}
@@ -636,16 +679,20 @@ def place_neutral_grid(center_price, state):
 
 
 def place_uptrend_grid(center_price, state):
-    """
-    Directional grid for uptrend: buy orders only, stacked below current price.
-    When a buy fills, a counter sell is placed above it (see check_and_place_counter_orders).
-    Uses long hedge position (positionIdx=1).
-    """
+    """Directional buy-only grid. TP sell placed on each fill."""
     tracked = {}
     placed_buys = []
+    available = get_available_margin()
+    skipped = 0
 
     for i in range(1, GRID_LEVELS + 1):
         buy_price = center_price * (1 - i * GRID_SPACING_PCT)
+        needed = margin_required(buy_price, QTY_PER_LEVEL)
+        if available is not None and available < needed + 0.5:
+            skipped += 1
+            append_log("MARGIN_SKIP", {"level": i, "available": available, "needed": needed})
+            continue
+
         res = place_limit_order("Buy", buy_price, QTY_PER_LEVEL, pos_idx=1)
         if res.get("retCode") == 0:
             oid = res["result"]["orderId"]
@@ -653,8 +700,11 @@ def place_uptrend_grid(center_price, state):
             tracked[oid] = {"side": "Buy", "price": round(buy_price, 2),
                             "qty": QTY_PER_LEVEL, "pos_idx": 1, "center": center_price}
         else:
-            send_telegram(f"❌ Uptrend buy failed ${buy_price:.2f}: {res.get('retMsg')}")
+            append_log("ORDER_FAIL", {"side": "Buy", "price": buy_price, "msg": res.get("retMsg")})
         time.sleep(0.15)
+
+    if skipped:
+        send_telegram(f"⚠️ Uptrend grid: skipped {skipped} level(s) — insufficient margin (${available:.2f} free)")
 
     state["tracked_orders"] = tracked
     state["counter_placed"] = {}
@@ -662,16 +712,20 @@ def place_uptrend_grid(center_price, state):
 
 
 def place_downtrend_grid(center_price, state):
-    """
-    Directional grid for downtrend: sell orders only, stacked above current price.
-    When a sell fills, a counter buy is placed below it (see check_and_place_counter_orders).
-    Uses short hedge position (positionIdx=2).
-    """
+    """Directional sell-only grid. TP buy placed on each fill."""
     tracked = {}
     placed_sells = []
+    available = get_available_margin()
+    skipped = 0
 
     for i in range(1, GRID_LEVELS + 1):
         sell_price = center_price * (1 + i * GRID_SPACING_PCT)
+        needed = margin_required(sell_price, QTY_PER_LEVEL)
+        if available is not None and available < needed + 0.5:
+            skipped += 1
+            append_log("MARGIN_SKIP", {"level": i, "available": available, "needed": needed})
+            continue
+
         res = place_limit_order("Sell", sell_price, QTY_PER_LEVEL, pos_idx=2)
         if res.get("retCode") == 0:
             oid = res["result"]["orderId"]
@@ -679,8 +733,11 @@ def place_downtrend_grid(center_price, state):
             tracked[oid] = {"side": "Sell", "price": round(sell_price, 2),
                             "qty": QTY_PER_LEVEL, "pos_idx": 2, "center": center_price}
         else:
-            send_telegram(f"❌ Downtrend sell failed ${sell_price:.2f}: {res.get('retMsg')}")
+            append_log("ORDER_FAIL", {"side": "Sell", "price": sell_price, "msg": res.get("retMsg")})
         time.sleep(0.15)
+
+    if skipped:
+        send_telegram(f"⚠️ Downtrend grid: skipped {skipped} level(s) — insufficient margin (${available:.2f} free)")
 
     state["tracked_orders"] = tracked
     state["counter_placed"] = {}
