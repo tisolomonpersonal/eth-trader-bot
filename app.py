@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import random
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 import bot as trader_bot
@@ -840,7 +841,7 @@ def api_diagnose():
     # ── Summary ──────────────────────────────────────────────────────────────
     failed = [k for k, v in results.items()
               if isinstance(v, dict) and not v.get("ok")
-              and k not in ("bybit_auth",)]  # bybit_auth is nested
+              and k not in ("bybit_auth", "env_vars", "summary")]  # env_vars and bybit_auth are nested/special
     bybit_auth_any_ok = any(v.get("ok") for v in bybit_auth_results.values())
     if not bybit_auth_any_ok:
         failed.append("bybit_auth (all account types failed)")
