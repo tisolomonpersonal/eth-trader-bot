@@ -19,7 +19,7 @@ LEVERAGE          = int(os.environ.get("LEVERAGE", "30"))
 CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "1800"))  # 30 min
 
 # Grid settings
-GRID_LEVELS       = int(os.environ.get("GRID_LEVELS", "5"))
+GRID_LEVELS       = int(os.environ.get("GRID_LEVELS", "3"))
 GRID_SPACING_PCT  = float(os.environ.get("GRID_SPACING_PCT", "0.004"))   # 0.4% per level
 QTY_PER_LEVEL     = float(os.environ.get("QTY_PER_LEVEL", "0.04"))       # ETH per order
 
