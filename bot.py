@@ -780,6 +780,148 @@ CENTER_PRICE: $X.XX"""
         return "SKIP", f"Claude error: {e}", price
 
 
+# ── startup recovery ─────────────────────────────────────────────────────────
+
+def recover_on_startup():
+    """
+    Called once at bot start.
+    1. Fetches open orders and live position from Bybit.
+    2. If open orders exist, reconstructs grid state (center, bounds, tracked IDs, mode).
+    3. If an open position exists with no matching TP order, places the TP immediately.
+    4. Sends a Telegram summary of what was found and what action was taken.
+    """
+    state = load_state()
+
+    open_orders = get_open_orders()
+    position    = get_position()
+
+    has_orders   = len(open_orders) > 0
+    has_position = position is not None
+
+    if not has_orders and not has_position:
+        send_telegram("🔄 <b>Startup recovery:</b> No open orders or positions found. Starting fresh.")
+        append_log("RECOVERY", {"result": "clean_start"})
+        return
+
+    # ── Reconstruct grid state from open orders ───────────────────────────────
+    if has_orders:
+        prices    = [float(o["price"]) for o in open_orders if o.get("price")]
+        sides     = [o.get("side") for o in open_orders]
+        buy_only  = all(s == "Buy"  for s in sides)
+        sell_only = all(s == "Sell" for s in sides)
+        mixed     = not buy_only and not sell_only
+
+        center_price = round(sum(prices) / len(prices), 2)
+        grid_upper   = round(max(prices) * (1 + GRID_SPACING_PCT), 2)
+        grid_lower   = round(min(prices) * (1 - GRID_SPACING_PCT), 2)
+
+        # Infer mode from order composition
+        if buy_only:
+            mode = "uptrend"
+        elif sell_only:
+            mode = "downtrend"
+        else:
+            mode = "neutral"
+
+        # Rebuild tracked_orders from open order list
+        tracked = {}
+        for o in open_orders:
+            oid = o.get("orderId")
+            if not oid:
+                continue
+            tracked[oid] = {
+                "side":    o.get("side"),
+                "price":   float(o.get("price") or 0),
+                "qty":     float(o.get("qty") or QTY_PER_LEVEL),
+                "pos_idx": 1 if o.get("side") == "Buy" else 2,
+                "center":  center_price,
+            }
+
+        state["grid_active"]    = True
+        state["grid_mode"]      = mode
+        state["center_price"]   = center_price
+        state["grid_upper"]     = grid_upper
+        state["grid_lower"]     = grid_lower
+        state["tracked_orders"] = tracked
+        state["counter_placed"] = state.get("counter_placed", {})
+
+        send_telegram(
+            f"🔄 <b>Startup recovery: Grid restored</b>\n"
+            f"Mode: {mode.upper()} | {len(open_orders)} open orders\n"
+            f"Center: ${center_price:.2f} | Range: ${grid_lower}–${grid_upper}\n"
+            f"Prices: {sorted(prices)}"
+        )
+        append_log("RECOVERY", {
+            "result": "grid_restored", "mode": mode,
+            "orders": len(open_orders), "center": center_price,
+        })
+
+    # ── Handle open position with no TP order ────────────────────────────────
+    if has_position:
+        pos_side    = position["side"]           # "Buy" or "Sell"
+        entry_price = position["entry_price"]
+        qty         = position["size"]
+        spacing_abs = entry_price * GRID_SPACING_PCT
+
+        # Check if there's already a TP order on the opposite side
+        tp_exists = any(
+            o.get("side") != pos_side
+            for o in open_orders
+        )
+
+        if not tp_exists:
+            # Place missing TP
+            if pos_side == "Buy":
+                tp_price = round(entry_price + spacing_abs, 2)
+                res = place_limit_order("Sell", tp_price, qty, pos_idx=1)
+                tp_side_label = "SELL"
+            else:
+                tp_price = round(entry_price - spacing_abs, 2)
+                res = place_limit_order("Buy", tp_price, qty, pos_idx=2)
+                tp_side_label = "BUY"
+
+            if res.get("retCode") == 0:
+                new_oid = res["result"]["orderId"]
+                tracked = state.get("tracked_orders", {})
+                tracked[new_oid] = {
+                    "side":       "Sell" if pos_side == "Buy" else "Buy",
+                    "price":      tp_price,
+                    "qty":        qty,
+                    "pos_idx":    1 if pos_side == "Buy" else 2,
+                    "center":     entry_price,
+                    "is_counter": True,
+                }
+                state["tracked_orders"] = tracked
+                send_telegram(
+                    f"🎯 <b>Recovery TP placed</b>\n"
+                    f"Open {pos_side} position @ ${entry_price:.2f} ({qty} ETH)\n"
+                    f"→ TP {tp_side_label} placed @ ${tp_price:.2f}"
+                )
+                append_log("RECOVERY_TP", {
+                    "pos_side": pos_side, "entry": entry_price,
+                    "tp_price": tp_price, "qty": qty,
+                })
+            else:
+                send_telegram(
+                    f"⚠️ <b>Recovery TP FAILED</b>\n"
+                    f"Open {pos_side} @ ${entry_price:.2f} — could not place TP: {res.get('retMsg')}"
+                )
+        else:
+            send_telegram(
+                f"✅ <b>Recovery:</b> Open {pos_side} position @ ${entry_price:.2f} "
+                f"already has a TP order — no action needed."
+            )
+
+    # Update live position fields in state
+    if has_position:
+        state["live_pnl"]      = round(position["live_pnl"], 4)
+        state["position_side"] = position["side"]
+        state["entry_price"]   = round(position["entry_price"], 2)
+        state["mark_price"]    = round(position["mark_price"], 2)
+
+    save_state(state)
+
+
 # ── main cycle ────────────────────────────────────────────────────────────────
 
 def run_cycle():
@@ -928,10 +1070,19 @@ def run_loop():
     clear_stop()
     send_telegram(
         f"🤖 <b>ETH Grid Bot Started</b>\n"
+        f"Checking for existing orders and positions..."
+    )
+    try:
+        recover_on_startup()
+    except Exception as e:
+        send_telegram(f"⚠️ Startup recovery error: {e}")
+        append_log("RECOVERY_ERROR", {"error": str(e)})
+    send_telegram(
+        f"🤖 <b>ETH Grid Bot Ready</b>\n"
         f"Modes: neutral / uptrend / downtrend (auto-detected)\n"
         f"{GRID_LEVELS} levels × {GRID_SPACING_PCT*100:.2f}% | {QTY_PER_LEVEL} ETH/order\n"
-        f"{LEVERAGE}x leverage | checks every {CHECK_INTERVAL//60}min\n"
-        f"ADX threshold: {ADX_SIDEWAYS_MAX} (sideways) / {ADX_TREND_MIN} (trend)"
+        f"{LEVERAGE}x leverage | interval: {CHECK_INTERVAL//60}min\n"
+        f"ADX sideways < {ADX_SIDEWAYS_MAX} | trend > {ADX_TREND_MIN}"
     )
     append_log("START", {
         "symbol": SYMBOL, "leverage": LEVERAGE,
