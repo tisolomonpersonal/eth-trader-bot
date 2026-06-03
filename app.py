@@ -25,7 +25,7 @@ EMOTIONS_DIR = Path(__file__).parent / "static" / "emotions"
 # In-memory chat storage
 CHAT_SESSIONS = {}
 CHAT_MAX_TURNS = int(os.environ.get("CHAT_MAX_TURNS", "8"))
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-4-7")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-4-6")   # FIX: was claude-opus-4-7 (invalid)
 CHAT_MAX_OUTPUT_TOKENS = int(os.environ.get("CHAT_MAX_OUTPUT_TOKENS", "180"))
 
 # Bot thread state
@@ -153,15 +153,17 @@ def _handle_chat_command(text):
         paused_until = int(st.get("paused_until") or 0)
         is_paused = bool(st.get("paused")) or time.time() < paused_until
         equity = st.get("equity")
-        pos = st.get("position") or {}
-        side = pos.get("side") if isinstance(pos, dict) else None
+        grid_active = st.get("grid_active", False)
         return True, (
             f"📡 Status\n"
             f"Bot thread: {'running' if _is_bot_running() else 'stopped'}\n"
             f"Trading enabled: {st.get('trading_enabled', True)}\n"
             f"Paused: {is_paused}\n"
             f"Equity (cached): {_format_money(equity)}\n"
-            f"Position: {side or 'none'}"
+            f"Grid active: {grid_active}\n"
+            f"Daily PnL: {_format_money(st.get('daily_pnl'))}\n"
+            f"Session profit: {_format_money(st.get('total_profit'))}\n"
+            f"Total fills: {st.get('total_fills', 0)}"
         )
     return False, ""
 
@@ -174,7 +176,8 @@ def _call_claude_chat(messages):
         return "Anthropic SDK is not available."
     client = anthropic.Anthropic()
     system = "You are a tsundere personal assistant inside a crypto trading bot chat. Keep replies short (1-4 sentences). Be a little sassy but helpful."
-    candidates = [CHAT_MODEL, "claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022"]
+    # FIX: updated model list to valid model IDs
+    candidates = [CHAT_MODEL, "claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
     for model in candidates:
         try:
             resp = client.messages.create(
@@ -184,7 +187,8 @@ def _call_claude_chat(messages):
                 messages=messages
             )
             return resp.content[0].text
-        except:
+        except Exception as e:
+            print(f"[chat] model {model} failed: {e}")
             continue
     return "Claude API error."
 
@@ -215,6 +219,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .status-running { background: #10b981; color: white; }
         .status-paused { background: #f59e0b; color: white; }
         .status-error { background: #ef4444; color: white; }
+        .mode-neutral { color: #38bdf8; }
+        .mode-uptrend { color: #4ade80; }
+        .mode-downtrend { color: #f87171; }
         .controls { display: flex; gap: 10px; flex-wrap: wrap; }
         button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; transition: all 0.2s; }
         button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
@@ -251,6 +258,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="stat">
                     <div class="stat-label">Bot Status</div>
                     <div class="stat-value" id="botStatus">Checking...</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Grid Mode</div>
+                    <div class="stat-value" id="gridMode">--</div>
                 </div>
                 <div class="stat">
                     <div class="stat-label">Equity</div>
@@ -291,7 +302,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     <div class="stat-value" id="lifetimePnl">--</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">Trades Today</div>
+                    <div class="stat-label">Total Fills</div>
                     <div class="stat-value" id="tradesToday">--</div>
                 </div>
                 <div class="stat">
@@ -363,7 +374,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 lpEl.textContent = money(d.lifetime_pnl);
                 lpEl.className = 'stat-value ' + (d.lifetime_pnl > 0 ? 'positive' : d.lifetime_pnl < 0 ? 'negative' : 'neutral');
 
-                document.getElementById('tradesToday').textContent = d.trades_today ?? 0;
+                document.getElementById('tradesToday').textContent = d.total_fills ?? 0;
+
+                // Grid mode indicator
+                const modeMap = {
+                    neutral:   { label: '⚖️ Neutral',   cls: 'mode-neutral' },
+                    uptrend:   { label: '📈 Uptrend',   cls: 'mode-uptrend' },
+                    downtrend: { label: '📉 Downtrend', cls: 'mode-downtrend' },
+                };
+                const modeInfo = modeMap[d.grid_mode] || { label: d.grid_mode || '--', cls: 'neutral' };
+                const modeEl = document.getElementById('gridMode');
+                modeEl.textContent  = modeInfo.label;
+                modeEl.className    = `stat-value ${modeInfo.cls}`;
                 document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
 
                 const pnl = d.live_pnl;
@@ -596,22 +618,24 @@ def api_status():
     is_paused = bool(state.get("paused")) or time.time() < paused_until
     perf = trader_bot.performance_summary(state)
     return jsonify({
-        "equity": state.get("equity"),
-        "daily_pnl": state.get("daily_pnl"),
+        "equity":           state.get("equity"),
+        "daily_pnl":        state.get("daily_pnl"),
         "consecutive_loss": state.get("consecutive_loss"),
-        "lifetime_pnl": state.get("lifetime_pnl"),
-        "live_pnl": state.get("live_pnl"),
-        "position_side": state.get("position_side"),
-        "entry_price": state.get("entry_price"),
-        "mark_price": state.get("mark_price"),
-        "paused": is_paused,
-        "trades_today": state.get("trades_today"),
-        "trading_enabled": state.get("trading_enabled", True),
-        "win_count": perf.get("wins"),
-        "loss_count": perf.get("losses"),
-        "avg_win": perf.get("avg_win"),
-        "avg_loss": perf.get("avg_loss"),
-        "bot_running": _is_bot_running(),
+        "lifetime_pnl":     state.get("lifetime_pnl"),
+        "live_pnl":         state.get("live_pnl"),
+        "position_side":    state.get("position_side"),
+        "entry_price":      state.get("entry_price"),
+        "mark_price":       state.get("mark_price"),
+        "paused":           is_paused,
+        "total_fills":      state.get("total_fills", 0),
+        "trading_enabled":  state.get("trading_enabled", True),
+        "win_count":        perf.get("wins"),
+        "loss_count":       perf.get("losses"),
+        "avg_win":          perf.get("avg_win"),
+        "avg_loss":         perf.get("avg_loss"),
+        "bot_running":      _is_bot_running(),
+        "grid_mode":        state.get("grid_mode", "neutral"),
+        "grid_active":      state.get("grid_active", False),
     })
 
 
