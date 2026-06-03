@@ -685,6 +685,180 @@ def api_log():
     return jsonify({"log": get_last_lines(50)})
 
 
+@app.route('/api/diagnose')
+def api_diagnose():
+    """
+    Tests every API key and returns a detailed pass/fail report.
+    Hit /api/diagnose in your browser to debug permission issues.
+    """
+    import hmac as _hmac, hashlib as _hashlib
+
+    results = {}
+
+    # ── 1. Env vars present ──────────────────────────────────────────────────
+    env_keys = ["BYBIT_API_KEY", "BYBIT_API_SECRET", "ANTHROPIC_API_KEY",
+                "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    env_check = {}
+    for k in env_keys:
+        v = os.environ.get(k, "")
+        env_check[k] = "set" if v else "MISSING"
+    results["env_vars"] = env_check
+
+    # ── 2. Bybit public (no auth) ────────────────────────────────────────────
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=ETHUSDT", timeout=8)
+        d = r.json()
+        results["bybit_public"] = {
+            "ok":      d.get("retCode") == 0,
+            "retCode": d.get("retCode"),
+            "retMsg":  d.get("retMsg"),
+            "price":   d.get("result", {}).get("list", [{}])[0].get("lastPrice"),
+        }
+    except Exception as e:
+        results["bybit_public"] = {"ok": False, "error": str(e)}
+
+    # ── 3. Bybit server time ─────────────────────────────────────────────────
+    try:
+        r  = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
+        ts = str(int(float(r.json()["result"]["timeNano"]) / 1_000_000))
+        results["bybit_time"] = {"ok": True, "server_ts": ts}
+    except Exception as e:
+        results["bybit_time"] = {"ok": False, "error": str(e)}
+        ts = None
+
+    # ── 4. Bybit auth — wallet balance (tries all account types) ────────────
+    bybit_key    = os.environ.get("BYBIT_API_KEY", "")
+    bybit_secret = os.environ.get("BYBIT_API_SECRET", "")
+    bybit_auth_results = {}
+
+    for acct in ["UNIFIED", "CONTRACT", "SPOT"]:
+        if not bybit_key or not bybit_secret or not ts:
+            bybit_auth_results[acct] = {"ok": False, "error": "missing key/secret or server time failed"}
+            continue
+        try:
+            query = f"accountType={acct}&coin=USDT"
+            sig   = _hmac.new(bybit_secret.encode(),
+                              (ts + bybit_key + "5000" + query).encode(),
+                              _hashlib.sha256).hexdigest()
+            headers = {"X-BAPI-API-KEY": bybit_key, "X-BAPI-TIMESTAMP": ts,
+                       "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000"}
+            r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}",
+                             headers=headers, timeout=10)
+            d = r.json()
+            equity = None
+            items  = d.get("result", {}).get("list", [])
+            if items:
+                for k in ("totalEquity", "totalWalletBalance"):
+                    v = items[0].get(k)
+                    if v not in (None, ""):
+                        try:
+                            equity = float(v)
+                            break
+                        except:
+                            pass
+            bybit_auth_results[acct] = {
+                "ok":      d.get("retCode") == 0,
+                "retCode": d.get("retCode"),
+                "retMsg":  d.get("retMsg"),
+                "equity":  equity,
+            }
+        except Exception as e:
+            bybit_auth_results[acct] = {"ok": False, "error": str(e)}
+
+    results["bybit_auth"] = bybit_auth_results
+
+    # ── 5. Bybit order permission — open-orders read ─────────────────────────
+    if bybit_key and bybit_secret and ts:
+        try:
+            query = "category=linear&symbol=ETHUSDT&limit=1"
+            sig   = _hmac.new(bybit_secret.encode(),
+                              (ts + bybit_key + "5000" + query).encode(),
+                              _hashlib.sha256).hexdigest()
+            headers = {"X-BAPI-API-KEY": bybit_key, "X-BAPI-TIMESTAMP": ts,
+                       "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000"}
+            r = requests.get(f"https://api.bybit.com/v5/order/realtime?{query}",
+                             headers=headers, timeout=10)
+            d = r.json()
+            results["bybit_order_read"] = {
+                "ok":      d.get("retCode") == 0,
+                "retCode": d.get("retCode"),
+                "retMsg":  d.get("retMsg"),
+                "hint":    "retCode 10003/10004 = bad key/sign | 10016 = missing Derivatives permission",
+            }
+        except Exception as e:
+            results["bybit_order_read"] = {"ok": False, "error": str(e)}
+    else:
+        results["bybit_order_read"] = {"ok": False, "error": "skipped — missing credentials"}
+
+    # ── 6. Anthropic ─────────────────────────────────────────────────────────
+    anth_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anth_key:
+        results["anthropic"] = {"ok": False, "error": "ANTHROPIC_API_KEY not set"}
+    elif anthropic is None:
+        results["anthropic"] = {"ok": False, "error": "anthropic SDK not installed"}
+    else:
+        try:
+            client = anthropic.Anthropic(api_key=anth_key)
+            resp   = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            results["anthropic"] = {
+                "ok":    True,
+                "model": resp.model,
+                "reply": resp.content[0].text if resp.content else "",
+            }
+        except Exception as e:
+            results["anthropic"] = {
+                "ok":    False,
+                "error": str(e),
+                "hint":  "401 = bad key | 403 = plan doesn't allow this model",
+            }
+
+    # ── 7. Telegram ──────────────────────────────────────────────────────────
+    tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not tg_token or not tg_chat_id:
+        results["telegram"] = {"ok": False, "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"}
+    else:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                json={"chat_id": tg_chat_id, "text": "🔧 Diagnose ping from ETH bot"},
+                timeout=10,
+            )
+            d = r.json()
+            results["telegram"] = {
+                "ok":         d.get("ok"),
+                "description": d.get("description"),
+                "http_status": r.status_code,
+            }
+        except Exception as e:
+            results["telegram"] = {"ok": False, "error": str(e)}
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    failed = [k for k, v in results.items()
+              if isinstance(v, dict) and not v.get("ok")
+              and k not in ("bybit_auth",)]  # bybit_auth is nested
+    bybit_auth_any_ok = any(v.get("ok") for v in bybit_auth_results.values())
+    if not bybit_auth_any_ok:
+        failed.append("bybit_auth (all account types failed)")
+
+    results["summary"] = {
+        "all_ok": len(failed) == 0,
+        "failed": failed,
+        "tip":    (
+            "If bybit_auth fails with retCode 10016: go to Bybit API Management → "
+            "edit your key → enable 'Unified Trading' or 'Derivatives' permission. "
+            "If retCode 10003/10004: your key or secret is wrong/has extra spaces. "
+            "If IP whitelist is on: add your Zeabur server IP or disable whitelist."
+        ),
+    }
+
+    return jsonify(results)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
