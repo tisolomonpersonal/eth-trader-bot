@@ -509,14 +509,12 @@ def update_live_position(state):
 
 def check_and_place_counter_orders(state, price):
     """
-    For directional grids:
-    - Uptrend: when a buy order fills, place a sell above it (close long for profit).
-    - Downtrend: when a sell order fills, place a buy below it (close short for profit).
+    Places a TP counter-order whenever a grid order fills:
+    - Any mode: buy fill  → sell TP at fill_price + spacing  (close long for profit)
+    - Any mode: sell fill → buy  TP at fill_price - spacing  (close short for profit)
     Detects fills by comparing tracked order IDs against currently open orders.
     """
     grid_mode = state.get("grid_mode", "neutral")
-    if grid_mode == "neutral":
-        return state
 
     tracked   = state.get("tracked_orders", {})
     countered = state.get("counter_placed", {})
@@ -551,55 +549,47 @@ def check_and_place_counter_orders(state, price):
         qty        = float(info.get("qty", QTY_PER_LEVEL))
         pos_idx    = int(info.get("pos_idx", 1))
 
-        if grid_mode == "uptrend" and info.get("side") == "Buy":
-            # Buy filled → place sell above to close the long for profit
+        side = info.get("side")
+
+        # Buy filled → TP sell above (all modes)
+        if side == "Buy" and grid_mode in ("uptrend", "neutral"):
             counter_price = round(fill_price + spacing_abs, 2)
             res = place_limit_order("Sell", counter_price, qty, pos_idx=pos_idx)
             if res.get("retCode") == 0:
                 counter_id = res["result"]["orderId"]
                 tracked[counter_id] = {
-                    "side":    "Sell",
-                    "price":   counter_price,
-                    "qty":     qty,
-                    "pos_idx": pos_idx,
-                    "center":  center,
-                    "is_counter": True,
+                    "side": "Sell", "price": counter_price, "qty": qty,
+                    "pos_idx": pos_idx, "center": center, "is_counter": True,
                 }
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("COUNTER_SELL", {"fill_buy": fill_price, "counter_sell": counter_price})
+                append_log("TP_SELL", {"mode": grid_mode, "fill_buy": fill_price, "tp_sell": counter_price})
                 send_telegram(
-                    f"🔁 <b>Counter SELL placed</b> (uptrend fill)\n"
-                    f"Buy filled @ ${fill_price:.2f} → Sell @ ${counter_price:.2f}\n"
-                    f"Profit target: +{GRID_SPACING_PCT*100:.2f}%"
+                    f"🎯 <b>TP SELL placed</b> [{grid_mode}]\n"
+                    f"Buy filled @ ${fill_price:.2f} → TP Sell @ ${counter_price:.2f}\n"
+                    f"Profit per fill: ~${spacing_abs:.2f} ({GRID_SPACING_PCT*100:.2f}%)"
                 )
             else:
-                print(f"[counter] sell failed: {res.get('retMsg')}")
+                print(f"[tp] sell failed: {res.get('retMsg')}")
 
-        elif grid_mode == "downtrend" and info.get("side") == "Sell":
-            # Sell filled → place buy below to close the short for profit
+        # Sell filled → TP buy below (all modes)
+        elif side == "Sell" and grid_mode in ("downtrend", "neutral"):
             counter_price = round(fill_price - spacing_abs, 2)
             res = place_limit_order("Buy", counter_price, qty, pos_idx=pos_idx)
             if res.get("retCode") == 0:
                 counter_id = res["result"]["orderId"]
                 tracked[counter_id] = {
-                    "side":    "Buy",
-                    "price":   counter_price,
-                    "qty":     qty,
-                    "pos_idx": pos_idx,
-                    "center":  center,
-                    "is_counter": True,
+                    "side": "Buy", "price": counter_price, "qty": qty,
+                    "pos_idx": pos_idx, "center": center, "is_counter": True,
                 }
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("COUNTER_BUY", {"fill_sell": fill_price, "counter_buy": counter_price})
+                append_log("TP_BUY", {"mode": grid_mode, "fill_sell": fill_price, "tp_buy": counter_price})
                 send_telegram(
-                    f"🔁 <b>Counter BUY placed</b> (downtrend fill)\n"
-                    f"Sell filled @ ${fill_price:.2f} → Buy @ ${counter_price:.2f}\n"
-                    f"Profit target: +{GRID_SPACING_PCT*100:.2f}%"
+                    f"🎯 <b>TP BUY placed</b> [{grid_mode}]\n"
+                    f"Sell filled @ ${fill_price:.2f} → TP Buy @ ${counter_price:.2f}\n"
+                    f"Profit per fill: ~${spacing_abs:.2f} ({GRID_SPACING_PCT*100:.2f}%)"
                 )
-            else:
-                print(f"[counter] buy failed: {res.get('retMsg')}")
 
     state["tracked_orders"] = tracked
     state["counter_placed"] = countered
@@ -832,8 +822,8 @@ def run_cycle():
 
     state["grid_mode"] = mode
 
-    # ── Counter-order placement for directional fills ────────────────────────
-    if state.get("grid_active") and mode in ("uptrend", "downtrend"):
+    # ── TP counter-orders: check fills for ALL modes ─────────────────────────
+    if state.get("grid_active"):
         state = check_and_place_counter_orders(state, price)
         save_state(state)
 
