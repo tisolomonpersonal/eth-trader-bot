@@ -27,8 +27,14 @@ QTY_PER_LEVEL     = float(os.environ.get("QTY_PER_LEVEL", "0.04"))       # ETH p
 ADX_PERIOD        = int(os.environ.get("ADX_PERIOD", "14"))
 ADX_SIDEWAYS_MAX  = float(os.environ.get("ADX_SIDEWAYS_MAX", "25"))      # below = sideways
 ADX_TREND_MIN     = float(os.environ.get("ADX_TREND_MIN", "25"))         # above = trend active
+ADX_EXTREME_EXIT  = float(os.environ.get("ADX_EXTREME_EXIT", "80"))      # Layer 3: violent move exit
 BB_WIDTH_MIN      = float(os.environ.get("BB_WIDTH_MIN", "0.005"))
 BB_WIDTH_MAX      = float(os.environ.get("BB_WIDTH_MAX", "0.025"))
+
+# Risk management
+LIVE_PNL_STOPLOSS   = float(os.environ.get("LIVE_PNL_STOPLOSS", "-4.0"))    # Layer 2: close all if PnL < this
+MAX_POSITION_ETH    = float(os.environ.get("MAX_POSITION_ETH", "0.12"))      # stop grid if position >= this
+SL_SPACING_MULT     = float(os.environ.get("SL_SPACING_MULT", "2.0"))        # Layer 1: SL = entry ± N×spacing
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 STATE_FILE = Path(__file__).with_name("bot_state.json")
@@ -360,6 +366,92 @@ def place_limit_order(side, price_level, qty, pos_idx=None):
     return r.json()
 
 
+# ── risk management helpers ───────────────────────────────────────────────────
+
+def set_position_stop_loss(pos_idx, stop_price):
+    """
+    Set a stop loss on an open position via Bybit's trading-stop endpoint.
+    pos_idx: 1 = long, 2 = short
+    """
+    try:
+        params = {
+            "category":    "linear",
+            "symbol":      SYMBOL,
+            "stopLoss":    str(round(stop_price, 2)),
+            "slTriggerBy": "LastPrice",
+            "positionIdx": pos_idx,
+        }
+        headers, body = sign_post(params)
+        r = requests.post("https://api.bybit.com/v5/position/trading-stop",
+                          data=body, headers=headers, timeout=10)
+        res = r.json()
+        if res.get("retCode") != 0:
+            print(f"[sl] set SL failed: {res.get('retMsg')}")
+        return res
+    except Exception as e:
+        print(f"[sl] error: {e}")
+        return {}
+
+def close_position_market(pos_side, qty, pos_idx):
+    """Close an open position immediately with a market order."""
+    try:
+        close_side = "Buy" if pos_side == "Sell" else "Sell"
+        params = {
+            "category":    "linear",
+            "symbol":      SYMBOL,
+            "side":        close_side,
+            "orderType":   "Market",
+            "qty":         str(round(qty, 3)),
+            "positionIdx": pos_idx,
+            "reduceOnly":  True,
+        }
+        headers, body = sign_post(params)
+        r = requests.post("https://api.bybit.com/v5/order/create",
+                          data=body, headers=headers, timeout=10)
+        return r.json()
+    except Exception as e:
+        print(f"[close_pos] error: {e}")
+        return {}
+
+def close_all_positions():
+    """Market-close every open position for ETHUSDT."""
+    try:
+        query = f"category=linear&symbol={SYMBOL}"
+        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}",
+                         headers=sign_get(query), timeout=10)
+        data = r.json()
+        if data.get("retCode") != 0:
+            return
+        for pos in data.get("result", {}).get("list", []):
+            size = float(pos.get("size") or 0)
+            if size <= 0:
+                continue
+            pos_side = pos.get("side")
+            pos_idx  = int(pos.get("positionIdx", 0))
+            res = close_position_market(pos_side, size, pos_idx)
+            print(f"[close_all] {pos_side} {size} ETH → {res.get('retCode')} {res.get('retMsg')}")
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"[close_all] error: {e}")
+
+def get_total_position_size():
+    """Return total open ETH position size across all sides."""
+    try:
+        query = f"category=linear&symbol={SYMBOL}"
+        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}",
+                         headers=sign_get(query), timeout=10)
+        data = r.json()
+        if data.get("retCode") != 0:
+            return 0.0
+        total = sum(
+            float(p.get("size") or 0)
+            for p in data.get("result", {}).get("list", [])
+        )
+        return round(total, 4)
+    except Exception as e:
+        print(f"[pos_size] error: {e}")
+        return 0.0
+
 # ── indicators ───────────────────────────────────────────────────────────────
 
 def _wilder(vals, period):
@@ -593,9 +685,12 @@ def check_and_place_counter_orders(state, price):
 
         side = info.get("side")
 
-        # Buy filled → TP sell above (all modes)
+        sl_abs = spacing_abs * SL_SPACING_MULT   # stop loss distance from entry
+
+        # Buy filled → TP sell above + SL below (all modes)
         if side == "Buy" and grid_mode in ("uptrend", "neutral"):
             counter_price = round(fill_price + spacing_abs, 2)
+            sl_price      = round(fill_price - sl_abs, 2)
             res = place_limit_order("Sell", counter_price, qty, pos_idx=pos_idx)
             if res.get("retCode") == 0:
                 counter_id = res["result"]["orderId"]
@@ -605,18 +700,22 @@ def check_and_place_counter_orders(state, price):
                 }
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("TP_SELL", {"mode": grid_mode, "fill_buy": fill_price, "tp_sell": counter_price})
+                # Layer 1: set stop loss on the long position
+                set_position_stop_loss(pos_idx, sl_price)
+                append_log("TP_SELL", {"mode": grid_mode, "fill_buy": fill_price,
+                                       "tp_sell": counter_price, "sl": sl_price})
                 send_telegram(
                     f"🎯 <b>TP SELL placed</b> [{grid_mode}]\n"
-                    f"Buy filled @ ${fill_price:.2f} → TP Sell @ ${counter_price:.2f}\n"
-                    f"Profit per fill: ~${spacing_abs:.2f} ({GRID_SPACING_PCT*100:.2f}%)"
+                    f"Buy filled @ ${fill_price:.2f}\n"
+                    f"TP: ${counter_price:.2f} (+{GRID_SPACING_PCT*100:.2f}%) | SL: ${sl_price:.2f} (-{SL_SPACING_MULT*GRID_SPACING_PCT*100:.2f}%)"
                 )
             else:
                 print(f"[tp] sell failed: {res.get('retMsg')}")
 
-        # Sell filled → TP buy below (all modes)
+        # Sell filled → TP buy below + SL above (all modes)
         elif side == "Sell" and grid_mode in ("downtrend", "neutral"):
             counter_price = round(fill_price - spacing_abs, 2)
+            sl_price      = round(fill_price + sl_abs, 2)
             res = place_limit_order("Buy", counter_price, qty, pos_idx=pos_idx)
             if res.get("retCode") == 0:
                 counter_id = res["result"]["orderId"]
@@ -626,11 +725,14 @@ def check_and_place_counter_orders(state, price):
                 }
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("TP_BUY", {"mode": grid_mode, "fill_sell": fill_price, "tp_buy": counter_price})
+                # Layer 1: set stop loss on the short position
+                set_position_stop_loss(pos_idx, sl_price)
+                append_log("TP_BUY", {"mode": grid_mode, "fill_sell": fill_price,
+                                      "tp_buy": counter_price, "sl": sl_price})
                 send_telegram(
                     f"🎯 <b>TP BUY placed</b> [{grid_mode}]\n"
-                    f"Sell filled @ ${fill_price:.2f} → TP Buy @ ${counter_price:.2f}\n"
-                    f"Profit per fill: ~${spacing_abs:.2f} ({GRID_SPACING_PCT*100:.2f}%)"
+                    f"Sell filled @ ${fill_price:.2f}\n"
+                    f"TP: ${counter_price:.2f} (-{GRID_SPACING_PCT*100:.2f}%) | SL: ${sl_price:.2f} (+{SL_SPACING_MULT*GRID_SPACING_PCT*100:.2f}%)"
                 )
 
     state["tracked_orders"] = tracked
@@ -1039,6 +1141,37 @@ def run_cycle():
         send_telegram(f"⏹ Trading disabled by dashboard. Price: ${price:.2f}")
         return
 
+    # ── Layer 2: Live PnL hard stop ──────────────────────────────────────────
+    live_pnl = state.get("live_pnl") or 0.0
+    if live_pnl <= LIVE_PNL_STOPLOSS:
+        cancel_all_orders()
+        close_all_positions()
+        state["grid_active"]     = False
+        state["trading_enabled"] = False
+        state["tracked_orders"]  = {}
+        state["counter_placed"]  = {}
+        save_state(state)
+        send_telegram(
+            f"🛑 <b>HARD STOP TRIGGERED</b>\n"
+            f"Live PnL ${live_pnl:.2f} ≤ limit ${LIVE_PNL_STOPLOSS:.2f}\n"
+            f"All positions closed. Trading disabled.\n"
+            f"Re-enable from dashboard when ready."
+        )
+        append_log("HARD_STOP", {"live_pnl": live_pnl, "limit": LIVE_PNL_STOPLOSS, "price": price})
+        return
+
+    # ── Daily loss auto-disable ──────────────────────────────────────────────
+    daily_pnl = state.get("daily_pnl") or 0.0
+    if daily_pnl <= -2.0 and state.get("trading_enabled", True):
+        state["trading_enabled"] = False
+        save_state(state)
+        send_telegram(
+            f"⏸ <b>DAILY LOSS LIMIT</b>\n"
+            f"Daily PnL ${daily_pnl:.2f} — trading paused for today.\n"
+            f"Re-enable from dashboard."
+        )
+        return
+
     candles = get_candles("60", 100)
     if len(candles) < 30:
         send_telegram(f"⚠️ Not enough candle data: {len(candles)}")
@@ -1046,6 +1179,33 @@ def run_cycle():
 
     mode, regime_reason, indicators = detect_regime(candles, price)
     prev_mode = state.get("grid_mode", "neutral")
+
+    # ── Layer 3: ADX extreme exit — violent market move ──────────────────────
+    if indicators["adx"] >= ADX_EXTREME_EXIT:
+        cancel_all_orders()
+        close_all_positions()
+        state["grid_active"]    = False
+        state["tracked_orders"] = {}
+        state["counter_placed"] = {}
+        save_state(state)
+        send_telegram(
+            f"⚡ <b>EXTREME ADX EXIT</b>\n"
+            f"ADX {indicators['adx']} ≥ {ADX_EXTREME_EXIT} — violent market move detected.\n"
+            f"All positions closed. Will resume next cycle."
+        )
+        append_log("EXTREME_EXIT", {"adx": indicators["adx"], "price": price})
+        return
+
+    # ── Position size gate: stop new grid if already at max exposure ─────────
+    total_position = get_total_position_size()
+    at_max_position = total_position >= MAX_POSITION_ETH
+    if at_max_position:
+        send_telegram(
+            f"⚠️ <b>MAX POSITION REACHED</b>\n"
+            f"Open: {total_position} ETH ≥ limit {MAX_POSITION_ETH} ETH\n"
+            f"Waiting for TPs to fill before placing new grid."
+        )
+        append_log("MAX_POSITION", {"size": total_position, "limit": MAX_POSITION_ETH})
 
     # ── Mode switch: cancel grid orders if regime changed (keep TPs) ─────────
     if state.get("grid_active") and mode != prev_mode:
@@ -1084,6 +1244,11 @@ def run_cycle():
     open_count  = len(open_orders)
 
     decision, reason, center_price = ask_claude_grid(price, indicators, open_count, state, mode)
+
+    # Override PLACE to SKIP if position size is maxed out
+    if decision == "PLACE" and at_max_position:
+        decision = "SKIP"
+        reason   = f"Position size {total_position} ETH at max {MAX_POSITION_ETH} ETH — waiting for TPs."
 
     if decision == "CANCEL":
         cancel_grid_orders_only(state)
