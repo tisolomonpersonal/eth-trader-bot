@@ -1267,9 +1267,57 @@ def run_cycle():
 
     state["grid_mode"] = mode
 
-    # ── TP counter-orders: check fills for ALL modes ─────────────────────────
-    if state.get("grid_active"):
+    # ── TP/SL monitoring: always runs if there are tracked orders OR open position
+    # Intentionally NOT gated on grid_active — TPs must be managed even when
+    # the grid is paused (e.g. max position reached, trailing re-center, etc.)
+    has_tracked = bool(state.get("tracked_orders"))
+    has_position = (state.get("position_side") is not None)
+
+    if has_tracked or has_position:
         state = check_and_place_counter_orders(state, price)
+
+        # Safety net: if there's an open position with no TP in tracked orders,
+        # place one now (covers cases where TP was missed or never set)
+        tp_ids = {oid for oid, info in state.get("tracked_orders", {}).items()
+                  if info.get("is_counter")}
+        pos = get_position()
+        if pos and not tp_ids:
+            fill_price  = pos["entry_price"]
+            qty         = pos["size"]
+            pos_side    = pos["side"]
+            spacing_abs = fill_price * GRID_SPACING_PCT
+            sl_abs      = spacing_abs * SL_SPACING_MULT
+
+            if pos_side == "Buy":
+                tp_price = round(fill_price + spacing_abs, 2)
+                sl_price = round(fill_price - sl_abs, 2)
+                res = place_limit_order("Sell", tp_price, qty, pos_idx=1)
+                pos_idx = 1
+            else:
+                tp_price = round(fill_price - spacing_abs, 2)
+                sl_price = round(fill_price + sl_abs, 2)
+                res = place_limit_order("Buy", tp_price, qty, pos_idx=2)
+                pos_idx = 2
+
+            if res.get("retCode") == 0:
+                new_oid = res["result"]["orderId"]
+                tracked = state.get("tracked_orders", {})
+                tracked[new_oid] = {
+                    "side":       "Sell" if pos_side == "Buy" else "Buy",
+                    "price":      tp_price, "qty": qty,
+                    "pos_idx":    pos_idx, "center": fill_price,
+                    "is_counter": True,
+                }
+                state["tracked_orders"] = tracked
+                set_position_stop_loss(pos_idx, sl_price)
+                send_telegram(
+                    f"🔧 <b>Missing TP/SL restored</b>\n"
+                    f"Open {pos_side} @ ${fill_price:.2f} ({qty} ETH)\n"
+                    f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}"
+                )
+                append_log("TP_RESTORED", {"pos_side": pos_side, "entry": fill_price,
+                                           "tp": tp_price, "sl": sl_price})
+
         save_state(state)
 
     # ── Trailing: re-center if price left grid range (keep TP orders) ────────
