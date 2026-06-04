@@ -89,6 +89,8 @@ def load_state():
         "entry_price":          None,
         "mark_price":           None,
         "last_fill_check_time": 0,
+        "waiting_for_trend_change": False,
+        "stopped_mode":         None,   # mode that was active when loss hit
     }
 
 def save_state(state):
@@ -1137,38 +1139,82 @@ def run_cycle():
     state = update_fills_and_pnl(state)
     save_state(state)
 
+    # ── Trend-change watcher (runs while paused after a loss) ────────────────
+    if state.get("waiting_for_trend_change"):
+        candles = get_candles("60", 100)
+        if len(candles) >= 30:
+            current_mode, regime_reason, indicators = detect_regime(candles, price)
+            stopped_mode = state.get("stopped_mode", "neutral")
+
+            # Trend has changed if mode is different from what caused the loss
+            trend_changed = current_mode != stopped_mode
+
+            if trend_changed:
+                state["waiting_for_trend_change"] = False
+                state["trading_enabled"]          = True
+                state["stopped_mode"]             = None
+                save_state(state)
+                send_telegram(
+                    f"✅ <b>TREND CHANGED — Resuming</b>\n"
+                    f"Was: {stopped_mode.upper()} → Now: {current_mode.upper()}\n"
+                    f"ADX: {indicators['adx']} | DI+: {indicators.get('plus_di')} | DI-: {indicators.get('minus_di')}\n"
+                    f"Price: ${price:.2f} | {regime_reason}"
+                )
+                append_log("TREND_CHANGE_RESUME", {
+                    "from": stopped_mode, "to": current_mode,
+                    "adx": indicators["adx"], "price": price,
+                })
+                # Fall through to normal cycle with new mode
+            else:
+                send_telegram(
+                    f"👀 <b>Watching for trend change</b>\n"
+                    f"Still {current_mode.upper()} (same as stopped mode)\n"
+                    f"ADX: {indicators['adx']} | DI+: {indicators.get('plus_di')} | DI-: {indicators.get('minus_di')}\n"
+                    f"Price: ${price:.2f} — not re-entering yet."
+                )
+                return
+        else:
+            return  # not enough candles, wait
+
     if not state.get("trading_enabled", True):
         send_telegram(f"⏹ Trading disabled by dashboard. Price: ${price:.2f}")
         return
 
     # ── Layer 2: Live PnL hard stop ──────────────────────────────────────────
     live_pnl = state.get("live_pnl") or 0.0
-    if live_pnl <= LIVE_PNL_STOPLOSS:
+    if live_pnl <= LIVE_PNL_STOPLOSS and not state.get("waiting_for_trend_change"):
         cancel_all_orders()
         close_all_positions()
-        state["grid_active"]     = False
-        state["trading_enabled"] = False
-        state["tracked_orders"]  = {}
-        state["counter_placed"]  = {}
+        current_mode = state.get("grid_mode", "neutral")
+        state["grid_active"]              = False
+        state["trading_enabled"]          = False
+        state["tracked_orders"]           = {}
+        state["counter_placed"]           = {}
+        state["waiting_for_trend_change"] = True
+        state["stopped_mode"]             = current_mode
         save_state(state)
         send_telegram(
             f"🛑 <b>HARD STOP TRIGGERED</b>\n"
             f"Live PnL ${live_pnl:.2f} ≤ limit ${LIVE_PNL_STOPLOSS:.2f}\n"
-            f"All positions closed. Trading disabled.\n"
-            f"Re-enable from dashboard when ready."
+            f"All positions closed. Was in {current_mode.upper()} mode.\n"
+            f"Watching for trend change before re-entering..."
         )
-        append_log("HARD_STOP", {"live_pnl": live_pnl, "limit": LIVE_PNL_STOPLOSS, "price": price})
+        append_log("HARD_STOP", {"live_pnl": live_pnl, "limit": LIVE_PNL_STOPLOSS,
+                                  "price": price, "stopped_mode": current_mode})
         return
 
     # ── Daily loss auto-disable ──────────────────────────────────────────────
     daily_pnl = state.get("daily_pnl") or 0.0
-    if daily_pnl <= -2.0 and state.get("trading_enabled", True):
-        state["trading_enabled"] = False
+    if daily_pnl <= -2.0 and state.get("trading_enabled", True) and not state.get("waiting_for_trend_change"):
+        current_mode = state.get("grid_mode", "neutral")
+        state["trading_enabled"]          = False
+        state["waiting_for_trend_change"] = True
+        state["stopped_mode"]             = current_mode
         save_state(state)
         send_telegram(
             f"⏸ <b>DAILY LOSS LIMIT</b>\n"
-            f"Daily PnL ${daily_pnl:.2f} — trading paused for today.\n"
-            f"Re-enable from dashboard."
+            f"Daily PnL ${daily_pnl:.2f} — paused in {current_mode.upper()} mode.\n"
+            f"Watching for trend change before re-entering..."
         )
         return
 
