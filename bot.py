@@ -286,6 +286,48 @@ def cancel_all_orders():
                       data=body, headers=headers, timeout=10)
     return r.json()
 
+def cancel_order(order_id):
+    """Cancel a single order by ID."""
+    params = {"category": "linear", "symbol": SYMBOL, "orderId": order_id}
+    headers, body = sign_post(params)
+    r = requests.post("https://api.bybit.com/v5/order/cancel",
+                      data=body, headers=headers, timeout=10)
+    return r.json()
+
+def cancel_grid_orders_only(state):
+    """
+    Cancel only the grid (entry) orders — preserve TP/counter orders so open
+    positions keep their take-profit protection.
+    Falls back to cancel_all if tracked_orders is empty.
+    """
+    tracked = state.get("tracked_orders", {})
+    if not tracked:
+        return cancel_all_orders()
+
+    tp_ids      = {oid for oid, info in tracked.items() if info.get("is_counter")}
+    grid_ids    = {oid for oid in tracked if oid not in tp_ids}
+
+    # Also cancel any open orders we don't have in tracked (safety net)
+    open_orders = get_open_orders()
+    open_ids    = {o["orderId"] for o in open_orders}
+    unknown_ids = open_ids - set(tracked.keys())
+    to_cancel   = (grid_ids | unknown_ids) & open_ids
+
+    cancelled = 0
+    for oid in to_cancel:
+        res = cancel_order(oid)
+        if res.get("retCode") == 0:
+            cancelled += 1
+        time.sleep(0.1)
+
+    # Remove cancelled grid orders from tracked; keep TPs
+    for oid in grid_ids:
+        tracked.pop(oid, None)
+    state["tracked_orders"] = tracked
+
+    print(f"[cancel_grid] cancelled {cancelled} grid orders, preserved {len(tp_ids)} TP orders")
+    return {"cancelled": cancelled, "tp_preserved": len(tp_ids)}
+
 def set_leverage():
     params = {"category": "linear", "symbol": SYMBOL,
               "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
@@ -1005,17 +1047,15 @@ def run_cycle():
     mode, regime_reason, indicators = detect_regime(candles, price)
     prev_mode = state.get("grid_mode", "neutral")
 
-    # ── Mode switch: cancel existing grid if regime changed ──────────────────
+    # ── Mode switch: cancel grid orders if regime changed (keep TPs) ─────────
     if state.get("grid_active") and mode != prev_mode:
-        cancel_all_orders()
-        state["grid_active"]     = False
-        state["tracked_orders"]  = {}
-        state["counter_placed"]  = {}
-        state["center_price"]    = None
+        cancel_grid_orders_only(state)
+        state["grid_active"]  = False
+        state["center_price"] = None
         save_state(state)
         send_telegram(
             f"🔀 <b>REGIME CHANGE</b> {prev_mode.upper()} → {mode.upper()}\n"
-            f"Price: ${price:.2f} | {regime_reason}\nGrid cancelled — will re-place."
+            f"Price: ${price:.2f} | {regime_reason}\nGrid orders cancelled — TP orders kept."
         )
         append_log("REGIME_CHANGE", {"from": prev_mode, "to": mode, "price": price})
 
@@ -1026,17 +1066,16 @@ def run_cycle():
         state = check_and_place_counter_orders(state, price)
         save_state(state)
 
-    # ── Trailing: re-center if price left grid range ─────────────────────────
+    # ── Trailing: re-center if price left grid range (keep TP orders) ────────
     trail, trail_reason = should_trail(state, price, mode)
     if trail:
-        cancel_all_orders()
-        state["grid_active"]    = False
-        state["tracked_orders"] = {}
-        state["counter_placed"] = {}
+        cancel_grid_orders_only(state)
+        state["grid_active"]  = False
+        state["center_price"] = None
         save_state(state)
         send_telegram(
             f"🔄 <b>TRAILING RE-CENTER</b> ({mode})\n"
-            f"{trail_reason}"
+            f"{trail_reason}\nGrid orders cancelled — TP orders preserved."
         )
         append_log("TRAIL_RECENTER", {"mode": mode, "price": price, "reason": trail_reason})
 
@@ -1047,18 +1086,16 @@ def run_cycle():
     decision, reason, center_price = ask_claude_grid(price, indicators, open_count, state, mode)
 
     if decision == "CANCEL":
-        if open_count > 0:
-            cancel_all_orders()
-        state["grid_active"]    = False
-        state["tracked_orders"] = {}
-        state["counter_placed"] = {}
+        cancel_grid_orders_only(state)
+        state["grid_active"]  = False
+        state["center_price"] = None
         save_state(state)
-        send_telegram(f"🚫 <b>GRID CANCELLED by Claude</b>\nPrice: ${price:.2f}\n{reason}")
+        send_telegram(f"🚫 <b>GRID CANCELLED by Claude</b>\nPrice: ${price:.2f}\n{reason}\nTP orders preserved.")
         append_log("GRID_CANCEL_CLAUDE", {"reason": reason, "price": price, "mode": mode})
 
     elif decision == "PLACE":
         if open_count > 0:
-            cancel_all_orders()
+            cancel_grid_orders_only(state)
             time.sleep(1)
 
         set_leverage()
