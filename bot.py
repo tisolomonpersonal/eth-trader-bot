@@ -34,8 +34,7 @@ BB_WIDTH_MAX      = float(os.environ.get("BB_WIDTH_MAX", "0.025"))
 # Risk management
 LIVE_PNL_STOPLOSS   = float(os.environ.get("LIVE_PNL_STOPLOSS", "-4.0"))    # Layer 2: close all if PnL < this
 MAX_POSITION_ETH    = float(os.environ.get("MAX_POSITION_ETH", "0.12"))      # stop grid if position >= this
-SL_SPACING_MULT     = float(os.environ.get("SL_SPACING_MULT", "2.0"))        # Layer 1: SL = entry ± N×spacing
-TRAIL_ACTIVATE_MULT = float(os.environ.get("TRAIL_ACTIVATE_MULT", "0.5"))    # trail activates at N×spacing profit
+TARGET_PROFIT_USD   = float(os.environ.get("TARGET_PROFIT_USD", "1.0"))      # fixed TP target per trade in USD
 BREAKEVEN_THRESHOLD = float(os.environ.get("BREAKEVEN_THRESHOLD", "0.50"))   # move SL to entry once profit >= $X
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
@@ -747,86 +746,56 @@ def check_and_place_counter_orders(state, price):
 
         side = info.get("side")
 
-        sl_abs    = spacing_abs * SL_SPACING_MULT
-        use_trail = grid_mode in ("uptrend", "downtrend")   # trailing in trends, fixed in neutral
+        # TP distance: target $1 profit, minimum 1× spacing
+        # $1 / qty = price move needed. Use whichever is larger.
+        tp_distance = max(TARGET_PROFIT_USD / qty, spacing_abs)
+        sl_distance = tp_distance   # 1:1 risk/reward
 
-        # Buy filled → exit on the upside
+        # Buy filled → fixed TP sell above + SL below
         if side == "Buy" and grid_mode in ("uptrend", "neutral"):
-            sl_price = round(fill_price - sl_abs, 2)
-
-            if use_trail:
-                # Trending: trail activates at 0.5× spacing (sooner), follows price up
-                active_price = round(fill_price + spacing_abs * TRAIL_ACTIVATE_MULT, 2)
-                set_position_trailing_stop(pos_idx, spacing_abs, active_price)
-                set_position_stop_loss(pos_idx, sl_price)
+            tp_price = round(fill_price + tp_distance, 2)
+            sl_price = round(fill_price - sl_distance, 2)
+            res = place_limit_order("Sell", tp_price, qty, pos_idx=pos_idx)
+            if res.get("retCode") == 0:
+                counter_id = res["result"]["orderId"]
+                tracked[counter_id] = {"side": "Sell", "price": tp_price, "qty": qty,
+                                       "pos_idx": pos_idx, "center": center, "is_counter": True}
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("TRAIL_TP_LONG", {"fill": fill_price, "active_at": active_price,
-                                              "trail": spacing_abs, "sl": sl_price})
+                set_position_stop_loss(pos_idx, sl_price)
+                append_log("TP_SELL", {"mode": grid_mode, "fill": fill_price,
+                                       "tp": tp_price, "sl": sl_price, "target_usd": TARGET_PROFIT_USD})
                 send_telegram(
-                    f"🎯 <b>Trailing TP set</b> [UPTREND]\n"
+                    f"🎯 <b>TP SELL placed</b> [{grid_mode.upper()}]\n"
                     f"Buy filled @ ${fill_price:.2f}\n"
-                    f"Trail activates @ ${active_price:.2f} (+{TRAIL_ACTIVATE_MULT*GRID_SPACING_PCT*100:.2f}%)\n"
-                    f"Trail distance: ${spacing_abs:.2f} | SL: ${sl_price:.2f}"
+                    f"TP: ${tp_price:.2f} (+${tp_distance:.2f}) | SL: ${sl_price:.2f}\n"
+                    f"Target profit: ~${round(tp_distance * qty, 2)}"
                 )
             else:
-                # Neutral: fixed limit sell TP
-                counter_price = round(fill_price + spacing_abs, 2)
-                res = place_limit_order("Sell", counter_price, qty, pos_idx=pos_idx)
-                if res.get("retCode") == 0:
-                    counter_id = res["result"]["orderId"]
-                    tracked[counter_id] = {"side": "Sell", "price": counter_price, "qty": qty,
-                                           "pos_idx": pos_idx, "center": center, "is_counter": True}
-                    countered[order_id] = True
-                    new_counter_count += 1
-                    set_position_stop_loss(pos_idx, sl_price)
-                    append_log("TP_SELL", {"fill": fill_price, "tp": counter_price, "sl": sl_price})
-                    send_telegram(
-                        f"🎯 <b>TP SELL placed</b> [NEUTRAL]\n"
-                        f"Buy filled @ ${fill_price:.2f}\n"
-                        f"TP: ${counter_price:.2f} (+{GRID_SPACING_PCT*100:.2f}%) | SL: ${sl_price:.2f}"
-                    )
-                else:
-                    print(f"[tp] sell failed: {res.get('retMsg')}")
+                print(f"[tp] sell failed: {res.get('retMsg')}")
 
-        # Sell filled → exit on the downside
+        # Sell filled → fixed TP buy below + SL above
         elif side == "Sell" and grid_mode in ("downtrend", "neutral"):
-            sl_price = round(fill_price + sl_abs, 2)
-
-            if use_trail:
-                # Trending: trail activates at 0.5× spacing (sooner), follows price down
-                active_price = round(fill_price - spacing_abs * TRAIL_ACTIVATE_MULT, 2)
-                set_position_trailing_stop(pos_idx, spacing_abs, active_price)
-                set_position_stop_loss(pos_idx, sl_price)
+            tp_price = round(fill_price - tp_distance, 2)
+            sl_price = round(fill_price + sl_distance, 2)
+            res = place_limit_order("Buy", tp_price, qty, pos_idx=pos_idx)
+            if res.get("retCode") == 0:
+                counter_id = res["result"]["orderId"]
+                tracked[counter_id] = {"side": "Buy", "price": tp_price, "qty": qty,
+                                       "pos_idx": pos_idx, "center": center, "is_counter": True}
                 countered[order_id] = True
                 new_counter_count += 1
-                append_log("TRAIL_TP_SHORT", {"fill": fill_price, "active_at": active_price,
-                                               "trail": spacing_abs, "sl": sl_price})
+                set_position_stop_loss(pos_idx, sl_price)
+                append_log("TP_BUY", {"mode": grid_mode, "fill": fill_price,
+                                      "tp": tp_price, "sl": sl_price, "target_usd": TARGET_PROFIT_USD})
                 send_telegram(
-                    f"🎯 <b>Trailing TP set</b> [DOWNTREND]\n"
+                    f"🎯 <b>TP BUY placed</b> [{grid_mode.upper()}]\n"
                     f"Sell filled @ ${fill_price:.2f}\n"
-                    f"Trail activates @ ${active_price:.2f} (-{TRAIL_ACTIVATE_MULT*GRID_SPACING_PCT*100:.2f}%)\n"
-                    f"Trail distance: ${spacing_abs:.2f} | SL: ${sl_price:.2f}"
+                    f"TP: ${tp_price:.2f} (-${tp_distance:.2f}) | SL: ${sl_price:.2f}\n"
+                    f"Target profit: ~${round(tp_distance * qty, 2)}"
                 )
             else:
-                # Neutral: fixed limit buy TP
-                counter_price = round(fill_price - spacing_abs, 2)
-                res = place_limit_order("Buy", counter_price, qty, pos_idx=pos_idx)
-                if res.get("retCode") == 0:
-                    counter_id = res["result"]["orderId"]
-                    tracked[counter_id] = {"side": "Buy", "price": counter_price, "qty": qty,
-                                           "pos_idx": pos_idx, "center": center, "is_counter": True}
-                    countered[order_id] = True
-                    new_counter_count += 1
-                    set_position_stop_loss(pos_idx, sl_price)
-                    append_log("TP_BUY", {"fill": fill_price, "tp": counter_price, "sl": sl_price})
-                    send_telegram(
-                        f"🎯 <b>TP BUY placed</b> [NEUTRAL]\n"
-                        f"Sell filled @ ${fill_price:.2f}\n"
-                        f"TP: ${counter_price:.2f} (-{GRID_SPACING_PCT*100:.2f}%) | SL: ${sl_price:.2f}"
-                    )
-                else:
-                    print(f"[tp] buy failed: {res.get('retMsg')}")
+                print(f"[tp] buy failed: {res.get('retMsg')}")
 
     state["tracked_orders"] = tracked
     state["counter_placed"] = countered
@@ -1395,63 +1364,37 @@ def run_cycle():
             qty         = pos["size"]
             pos_side    = pos["side"]
             spacing_abs = fill_price * GRID_SPACING_PCT
-            sl_abs      = spacing_abs * SL_SPACING_MULT
-            use_trail   = mode in ("uptrend", "downtrend")
+            tp_distance = max(TARGET_PROFIT_USD / qty, spacing_abs)
 
             if pos_side == "Buy":
                 pos_idx  = 1
-                sl_price = round(fill_price - sl_abs, 2)
-                if use_trail:
-                    active_price = round(fill_price + spacing_abs, 2)
-                    set_position_trailing_stop(pos_idx, spacing_abs, active_price)
-                    set_position_stop_loss(pos_idx, sl_price)
-                    send_telegram(
-                        f"🔧 <b>Trailing TP restored</b> [UPTREND]\n"
-                        f"Open Buy @ ${fill_price:.2f} | Trail activates @ ${active_price:.2f}\n"
-                        f"SL: ${sl_price:.2f}"
-                    )
-                    append_log("TP_RESTORED", {"type": "trailing", "pos_side": pos_side,
-                                               "entry": fill_price, "active": active_price, "sl": sl_price})
-                else:
-                    tp_price = round(fill_price + spacing_abs, 2)
-                    res = place_limit_order("Sell", tp_price, qty, pos_idx=pos_idx)
-                    if res.get("retCode") == 0:
-                        new_oid = res["result"]["orderId"]
-                        tracked = state.get("tracked_orders", {})
-                        tracked[new_oid] = {"side": "Sell", "price": tp_price, "qty": qty,
-                                            "pos_idx": pos_idx, "center": fill_price, "is_counter": True}
-                        state["tracked_orders"] = tracked
-                        set_position_stop_loss(pos_idx, sl_price)
-                        send_telegram(f"🔧 <b>TP/SL restored</b>\nBuy @ ${fill_price:.2f} → TP ${tp_price:.2f} | SL ${sl_price:.2f}")
-                        append_log("TP_RESTORED", {"type": "fixed", "pos_side": pos_side,
-                                                   "entry": fill_price, "tp": tp_price, "sl": sl_price})
+                tp_price = round(fill_price + tp_distance, 2)
+                sl_price = round(fill_price - tp_distance, 2)
+                res = place_limit_order("Sell", tp_price, qty, pos_idx=pos_idx)
             else:
                 pos_idx  = 2
-                sl_price = round(fill_price + sl_abs, 2)
-                if use_trail:
-                    active_price = round(fill_price - spacing_abs, 2)
-                    set_position_trailing_stop(pos_idx, spacing_abs, active_price)
-                    set_position_stop_loss(pos_idx, sl_price)
-                    send_telegram(
-                        f"🔧 <b>Trailing TP restored</b> [DOWNTREND]\n"
-                        f"Open Sell @ ${fill_price:.2f} | Trail activates @ ${active_price:.2f}\n"
-                        f"SL: ${sl_price:.2f}"
-                    )
-                    append_log("TP_RESTORED", {"type": "trailing", "pos_side": pos_side,
-                                               "entry": fill_price, "active": active_price, "sl": sl_price})
-                else:
-                    tp_price = round(fill_price - spacing_abs, 2)
-                    res = place_limit_order("Buy", tp_price, qty, pos_idx=pos_idx)
-                    if res.get("retCode") == 0:
-                        new_oid = res["result"]["orderId"]
-                        tracked = state.get("tracked_orders", {})
-                        tracked[new_oid] = {"side": "Buy", "price": tp_price, "qty": qty,
-                                            "pos_idx": pos_idx, "center": fill_price, "is_counter": True}
-                        state["tracked_orders"] = tracked
-                        set_position_stop_loss(pos_idx, sl_price)
-                        send_telegram(f"🔧 <b>TP/SL restored</b>\nSell @ ${fill_price:.2f} → TP ${tp_price:.2f} | SL ${sl_price:.2f}")
-                        append_log("TP_RESTORED", {"type": "fixed", "pos_side": pos_side,
-                                                   "entry": fill_price, "tp": tp_price, "sl": sl_price})
+                tp_price = round(fill_price - tp_distance, 2)
+                sl_price = round(fill_price + tp_distance, 2)
+                res = place_limit_order("Buy", tp_price, qty, pos_idx=pos_idx)
+
+            if res.get("retCode") == 0:
+                new_oid = res["result"]["orderId"]
+                tracked = state.get("tracked_orders", {})
+                tracked[new_oid] = {
+                    "side":       "Sell" if pos_side == "Buy" else "Buy",
+                    "price":      tp_price, "qty": qty,
+                    "pos_idx":    pos_idx, "center": fill_price, "is_counter": True,
+                }
+                state["tracked_orders"] = tracked
+                set_position_stop_loss(pos_idx, sl_price)
+                send_telegram(
+                    f"🔧 <b>TP/SL restored</b>\n"
+                    f"Open {pos_side} @ ${fill_price:.2f} ({qty} ETH)\n"
+                    f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}\n"
+                    f"Target: ~${round(tp_distance * qty, 2)}"
+                )
+                append_log("TP_RESTORED", {"pos_side": pos_side, "entry": fill_price,
+                                           "tp": tp_price, "sl": sl_price})
 
         save_state(state)
 
