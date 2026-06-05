@@ -16,7 +16,7 @@ TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL            = "ETHUSDT"
 LEVERAGE          = int(os.environ.get("LEVERAGE", "30"))
-CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "1800"))  # 30 min
+CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "300"))   # 5 min
 
 # Grid settings
 GRID_LEVELS       = int(os.environ.get("GRID_LEVELS", "2"))
@@ -35,6 +35,8 @@ BB_WIDTH_MAX      = float(os.environ.get("BB_WIDTH_MAX", "0.025"))
 LIVE_PNL_STOPLOSS   = float(os.environ.get("LIVE_PNL_STOPLOSS", "-4.0"))    # Layer 2: close all if PnL < this
 MAX_POSITION_ETH    = float(os.environ.get("MAX_POSITION_ETH", "0.12"))      # stop grid if position >= this
 SL_SPACING_MULT     = float(os.environ.get("SL_SPACING_MULT", "2.0"))        # Layer 1: SL = entry ± N×spacing
+TRAIL_ACTIVATE_MULT = float(os.environ.get("TRAIL_ACTIVATE_MULT", "0.5"))    # trail activates at N×spacing profit
+BREAKEVEN_THRESHOLD = float(os.environ.get("BREAKEVEN_THRESHOLD", "0.50"))   # move SL to entry once profit >= $X
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 STATE_FILE = Path(__file__).with_name("bot_state.json")
@@ -543,6 +545,38 @@ def calculate_bollinger(closes, period=20):
     std    = (sum((p - sma) ** 2 for p in recent) / period) ** 0.5
     return round(sma, 2), round(sma + 2*std, 2), round(sma - 2*std, 2)
 
+def detect_di_crossover(candles, period=14):
+    """
+    Detect if DI lines just crossed in the last 2 bars — signals a FRESH trend,
+    not a mature one. Returns ('up', True/False) or ('down', True/False).
+    fresh=True means the cross happened in the last 2 candles.
+    """
+    if len(candles) < period * 2 + 2:
+        return None, False
+
+    def di_pair(subset):
+        plus_dm, minus_dm, tr = _dm_tr(subset)
+        tr_s    = _wilder(tr,       period)
+        plus_s  = _wilder(plus_dm,  period)
+        minus_s = _wilder(minus_dm, period)
+        if not tr_s or tr_s[-1] == 0:
+            return 0.0, 0.0
+        return (100 * plus_s[-1] / tr_s[-1],
+                100 * minus_s[-1] / tr_s[-1])
+
+    plus_now,  minus_now  = di_pair(candles)
+    plus_prev, minus_prev = di_pair(candles[:-1])
+
+    if plus_now > minus_now and plus_prev <= minus_prev:
+        return "up",   True   # just crossed bullish
+    if minus_now > plus_now and minus_prev <= plus_prev:
+        return "down", True   # just crossed bearish
+    if plus_now > minus_now:
+        return "up",   False  # ongoing uptrend, not fresh
+    if minus_now > plus_now:
+        return "down", False  # ongoing downtrend, not fresh
+    return None, False
+
 def detect_regime(candles, price):
     """
     Returns (mode, reason, indicators) where mode is:
@@ -556,10 +590,13 @@ def detect_regime(candles, price):
     mid, upper, lower = calculate_bollinger(closes)
     bb_width = (upper - lower) / mid if mid > 0 else 0
 
+    di_direction, di_fresh = detect_di_crossover(candles)
     indicators = {
         "adx":         adx,
         "plus_di":     plus_di,
         "minus_di":    minus_di,
+        "di_fresh":    di_fresh,       # True = DI just crossed (fresh signal)
+        "di_direction": di_direction,
         "bb_width_pct": round(bb_width * 100, 3),
         "bb_upper":    upper,
         "bb_lower":    lower,
@@ -718,9 +755,8 @@ def check_and_place_counter_orders(state, price):
             sl_price = round(fill_price - sl_abs, 2)
 
             if use_trail:
-                # Trending: trailing stop — activates once price rises 1× spacing,
-                # then follows price up, exits if it reverses by 1× spacing
-                active_price = round(fill_price + spacing_abs, 2)
+                # Trending: trail activates at 0.5× spacing (sooner), follows price up
+                active_price = round(fill_price + spacing_abs * TRAIL_ACTIVATE_MULT, 2)
                 set_position_trailing_stop(pos_idx, spacing_abs, active_price)
                 set_position_stop_loss(pos_idx, sl_price)
                 countered[order_id] = True
@@ -730,8 +766,8 @@ def check_and_place_counter_orders(state, price):
                 send_telegram(
                     f"🎯 <b>Trailing TP set</b> [UPTREND]\n"
                     f"Buy filled @ ${fill_price:.2f}\n"
-                    f"Trail activates @ ${active_price:.2f}, distance ${spacing_abs:.2f}\n"
-                    f"Lets winner run ↑ | SL: ${sl_price:.2f}"
+                    f"Trail activates @ ${active_price:.2f} (+{TRAIL_ACTIVATE_MULT*GRID_SPACING_PCT*100:.2f}%)\n"
+                    f"Trail distance: ${spacing_abs:.2f} | SL: ${sl_price:.2f}"
                 )
             else:
                 # Neutral: fixed limit sell TP
@@ -758,9 +794,8 @@ def check_and_place_counter_orders(state, price):
             sl_price = round(fill_price + sl_abs, 2)
 
             if use_trail:
-                # Trending: trailing stop — activates once price drops 1× spacing,
-                # then follows price down, exits if it reverses up by 1× spacing
-                active_price = round(fill_price - spacing_abs, 2)
+                # Trending: trail activates at 0.5× spacing (sooner), follows price down
+                active_price = round(fill_price - spacing_abs * TRAIL_ACTIVATE_MULT, 2)
                 set_position_trailing_stop(pos_idx, spacing_abs, active_price)
                 set_position_stop_loss(pos_idx, sl_price)
                 countered[order_id] = True
@@ -770,8 +805,8 @@ def check_and_place_counter_orders(state, price):
                 send_telegram(
                     f"🎯 <b>Trailing TP set</b> [DOWNTREND]\n"
                     f"Sell filled @ ${fill_price:.2f}\n"
-                    f"Trail activates @ ${active_price:.2f}, distance ${spacing_abs:.2f}\n"
-                    f"Lets winner run ↓ | SL: ${sl_price:.2f}"
+                    f"Trail activates @ ${active_price:.2f} (-{TRAIL_ACTIVATE_MULT*GRID_SPACING_PCT*100:.2f}%)\n"
+                    f"Trail distance: ${spacing_abs:.2f} | SL: ${sl_price:.2f}"
                 )
             else:
                 # Neutral: fixed limit buy TP
@@ -994,7 +1029,8 @@ Time: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 Current mode: {mode.upper()} — {mode_desc}
 
 Market indicators:
-- ADX: {indicators['adx']} | DI+: {indicators.get('plus_di', 'n/a')} | DI-: {indicators.get('minus_di', 'n/a')}
+- ADX: {indicators['adx']} | DI+: {indicators.get('plus_di')} | DI-: {indicators.get('minus_di')}
+- DI Cross: {'🆕 FRESH cross just happened' if indicators.get('di_fresh') else '⏳ Mature trend — cross was earlier'}
 - BB Upper: ${indicators['bb_upper']} | Mid: ${indicators['bb_mid']} | Lower: ${indicators['bb_lower']}
 - BB Width: {indicators['bb_width_pct']}%
 
@@ -1281,6 +1317,23 @@ def run_cycle():
 
     mode, regime_reason, indicators = detect_regime(candles, price)
     prev_mode = state.get("grid_mode", "neutral")
+
+    # ── Breakeven SL: once position profit >= threshold, move SL to entry ────
+    pos = get_position()
+    if pos:
+        entry   = pos["entry_price"]
+        size    = pos["size"]
+        upnl    = pos["live_pnl"]
+        pos_idx = 1 if pos["side"] == "Buy" else 2
+        if upnl >= BREAKEVEN_THRESHOLD:
+            be_res = set_position_stop_loss(pos_idx, entry)
+            if be_res.get("retCode") == 0:
+                append_log("BREAKEVEN_SET", {"entry": entry, "upnl": upnl, "pos_idx": pos_idx})
+                send_telegram(
+                    f"🔒 <b>Breakeven SL set</b>\n"
+                    f"Position profit ${upnl:.2f} ≥ ${BREAKEVEN_THRESHOLD:.2f}\n"
+                    f"SL moved to entry ${entry:.2f} — trade can no longer lose."
+                )
 
     # ── Layer 3: ADX extreme exit — violent market move ──────────────────────
     if indicators["adx"] >= ADX_EXTREME_EXIT:
