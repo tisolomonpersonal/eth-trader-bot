@@ -1,30 +1,23 @@
+from flask import Flask, jsonify, request, render_template_string, make_response, send_from_directory
+import json
+import os
+import threading
+import time
+import traceback
+import random
+import requests
+from datetime import datetime, timezone
+from pathlib import Path
+import uuid
+
 try:
-    from flask import Flask, jsonify, request, render_template_string, make_response, send_from_directory
-    import json
-    import os
-    import threading
-    import time
-    import traceback
-    import random
-    import requests
-    from datetime import datetime, timezone
-    from pathlib import Path
-    import uuid
+    import anthropic
+except Exception:
+    anthropic = None
 
-    try:
-        import anthropic
-    except Exception:
-        anthropic = None
+import bot as trader_bot
 
-    try:
-        import bot as trader_bot
-    except Exception as _bot_err:
-        import traceback as _tb
-        print(f"[startup] FATAL: failed to import bot.py: {_bot_err}")
-        _tb.print_exc()
-        raise
-
-    app = Flask(__name__)
+app = Flask(__name__)
 
 @app.after_request
 def add_cors(response):
@@ -36,12 +29,6 @@ def add_cors(response):
 @app.route("/api/<path:path>", methods=["OPTIONS"])
 def handle_options(path):
     return "", 204
-
-except Exception as _startup_err:
-    import traceback as _tb
-    print(f"[startup] FATAL import error: {_startup_err}")
-    _tb.print_exc()
-    raise
 
 # Paths (shared with bot.py)
 STATE_FILE = Path(__file__).parent / "bot_state.json"
@@ -918,13 +905,7 @@ def api_diagnose():
     results["summary"] = {
         "all_ok": len(failed) == 0,
         "failed": failed,
-        "tip":    (
-            "If bybit_auth fails with retCode 10016: go to Bybit API Management → "
-            "edit your key → enable 'Unified Trading' or 'Derivatives' permission. "
-            "If retCode 10003/10004: your key or secret is wrong/has extra spaces. "
-            "If IP whitelist is on: add your Zeabur server IP or disable whitelist."
-        ),
-    }
+        "tip": "retCode 10016: enable Unified Trading or Derivatives permission in Bybit API settings. retCode 10003/10004: wrong key or secret. IP whitelist: add Zeabur IP or disable it."    }
 
     return jsonify(results)
 
