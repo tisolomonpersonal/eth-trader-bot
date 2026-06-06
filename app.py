@@ -652,8 +652,12 @@ def api_status():
         "avg_win":          perf.get("avg_win"),
         "avg_loss":         perf.get("avg_loss"),
         "bot_running":      _is_bot_running(),
-        "grid_mode":        state.get("grid_mode", "neutral"),
-        "grid_active":      state.get("grid_active", False),
+        "in_trade":         state.get("in_trade", False),
+        "trade_side":       state.get("trade_side"),
+        "bias_4h":          state.get("bias_4h"),
+        "avg_price_4h":     state.get("avg_price_4h"),
+        "avg_price_1h":     state.get("avg_price_1h"),
+        "tp_price":         state.get("tp_price"),
     })
 
 
