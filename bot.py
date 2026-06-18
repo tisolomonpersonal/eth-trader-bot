@@ -1,69 +1,98 @@
 """
-EURUSD Master Pattern Trading Bot (Bybit TradFi)
-=================================================
+EURUSD Master Pattern Trading Bot — MT5 Edition
+================================================
 Strategy: 3-phase master pattern (Contraction -> Expansion -> Trend)
 - 4H timeframe: directional bias (where smart money has settled)
 - 1H timeframe: entry signal (counter-trend expansion = entry zone)
-- No hard SL: exit only when 4H bias reverses (trend change)
-- TP: dynamic, placed at 1H average price (contraction midpoint)
+- No hard SL: exit only when 4H bias reverses
+- TP: set directly on the pending order at 1H average price
 - Single position at a time
-- Dynamic lot sizing: protects account by risking RISK_PCT per trade
-- Forex market hours respected (24/5, closed weekends)
+- Dynamic lot sizing: risks RISK_PCT of equity per trade
+- Connects to MT5 terminal via mt5linux RPC bridge (Zeabur internal network)
 """
 
-import requests, json, os, time, hmac, hashlib, traceback
-from datetime import datetime, timezone
+import json, os, time, traceback
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import requests
+
 try:
-    import anthropic
+    from mt5linux import MetaTrader5
+except ImportError:
+    MetaTrader5 = None
+
+try:
+    import anthropic as _anthropic_lib
 except Exception:
-    anthropic = None
+    _anthropic_lib = None
 
 # == CONFIG ====================================================================
-BYBIT_API_KEY      = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET   = os.environ.get("BYBIT_API_SECRET", "")
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# TradFi symbol (Zero-Fee mode uses .s suffix; Tight-Spread mode omit suffix)
-SYMBOL             = os.environ.get("SYMBOL", "EURUSD.s")
-# NOTE: If TradFi symbols require a different category, update CATEGORY below.
-# Try "linear" first. If API returns error, check Bybit TradFi API docs.
-CATEGORY           = os.environ.get("CATEGORY", "linear")
+# MT5 connection (set these as Zeabur environment variables)
+MT5_HOST   = os.environ.get("MT5_HOST", "mt5.zeabur.internal")  # your MT5 service name
+MT5_PORT   = int(os.environ.get("MT5_PORT", "8001"))
+
+# Symbol — use what appears in your Bybit MT5 terminal (check the Market Watch)
+SYMBOL     = os.environ.get("SYMBOL", "EURUSD.s")
+MAGIC      = 234567   # bot identifier on all orders
 
 # Forex precision
-PIP_SIZE           = float(os.environ.get("PIP_SIZE", "0.0001"))       # 1 pip for EURUSD
-LOT_UNIT_SIZE      = int(os.environ.get("LOT_UNIT_SIZE", "100000"))    # units in 1 standard lot
-PRICE_DECIMALS     = int(os.environ.get("PRICE_DECIMALS", "5"))        # EURUSD: 5 decimal places
-MIN_LOT            = float(os.environ.get("MIN_LOT", "0.01"))          # minimum lot size
-MAX_LOT            = float(os.environ.get("MAX_LOT", "10.0"))          # maximum lot size
+PRICE_DECIMALS = int(os.environ.get("PRICE_DECIMALS", "5"))   # EURUSD: 5 dp
+PIP_SIZE       = float(os.environ.get("PIP_SIZE", "0.0001"))  # 1 pip EURUSD
 
-# Dynamic lot sizing (protects money, scales with account)
-# Lots sized so that MAX_ADVERSE_PIPS adverse move = RISK_PCT of equity
-RISK_PCT           = float(os.environ.get("RISK_PCT", "0.01"))         # 1% equity at risk per trade
-MAX_ADVERSE_PIPS   = int(os.environ.get("MAX_ADVERSE_PIPS", "100"))    # worst-case pip buffer for sizing
+# Position sizing: risk RISK_PCT of equity, assume MAX_ADVERSE_PIPS worst case
+RISK_PCT         = float(os.environ.get("RISK_PCT", "0.01"))        # 1%
+MAX_ADVERSE_PIPS = int(os.environ.get("MAX_ADVERSE_PIPS", "100"))   # 100 pip buffer
+MIN_LOT          = float(os.environ.get("MIN_LOT", "0.01"))
+MAX_LOT          = float(os.environ.get("MAX_LOT", "10.0"))
 
 # Entry
-ENTRY_OFFSET_PIPS  = int(os.environ.get("ENTRY_OFFSET_PIPS", "2"))     # pip offset for limit entry
-MIN_TP_PIPS        = int(os.environ.get("MIN_TP_PIPS", "10"))          # skip entry if TP < this many pips
+ENTRY_OFFSET_PCT = float(os.environ.get("ENTRY_OFFSET_PCT", "0.001"))  # 0.1% offset
+MIN_TP_PIPS      = int(os.environ.get("MIN_TP_PIPS", "10"))            # skip if TP < 10 pips
 
-# Master pattern timeframes
-BIAS_TF            = os.environ.get("BIAS_TF", "240")                  # 4H - directional bias
-ENTRY_TF           = os.environ.get("ENTRY_TF", "60")                  # 1H - entry timing
-BOX_LOOKBACK       = int(os.environ.get("BOX_LOOKBACK", "40"))         # candles to search for contraction
-BOX_WINDOW         = int(os.environ.get("BOX_WINDOW", "5"))            # candles in contraction box
-SETTLE_CANDLES     = int(os.environ.get("SETTLE_CANDLES", "2"))        # 4H candles needed to confirm bias
+# Master pattern timeframes (in minutes as strings, mapped to MT5 constants)
+BIAS_TF        = os.environ.get("BIAS_TF", "240")   # 4H
+ENTRY_TF       = os.environ.get("ENTRY_TF", "60")   # 1H
+BOX_LOOKBACK   = int(os.environ.get("BOX_LOOKBACK", "40"))
+BOX_WINDOW     = int(os.environ.get("BOX_WINDOW", "5"))
+SETTLE_CANDLES = int(os.environ.get("SETTLE_CANDLES", "2"))
 
-# Risk
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "60"))       # seconds between cycles (1 min)
-CLAUDE_INTERVAL    = int(os.environ.get("CLAUDE_INTERVAL", "1800"))    # Claude AI analysis every 30 min
-PORTFOLIO_STOPLOSS = float(os.environ.get("PORTFOLIO_STOPLOSS", "-4.0"))  # emergency close all
+# Risk / timing
+CHECK_INTERVAL   = int(os.environ.get("CHECK_INTERVAL", "60"))      # 1 min cycles
+CLAUDE_INTERVAL  = int(os.environ.get("CLAUDE_INTERVAL", "1800"))   # 30 min AI read
+PORTFOLIO_STOPLOSS = float(os.environ.get("PORTFOLIO_STOPLOSS", "-4.0"))
 
-BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 STATE_FILE = Path(__file__).with_name("bot_state.json")
 LOG_FILE   = Path(__file__).with_name("log.txt")
+
+# MT5 timeframe map
+TF_MAP = {
+    "1": 1, "5": 5, "15": 15, "30": 30,
+    "60": 16385,    # TIMEFRAME_H1
+    "240": 16388,   # TIMEFRAME_H4
+    "1440": 16390,  # TIMEFRAME_D1
+}
+
+# == MT5 CONNECTION ============================================================
+
+_mt5 = None
+
+def get_mt5():
+    """Return MT5 instance, (re)connecting if needed."""
+    global _mt5
+    if MetaTrader5 is None:
+        raise Exception("mt5linux not installed. Add it to requirements.txt.")
+    if _mt5 is None:
+        _mt5 = MetaTrader5(host=MT5_HOST, port=MT5_PORT)
+    if not _mt5.initialize():
+        err = _mt5.last_error()
+        _mt5 = None
+        raise Exception(f"MT5 connection failed ({MT5_HOST}:{MT5_PORT}): {err}")
+    return _mt5
 
 
 # == STOP FLAG =================================================================
@@ -83,26 +112,26 @@ def load_state():
     except:
         pass
     return {
-        "in_trade":         False,
-        "trade_side":       None,
-        "entry_price":      None,
-        "tp_price":         None,
-        "tp_order_id":      None,
-        "lot_size":         None,
-        "bias_4h":          None,
-        "avg_price_4h":     None,
-        "avg_price_1h":     None,
-        "total_profit":     0.0,
-        "lifetime_pnl":     0.0,
-        "daily_pnl":        0.0,
-        "daily_pnl_date":   "",
-        "total_fills":      0,
-        "trade_history":    [],
-        "live_pnl":         None,
-        "position_side":    None,
-        "mark_price":       None,
-        "equity":           None,
-        "last_fill_check":  0,
+        "in_trade":              False,
+        "trade_side":            None,
+        "entry_price":           None,
+        "tp_price":              None,
+        "entry_ticket":          None,   # MT5 pending order ticket
+        "lot_size":              None,
+        "bias_4h":               None,
+        "avg_price_4h":          None,
+        "avg_price_1h":          None,
+        "total_profit":          0.0,
+        "lifetime_pnl":          0.0,
+        "daily_pnl":             0.0,
+        "daily_pnl_date":        "",
+        "total_fills":           0,
+        "trade_history":         [],
+        "live_pnl":              None,
+        "position_side":         None,
+        "mark_price":            None,
+        "equity":                None,
+        "last_fill_check_ts":    0,
         "trading_enabled":       True,
         "paused_until":          0,
         "last_claude_analysis":  0,
@@ -141,86 +170,7 @@ def performance_summary(state):
     }
 
 
-# == MARKET HOURS ==============================================================
-
-def is_forex_market_open():
-    """
-    Forex is open 24 hours Mon-Fri.
-    Closes: Friday 22:00 UTC
-    Opens:  Sunday 22:00 UTC
-    """
-    now     = datetime.now(timezone.utc)
-    weekday = now.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
-
-    if weekday == 5:                              # Saturday - always closed
-        return False
-    if weekday == 6 and now.hour < 22:            # Sunday before 22:00 UTC
-        return False
-    if weekday == 4 and now.hour >= 22:           # Friday after 22:00 UTC
-        return False
-    return True
-
-
-# == LOT SIZING ================================================================
-
-def pip_value_usd(lot_size):
-    """
-    USD value of 1 pip move for given lot size.
-    For EURUSD: 1 pip = PIP_SIZE * LOT_UNIT_SIZE * lot_size USD
-    e.g. 0.01 lot -> 0.0001 * 100000 * 0.01 = $0.10 per pip
-    """
-    return PIP_SIZE * LOT_UNIT_SIZE * lot_size
-
-
-def calculate_lot_size(equity):
-    """
-    Dynamic lot sizing that protects the account:
-    - Risk RISK_PCT of equity (default 1%)
-    - Sized so a MAX_ADVERSE_PIPS move against us = risk_amount
-    - Automatically scales up as account grows, down if it shrinks
-
-    Example:
-      $10 equity  -> risk $0.10 -> 0.01 lots (min)
-      $100 equity -> risk $1.00 -> 0.10 lots
-      $500 equity -> risk $5.00 -> 0.50 lots
-    """
-    if not equity or equity <= 0:
-        return MIN_LOT
-
-    risk_amount          = equity * RISK_PCT
-    pip_value_per_std    = PIP_SIZE * LOT_UNIT_SIZE  # pip value for 1 standard lot (e.g. $10)
-    lot_size             = risk_amount / (MAX_ADVERSE_PIPS * pip_value_per_std)
-    lot_size             = max(MIN_LOT, min(round(lot_size, 2), MAX_LOT))
-    return lot_size
-
-
-# == BYBIT AUTH ================================================================
-
-def get_server_time():
-    r = requests.get("https://api.bybit.com/v3/public/time", timeout=5)
-    return str(int(float(r.json()["result"]["timeNano"]) / 1_000_000))
-
-def sign_get(query):
-    ts  = get_server_time()
-    sig = hmac.new(BYBIT_API_SECRET.encode(),
-                   (ts + BYBIT_API_KEY + "5000" + query).encode(),
-                   hashlib.sha256).hexdigest()
-    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000"}
-
-def sign_post(params):
-    ts   = get_server_time()
-    body = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
-    sig  = hmac.new(BYBIT_API_SECRET.encode(),
-                    (ts + BYBIT_API_KEY + "5000" + body).encode(),
-                    hashlib.sha256).hexdigest()
-    headers = {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts,
-               "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000",
-               "Content-Type": "application/json"}
-    return headers, body
-
-
-# == BYBIT API =================================================================
+# == TELEGRAM ==================================================================
 
 def send_telegram(msg):
     try:
@@ -232,197 +182,200 @@ def send_telegram(msg):
     except:
         pass
 
-_working_category = None
+
+# == MT5 MARKET DATA ===========================================================
 
 def get_price():
-    global _working_category
-    # Try configured category first, then fallbacks for TradFi compatibility
-    for cat in [_working_category or CATEGORY, "spot", "linear", "inverse"]:
-        if not cat:
-            continue
-        try:
-            r    = requests.get(
-                f"https://api.bybit.com/v5/market/tickers?category={cat}&symbol={SYMBOL}",
-                timeout=10)
-            data = r.json()
-            lst  = data.get("result", {}).get("list", [])
-            if lst and lst[0].get("lastPrice"):
-                _working_category = cat   # remember the working category
-                return float(lst[0]["lastPrice"])
-        except Exception:
-            continue
-    raise Exception(
-        f"Cannot get price for {SYMBOL}. "
-        f"Check SYMBOL is correct for Bybit TradFi (try EURUSD.s or EURUSD)."
-    )
+    mt5  = get_mt5()
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        raise Exception(f"No tick data for {SYMBOL}. Check symbol name in MT5 Market Watch.")
+    return (tick.ask + tick.bid) / 2.0   # mid price
+
 
 def get_candles(interval, limit=100):
-    for cat in [_working_category or CATEGORY, "spot", "linear", "inverse"]:
-        try:
-            r    = requests.get(
-                f"https://api.bybit.com/v5/market/kline?category={cat}"
-                f"&symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=10)
-            data = r.json()
-            lst  = data.get("result", {}).get("list", [])
-            if not lst:
-                continue
-            return [
-                {"open": float(c[1]), "high": float(c[2]),
-                 "low":  float(c[3]), "close": float(c[4]), "volume": float(c[5])}
-                for c in reversed(lst)
-            ]
-        except Exception:
-            continue
-    return []
+    try:
+        mt5 = get_mt5()
+        tf  = TF_MAP.get(str(interval), 16385)   # default H1
+        rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, limit)
+        if rates is None or len(rates) == 0:
+            return []
+        return [
+            {"open":  float(r["open"]),  "high": float(r["high"]),
+             "low":   float(r["low"]),   "close": float(r["close"])}
+            for r in rates
+        ]
+    except Exception as e:
+        print(f"[get_candles] {e}")
+        return []
+
 
 def get_wallet_equity_usdt():
-    for acct in [BYBIT_ACCOUNT_TYPE, "UNIFIED", "CONTRACT"]:
-        try:
-            query = f"accountType={acct}&coin=USDT"
-            r = requests.get(f"https://api.bybit.com/v5/account/wallet-balance?{query}",
-                             headers=sign_get(query), timeout=10)
-            data = r.json()
-            if data.get("retCode") != 0:
-                continue
-            items = data.get("result", {}).get("list", [])
-            if not items:
-                continue
-            for k in ("totalEquity", "totalWalletBalance"):
-                v = items[0].get(k)
-                if v not in (None, ""):
-                    try:
-                        eq = float(v)
-                        if eq >= 0:
-                            return eq
-                    except:
-                        pass
-        except:
-            pass
-    return None
+    try:
+        mt5  = get_mt5()
+        info = mt5.account_info()
+        if info is None:
+            return None
+        return float(info.equity)
+    except:
+        return None
+
 
 def get_position():
+    """Return first open position for SYMBOL, or None."""
     try:
-        query = f"category={CATEGORY}&symbol={SYMBOL}"
-        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}",
-                         headers=sign_get(query), timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0:
+        mt5       = get_mt5()
+        positions = mt5.positions_get(symbol=SYMBOL)
+        if not positions:
             return None
-        for pos in data.get("result", {}).get("list", []):
-            size = float(pos.get("size") or 0)
-            if size > 0:
-                return {
-                    "side":        pos.get("side"),
-                    "size":        size,
-                    "entry_price": float(pos.get("avgPrice") or 0),
-                    "mark_price":  float(pos.get("markPrice") or 0),
-                    "live_pnl":    float(pos.get("unrealisedPnl") or 0),
-                    "pos_idx":     int(pos.get("positionIdx", 0)),
-                }
-        return None
+        pos = positions[0]
+        return {
+            "side":        "Buy"  if pos.type == 0 else "Sell",
+            "size":        float(pos.volume),
+            "entry_price": float(pos.price_open),
+            "mark_price":  float(pos.price_current),
+            "live_pnl":    float(pos.profit),
+            "ticket":      int(pos.ticket),
+        }
     except Exception as e:
-        print(f"[position] {e}")
+        print(f"[get_position] {e}")
         return None
 
+
 def get_open_orders():
-    query = f"category={CATEGORY}&symbol={SYMBOL}&limit=50"
+    """Return all pending orders for SYMBOL placed by this bot."""
     try:
-        r = requests.get(f"https://api.bybit.com/v5/order/realtime?{query}",
-                         headers=sign_get(query), timeout=10)
-        return r.json().get("result", {}).get("list", [])
+        mt5    = get_mt5()
+        orders = mt5.orders_get(symbol=SYMBOL)
+        if not orders:
+            return []
+        return [o for o in orders if o.magic == MAGIC]
     except:
         return []
 
-def cancel_all_orders():
-    params = {"category": CATEGORY, "symbol": SYMBOL}
-    headers, body = sign_post(params)
-    try:
-        r = requests.post("https://api.bybit.com/v5/order/cancel-all",
-                          data=body, headers=headers, timeout=10)
-        return r.json()
-    except:
-        return {}
 
-def cancel_order(order_id):
-    params = {"category": CATEGORY, "symbol": SYMBOL, "orderId": order_id}
-    headers, body = sign_post(params)
-    try:
-        r = requests.post("https://api.bybit.com/v5/order/cancel",
-                          data=body, headers=headers, timeout=10)
-        return r.json()
-    except:
-        return {}
+# == MT5 ORDER EXECUTION =======================================================
 
-def place_limit_order(side, price, qty, pos_idx=None, reduce_only=False):
-    if pos_idx is None:
-        pos_idx = 1 if side == "Buy" else 2
-    params = {
-        "category":    CATEGORY,
-        "symbol":      SYMBOL,
-        "side":        side,
-        "orderType":   "Limit",
-        "qty":         str(round(qty, 2)),                       # lots: 2 decimal places
-        "price":       str(round(price, PRICE_DECIMALS)),        # forex: 5 decimal places
-        "positionIdx": pos_idx,
-        "timeInForce": "GTC",
-    }
-    if reduce_only:
-        params["reduceOnly"] = True
-    headers, body = sign_post(params)
+def calculate_lot_size(equity):
+    """
+    Risk RISK_PCT of equity; size so MAX_ADVERSE_PIPS adverse move = risk_amount.
+    $10  -> 0.01 lots (min) | $100 -> 0.10 lots | $1000 -> 1.00 lot
+    """
+    if not equity or equity <= 0:
+        return MIN_LOT
+    risk_amount       = equity * RISK_PCT
+    pip_value_std_lot = PIP_SIZE * 100_000   # $10 per pip for EURUSD 1 std lot
+    lot               = risk_amount / (MAX_ADVERSE_PIPS * pip_value_std_lot)
+    return max(MIN_LOT, min(round(lot, 2), MAX_LOT))
+
+
+def place_pending_order(order_type_str, entry_price, tp_price, lot_size):
+    """
+    Place a Buy Limit or Sell Limit with TP set directly on the order.
+    order_type_str: "buy_limit" or "sell_limit"
+    Returns: (success: bool, ticket: int or None, msg: str)
+    """
     try:
-        r = requests.post("https://api.bybit.com/v5/order/create",
-                          data=body, headers=headers, timeout=10)
-        return r.json()
+        mt5 = get_mt5()
+        if order_type_str == "sell_limit":
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+        else:
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+
+        request = {
+            "action":      mt5.TRADE_ACTION_PENDING,
+            "symbol":      SYMBOL,
+            "volume":      round(lot_size, 2),
+            "type":        order_type,
+            "price":       round(entry_price, PRICE_DECIMALS),
+            "tp":          round(tp_price,    PRICE_DECIMALS),
+            "deviation":   10,
+            "magic":       MAGIC,
+            "comment":     "master_pattern",
+            "type_time":   mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            msg = result.comment if result else "No response"
+            return False, None, msg
+        return True, int(result.order), "ok"
     except Exception as e:
-        return {"retCode": -1, "retMsg": str(e)}
+        return False, None, str(e)
 
-def close_position_market(pos_side, qty, pos_idx):
-    close_side = "Buy" if pos_side == "Sell" else "Sell"
-    params = {
-        "category":    CATEGORY,
-        "symbol":      SYMBOL,
-        "side":        close_side,
-        "orderType":   "Market",
-        "qty":         str(round(qty, 2)),
-        "positionIdx": pos_idx,
-        "reduceOnly":  True,
-    }
-    headers, body = sign_post(params)
+
+def cancel_order_by_ticket(ticket):
     try:
-        r = requests.post("https://api.bybit.com/v5/order/create",
-                          data=body, headers=headers, timeout=10)
-        return r.json()
+        mt5 = get_mt5()
+        request = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)}
+        mt5.order_send(request)
     except Exception as e:
-        return {"retCode": -1, "retMsg": str(e)}
+        print(f"[cancel_order] {e}")
+
+
+def cancel_all_bot_orders():
+    """Cancel all pending orders placed by this bot (matching MAGIC number)."""
+    try:
+        mt5    = get_mt5()
+        orders = mt5.orders_get(symbol=SYMBOL)
+        if not orders:
+            return
+        for o in orders:
+            if o.magic == MAGIC:
+                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                time.sleep(0.1)
+    except Exception as e:
+        print(f"[cancel_all] {e}")
+
 
 def close_all_positions():
+    """Market-close all open positions for SYMBOL."""
     try:
-        query = f"category={CATEGORY}&symbol={SYMBOL}"
-        r = requests.get(f"https://api.bybit.com/v5/position/list?{query}",
-                         headers=sign_get(query), timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0:
+        mt5       = get_mt5()
+        positions = mt5.positions_get(symbol=SYMBOL)
+        if not positions:
             return
-        for pos in data.get("result", {}).get("list", []):
-            size = float(pos.get("size") or 0)
-            if size <= 0:
-                continue
-            res = close_position_market(pos["side"], size, int(pos.get("positionIdx", 0)))
-            print(f"[close_all] {pos['side']} {size} lots -> {res.get('retCode')} {res.get('retMsg')}")
+        for pos in positions:
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if pos.type == 0:   # BUY position -> close with SELL
+                close_type  = mt5.ORDER_TYPE_SELL
+                close_price = tick.bid
+            else:               # SELL position -> close with BUY
+                close_type  = mt5.ORDER_TYPE_BUY
+                close_price = tick.ask
+
+            request = {
+                "action":      mt5.TRADE_ACTION_DEAL,
+                "symbol":      SYMBOL,
+                "volume":      float(pos.volume),
+                "type":        close_type,
+                "position":    pos.ticket,
+                "price":       close_price,
+                "deviation":   20,
+                "magic":       MAGIC,
+                "comment":     "emergency_close",
+                "type_time":   mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_RETURN,
+            }
+            mt5.order_send(request)
             time.sleep(0.2)
     except Exception as e:
         print(f"[close_all] {e}")
 
-def get_closed_pnl(start_time_ms=None):
+
+def get_closed_deals(since_ts=None):
+    """Return closed deals since since_ts (unix timestamp)."""
     try:
-        query = f"category={CATEGORY}&symbol={SYMBOL}&limit=50"
-        if start_time_ms:
-            query += f"&startTime={int(start_time_ms)}"
-        r = requests.get(f"https://api.bybit.com/v5/position/closed-pnl?{query}",
-                         headers=sign_get(query), timeout=10)
-        data = r.json()
-        return data.get("result", {}).get("list", []) if data.get("retCode") == 0 else []
-    except:
+        mt5       = get_mt5()
+        from_dt   = datetime.fromtimestamp(since_ts or (time.time() - 86400), tz=timezone.utc)
+        to_dt     = datetime.now(timezone.utc)
+        deals     = mt5.history_deals_get(from_dt, to_dt)
+        if deals is None:
+            return []
+        # DEAL_ENTRY_OUT = 1 means closing deal
+        return [d for d in deals if d.symbol == SYMBOL and d.entry == 1 and d.magic == MAGIC]
+    except Exception as e:
+        print(f"[closed_deals] {e}")
         return []
 
 
@@ -431,19 +384,19 @@ def get_closed_pnl(start_time_ms=None):
 def find_contraction_box(candles, lookback=40, window=5):
     """
     Find the tightest price range (contraction box) in recent candles.
-    Phase 1 of the master pattern - where smart money accumulates.
+    Phase 1 of the master pattern — where smart money accumulates.
     Returns: {high, low, avg, range, range_pct} or None
     """
     if len(candles) < window + 2:
         return None
-    recent    = candles[-min(lookback, len(candles)):]
-    best_range = float('inf')
-    best_high  = best_low = 0
+    recent     = candles[-min(lookback, len(candles)):]
+    best_range = float("inf")
+    best_high  = best_low = 0.0
 
     for i in range(len(recent) - window + 1):
         subset = recent[i:i + window]
-        hi  = max(c['high'] for c in subset)
-        lo  = min(c['low']  for c in subset)
+        hi  = max(c["high"] for c in subset)
+        lo  = min(c["low"]  for c in subset)
         rng = hi - lo
         if rng < best_range:
             best_range = rng
@@ -453,8 +406,8 @@ def find_contraction_box(candles, lookback=40, window=5):
     if best_high == 0:
         return None
 
-    avg       = (best_high + best_low) / 2
-    range_pct = (best_range / avg) * 100 if avg > 0 else 0
+    avg       = (best_high + best_low) / 2.0
+    range_pct = (best_range / avg) * 100.0 if avg > 0 else 0
 
     return {
         "high":      round(best_high, PRICE_DECIMALS),
@@ -467,9 +420,9 @@ def find_contraction_box(candles, lookback=40, window=5):
 
 def get_directional_bias(price):
     """
-    4H directional bias using master pattern average price.
-    Bias confirmed when SETTLE_CANDLES consecutive 4H closes settle above/below avg.
-    Returns: (bias, avg_price_4h, box_4h)
+    4H directional bias via master pattern average price.
+    Confirmed when SETTLE_CANDLES consecutive 4H closes settle above/below avg.
+    Returns: (bias, avg_4h, box_4h)   bias = "long" | "short" | "neutral"
     """
     candles = get_candles(BIAS_TF, 60)
     if len(candles) < 15:
@@ -489,16 +442,14 @@ def get_directional_bias(price):
         return "long", avg, box
     elif below >= SETTLE_CANDLES and price < avg:
         return "short", avg, box
-
     return "neutral", avg, box
 
 
 def get_entry_signal(bias, price):
     """
-    1H entry signal using master pattern.
-    Entry zone = when price is on the COUNTER-TREND side of 1H average price.
-    This is the expansion phase on the smaller timeframe.
-
+    1H entry signal.
+    Entry zone = price on COUNTER-TREND side of 1H average (pullback).
+    TP = 1H average (where price should return to).
     Returns: (signal, tp_price, avg_1h, box_1h)
     """
     candles = get_candles(ENTRY_TF, 60)
@@ -511,19 +462,15 @@ def get_entry_signal(bias, price):
 
     avg = box["avg"]
 
-    if bias == "short":
-        if price > avg:
-            tp         = avg
-            pip_dist   = (price - tp) / PIP_SIZE
-            if pip_dist >= MIN_TP_PIPS:
-                return True, round(tp, PRICE_DECIMALS), avg, box
+    if bias == "short" and price > avg:
+        pip_dist = (price - avg) / PIP_SIZE
+        if pip_dist >= MIN_TP_PIPS:
+            return True, round(avg, PRICE_DECIMALS), avg, box
 
-    elif bias == "long":
-        if price < avg:
-            tp         = avg
-            pip_dist   = (tp - price) / PIP_SIZE
-            if pip_dist >= MIN_TP_PIPS:
-                return True, round(tp, PRICE_DECIMALS), avg, box
+    elif bias == "long" and price < avg:
+        pip_dist = (avg - price) / PIP_SIZE
+        if pip_dist >= MIN_TP_PIPS:
+            return True, round(avg, PRICE_DECIMALS), avg, box
 
     return False, None, avg, box
 
@@ -532,77 +479,65 @@ def get_entry_signal(bias, price):
 
 def enter_trade(bias, price, tp_price, state):
     """
-    Enter a single position in the direction of the 4H bias.
-    - Lot size: calculated dynamically based on account equity (protects money)
-    - Entry: limit order ENTRY_OFFSET_PIPS from current price for better fill
-    - TP: limit order at 1H average price (no hard SL; exit on bias reversal)
+    Place a pending limit order with TP baked in.
+    Lot size is calculated dynamically from current equity.
     """
     equity   = get_wallet_equity_usdt() or 10.0
     lot_size = calculate_lot_size(equity)
-
-    pip_dist    = abs(price - tp_price) / PIP_SIZE
-    profit_est  = pip_dist * pip_value_usd(lot_size)
+    pip_dist = abs(price - tp_price) / PIP_SIZE
+    pip_val  = PIP_SIZE * 100_000 * lot_size   # USD per pip for this lot size
+    profit_est = pip_dist * pip_val
 
     if bias == "short":
-        entry_price = round(price + ENTRY_OFFSET_PIPS * PIP_SIZE, PRICE_DECIMALS)
-        pos_idx     = 2
-        tp_side     = "Buy"
+        entry_price  = round(price * (1 + ENTRY_OFFSET_PCT), PRICE_DECIMALS)
+        order_type   = "sell_limit"
     else:
-        entry_price = round(price - ENTRY_OFFSET_PIPS * PIP_SIZE, PRICE_DECIMALS)
-        pos_idx     = 1
-        tp_side     = "Sell"
+        entry_price  = round(price * (1 - ENTRY_OFFSET_PCT), PRICE_DECIMALS)
+        order_type   = "buy_limit"
 
-    # Place entry order
-    res = place_limit_order(
-        "Sell" if bias == "short" else "Buy",
-        entry_price, lot_size, pos_idx=pos_idx
-    )
-    if res.get("retCode") != 0:
-        send_telegram(f"Entry failed: {res.get('retMsg')}")
-        append_log("ENTRY_FAIL", {"bias": bias, "price": entry_price, "msg": res.get("retMsg")})
+    ok, ticket, msg = place_pending_order(order_type, entry_price, tp_price, lot_size)
+    if not ok:
+        send_telegram(f"Entry failed: {msg}")
+        append_log("ENTRY_FAIL", {"bias": bias, "price": entry_price, "msg": msg})
         return state
 
-    # Place TP order (reduce-only, closes when price returns to 1H avg)
-    tp_res = place_limit_order(tp_side, tp_price, lot_size, pos_idx=pos_idx, reduce_only=True)
-    tp_oid = tp_res["result"]["orderId"] if tp_res.get("retCode") == 0 else None
-
-    state["in_trade"]    = True
-    state["trade_side"]  = bias
-    state["entry_price"] = entry_price
-    state["tp_price"]    = tp_price
-    state["tp_order_id"] = tp_oid
-    state["lot_size"]    = lot_size
+    state["in_trade"]      = True
+    state["trade_side"]    = bias
+    state["entry_price"]   = entry_price
+    state["tp_price"]      = tp_price
+    state["entry_ticket"]  = ticket
+    state["lot_size"]      = lot_size
 
     send_telegram(
-        f"{'Short' if bias == 'short' else 'Long'} <b>TRADE ENTERED [{bias.upper()}]</b>\n"
+        f"{'📉' if bias == 'short' else '📈'} <b>ORDER PLACED [{bias.upper()}]</b>\n"
         f"Entry: {entry_price:.{PRICE_DECIMALS}f} | TP: {tp_price:.{PRICE_DECIMALS}f}\n"
-        f"TP distance: {pip_dist:.1f} pips | Est. profit: ~${profit_est:.2f}\n"
-        f"Lot size: {lot_size} (equity: ${equity:.2f}, risk: {RISK_PCT*100:.0f}%)\n"
+        f"Distance: {pip_dist:.1f} pips | Est. profit: ~${profit_est:.2f}\n"
+        f"Lots: {lot_size} | Equity: ${equity:.2f} | Risk: {RISK_PCT*100:.0f}%\n"
         f"Exit: TP fill OR 4H bias reversal"
     )
     append_log("ENTRY", {
         "bias": bias, "entry": entry_price, "tp": tp_price,
         "pips": round(pip_dist, 1), "profit_est": round(profit_est, 4),
-        "lots": lot_size, "equity": round(equity, 2)
+        "lots": lot_size, "equity": round(equity, 2), "ticket": ticket,
     })
     return state
 
 
 def exit_trade(state, reason, price):
-    """Close open position with a market order and cancel any open orders."""
-    cancel_all_orders()
+    """Cancel pending orders and close any open position."""
+    cancel_all_bot_orders()
     time.sleep(0.5)
     close_all_positions()
 
-    state["in_trade"]    = False
-    state["trade_side"]  = None
-    state["entry_price"] = None
-    state["tp_price"]    = None
-    state["tp_order_id"] = None
-    state["lot_size"]    = None
+    state["in_trade"]     = False
+    state["trade_side"]   = None
+    state["entry_price"]  = None
+    state["tp_price"]     = None
+    state["entry_ticket"] = None
+    state["lot_size"]     = None
 
     send_telegram(
-        f"TRADE CLOSED\n"
+        f"🚪 <b>TRADE CLOSED</b>\n"
         f"Reason: {reason}\n"
         f"Price: {price:.{PRICE_DECIMALS}f}"
     )
@@ -610,7 +545,7 @@ def exit_trade(state, reason, price):
     return state
 
 
-# == PnL & POSITION TRACKING ===================================================
+# == LIVE POSITION & PnL TRACKING ==============================================
 
 def update_live_position(state):
     pos = get_position()
@@ -623,21 +558,24 @@ def update_live_position(state):
         state["live_pnl"]      = 0.0
         state["position_side"] = None
         state["mark_price"]    = None
-        if state.get("in_trade"):
-            state["in_trade"]    = False
-            state["trade_side"]  = None
-            state["tp_order_id"] = None
+        # No position AND no pending order = TP was hit
+        orders = get_open_orders()
+        if state.get("in_trade") and not orders:
+            state["in_trade"]     = False
+            state["trade_side"]   = None
+            state["entry_ticket"] = None
     return state
 
-def update_fills_and_pnl(state):
-    now_ms         = int(time.time() * 1000)
-    last_check_ms  = int(state.get("last_fill_check") or 0)
-    if last_check_ms == 0:
-        last_check_ms = now_ms - 24 * 60 * 60 * 1000
 
-    fills = get_closed_pnl(start_time_ms=last_check_ms)
-    if not fills:
-        state["last_fill_check"] = now_ms
+def update_fills_and_pnl(state):
+    now_ts        = time.time()
+    last_check_ts = float(state.get("last_fill_check_ts") or 0)
+    if last_check_ts == 0:
+        last_check_ts = now_ts - 86400
+
+    deals = get_closed_deals(since_ts=last_check_ts)
+    state["last_fill_check_ts"] = now_ts
+    if not deals:
         return state
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -646,32 +584,29 @@ def update_fills_and_pnl(state):
         state["daily_pnl_date"] = today_str
 
     new_fills = 0
-    for fill in fills:
+    for deal in deals:
         try:
-            fill_ms    = int(fill.get("updatedTime") or fill.get("createdTime") or 0)
-            if fill_ms <= last_check_ms:
-                continue
-            closed_pnl = float(fill.get("closedPnl") or 0)
-            state["total_profit"]  = round(state.get("total_profit", 0) + closed_pnl, 6)
-            state["lifetime_pnl"]  = round(state.get("lifetime_pnl", 0) + closed_pnl, 6)
-            state["daily_pnl"]     = round(state.get("daily_pnl", 0) + closed_pnl, 6)
-            state["total_fills"]   = state.get("total_fills", 0) + 1
-            trade_record = {
-                "ts":      datetime.fromtimestamp(fill_ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "side":    fill.get("side"),
-                "qty":     float(fill.get("qty") or 0),
+            closed_pnl = float(deal.profit)
+            state["total_profit"] = round(state.get("total_profit", 0) + closed_pnl, 6)
+            state["lifetime_pnl"] = round(state.get("lifetime_pnl", 0) + closed_pnl, 6)
+            state["daily_pnl"]    = round(state.get("daily_pnl", 0) + closed_pnl, 6)
+            state["total_fills"]  = state.get("total_fills", 0) + 1
+            ts_str = datetime.fromtimestamp(deal.time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            record = {
+                "ts":      ts_str,
+                "side":    "Buy" if deal.type == 1 else "Sell",
+                "qty":     float(deal.volume),
                 "pnl":     round(closed_pnl, 6),
-                "exit_px": float(fill.get("avgExitPrice") or 0),
+                "exit_px": float(deal.price),
             }
             hist = state.get("trade_history") or []
-            hist.append(trade_record)
+            hist.append(record)
             state["trade_history"] = hist[-200:]
             new_fills += 1
-            append_log("FILL", trade_record)
+            append_log("FILL", record)
         except Exception as e:
             print(f"[fill] {e}")
 
-    state["last_fill_check"] = now_ms
     if new_fills:
         send_telegram(
             f"<b>{new_fills} fill(s)</b>\n"
@@ -683,15 +618,12 @@ def update_fills_and_pnl(state):
 # == STARTUP RECOVERY ==========================================================
 
 def recover_on_startup(state):
-    """
-    On restart: check for open positions and orders.
-    Restore trade state and place missing TP if needed.
-    """
-    open_orders = get_open_orders()
-    pos         = get_position()
+    """On restart, check for open position/orders and restore state."""
+    pos    = get_position()
+    orders = get_open_orders()
 
-    if not pos and not open_orders:
-        send_telegram("Startup: clean slate - no open positions or orders.")
+    if not pos and not orders:
+        send_telegram("Startup: clean slate — no open position or pending orders.")
         append_log("RECOVERY", {"result": "clean"})
         return state
 
@@ -701,44 +633,21 @@ def recover_on_startup(state):
         state["entry_price"]   = round(pos["entry_price"], PRICE_DECIMALS)
         state["trade_side"]    = "short" if pos["side"] == "Sell" else "long"
         state["live_pnl"]      = round(pos["live_pnl"], 4)
-
-        tp_exists = any(
-            o.get("reduceOnly") or o.get("side") != pos["side"]
-            for o in open_orders
+        send_telegram(
+            f"Recovery: open {pos['side']} position found\n"
+            f"Entry: {pos['entry_price']:.{PRICE_DECIMALS}f} | PnL: ${pos['live_pnl']:.2f}"
         )
-
-        if not tp_exists:
-            candles_1h = get_candles(ENTRY_TF, 60)
-            box_1h     = find_contraction_box(candles_1h, lookback=20, window=3) if candles_1h else None
-            if box_1h:
-                tp_price = box_1h["avg"]
-                tp_side  = "Buy" if pos["side"] == "Sell" else "Sell"
-                pos_idx  = 2 if pos["side"] == "Sell" else 1
-                equity   = get_wallet_equity_usdt() or 10.0
-                lot_size = calculate_lot_size(equity)
-                res      = place_limit_order(tp_side, tp_price, lot_size,
-                                             pos_idx=pos_idx, reduce_only=True)
-                if res.get("retCode") == 0:
-                    state["tp_order_id"] = res["result"]["orderId"]
-                    state["tp_price"]    = tp_price
-                    state["lot_size"]    = lot_size
-                    send_telegram(
-                        f"Recovery: TP placed\n"
-                        f"Open {pos['side']} @ {pos['entry_price']:.{PRICE_DECIMALS}f}\n"
-                        f"TP: {tp_price:.{PRICE_DECIMALS}f} (1H avg)"
-                    )
-                    append_log("RECOVERY_TP", {"entry": pos["entry_price"], "tp": tp_price})
-        else:
-            for o in open_orders:
-                if o.get("side") != pos["side"]:
-                    state["tp_order_id"] = o.get("orderId")
-                    state["tp_price"]    = float(o.get("price") or 0)
-                    break
-            send_telegram(
-                f"Recovery: trade restored\n"
-                f"Open {pos['side']} @ {pos['entry_price']:.{PRICE_DECIMALS}f}\n"
-                f"TP order found @ {state.get('tp_price', '?')}"
-            )
+    elif orders:
+        o = orders[0]
+        state["in_trade"]     = True
+        state["entry_ticket"] = o.ticket
+        state["entry_price"]  = round(o.price_open, PRICE_DECIMALS)
+        state["tp_price"]     = round(o.tp, PRICE_DECIMALS) if o.tp else None
+        state["trade_side"]   = "short" if o.type in (2, 4) else "long"
+        send_telegram(
+            f"Recovery: pending order found (ticket {o.ticket})\n"
+            f"Price: {o.price_open:.{PRICE_DECIMALS}f} | TP: {o.tp:.{PRICE_DECIMALS}f}"
+        )
 
     save_state(state)
     return state
@@ -746,20 +655,16 @@ def recover_on_startup(state):
 
 # == CLAUDE AI MARKET ANALYSIS =================================================
 
-def claude_market_analysis(price, bias_4h, avg_4h, box_4h, avg_1h, state):
-    """
-    Call Claude AI every 30 minutes to analyze the market and send a
-    short, actionable Telegram update based on current conditions.
-    """
-    if not anthropic or not ANTHROPIC_API_KEY:
+def claude_market_analysis(price, bias_4h, avg_4h, avg_1h, state):
+    if not _anthropic_lib or not ANTHROPIC_API_KEY:
         return
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = _anthropic_lib.Anthropic(api_key=ANTHROPIC_API_KEY)
         perf   = performance_summary(state)
         prompt = (
-            f"You are a concise forex trading analyst reviewing a Master Pattern bot on EURUSD.\n\n"
-            f"Current snapshot:\n"
-            f"- Price: {price:.5f}\n"
+            f"You are a concise forex analyst reviewing a Master Pattern bot on {SYMBOL}.\n\n"
+            f"Snapshot:\n"
+            f"- Price: {price:.{PRICE_DECIMALS}f}\n"
             f"- 4H Bias: {bias_4h}\n"
             f"- 4H Contraction avg (key level): {avg_4h}\n"
             f"- 1H Average: {avg_1h}\n"
@@ -767,12 +672,12 @@ def claude_market_analysis(price, bias_4h, avg_4h, box_4h, avg_1h, state):
             f"- Live PnL: ${state.get('live_pnl', 0):.2f}\n"
             f"- Daily PnL: ${state.get('daily_pnl', 0):.2f}\n"
             f"- Equity: ${state.get('equity', 0):.2f}\n"
-            f"- Win rate: {perf['winrate']}% ({perf['wins']}W / {perf['losses']}L)\n\n"
-            f"Give exactly 3 short lines:\n"
+            f"- Win rate: {perf['winrate']}% ({perf['wins']}W/{perf['losses']}L)\n\n"
+            f"Give exactly 3 lines:\n"
             f"1. Setup quality right now (valid / weak / wait)\n"
-            f"2. Key level to watch next\n"
-            f"3. One risk or thing to watch out for\n"
-            f"No fluff. Be direct."
+            f"2. Key level to watch\n"
+            f"3. One risk to be aware of\n"
+            f"Be direct. No fluff."
         )
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -781,7 +686,7 @@ def claude_market_analysis(price, bias_4h, avg_4h, box_4h, avg_1h, state):
         )
         analysis = response.content[0].text.strip()
         send_telegram(f"<b>AI (30min read)</b>\n{analysis}")
-        append_log("CLAUDE_ANALYSIS", {"price": price, "bias": bias_4h, "summary": analysis[:300]})
+        append_log("CLAUDE_ANALYSIS", {"price": price, "bias": bias_4h, "text": analysis[:300]})
     except Exception as e:
         print(f"[claude_analysis] {e}")
 
@@ -790,105 +695,99 @@ def claude_market_analysis(price, bias_4h, avg_4h, box_4h, avg_1h, state):
 
 def run_cycle():
     now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    price = get_price()
     state = load_state()
 
-    # Forex market hours guard
-    if not is_forex_market_open():
-        state["equity"] = get_wallet_equity_usdt()
-        save_state(state)
-        append_log("MARKET_CLOSED", {"time": now})
-        return  # Market closed, skip cycle silently
-
-    price = get_price()
-
-    # Refresh live data
     state["equity"] = get_wallet_equity_usdt()
     state["price"]  = price
     state = update_live_position(state)
     state = update_fills_and_pnl(state)
     save_state(state)
 
-    # Dashboard kill-switch
     if not state.get("trading_enabled", True):
-        send_telegram(f"Trading disabled. Price: {price:.{PRICE_DECIMALS}f}")
         return
 
     # == Emergency portfolio stop ==============================================
     live_pnl = state.get("live_pnl") or 0.0
     if live_pnl <= PORTFOLIO_STOPLOSS:
-        cancel_all_orders()
+        cancel_all_bot_orders()
         close_all_positions()
         state["in_trade"]        = False
         state["trading_enabled"] = False
         save_state(state)
         send_telegram(
-            f"EMERGENCY STOP\n"
+            f"🛑 <b>EMERGENCY STOP</b>\n"
             f"Live PnL ${live_pnl:.2f} <= ${PORTFOLIO_STOPLOSS:.2f}\n"
-            f"All positions closed. Re-enable from dashboard."
+            f"All closed. Re-enable from dashboard."
         )
         append_log("EMERGENCY_STOP", {"live_pnl": live_pnl, "price": price})
         return
 
-    # == 4H directional bias (master pattern) =================================
+    # == 4H directional bias ==================================================
     bias_4h, avg_4h, box_4h = get_directional_bias(price)
     state["bias_4h"]      = bias_4h
     state["avg_price_4h"] = avg_4h
 
-    # == Claude AI analysis every 30 minutes ==================================
+    # == Claude AI analysis every 30 min ======================================
     now_ts = time.time()
     if now_ts - state.get("last_claude_analysis", 0) >= CLAUDE_INTERVAL:
-        claude_market_analysis(
-            price, bias_4h, avg_4h, box_4h,
-            state.get("avg_price_1h"), state
-        )
+        claude_market_analysis(price, bias_4h, avg_4h, state.get("avg_price_1h"), state)
         state["last_claude_analysis"] = now_ts
 
-    # == If in a trade: check exit conditions =================================
+    # == In a trade: check exit conditions =====================================
     if state.get("in_trade"):
         trade_side = state.get("trade_side")
         pos        = get_position()
+        orders     = get_open_orders()
 
-        if not pos:
+        # TP hit: position gone and no more pending orders
+        if not pos and not orders:
             state["in_trade"]   = False
             state["trade_side"] = None
             save_state(state)
             send_telegram(
-                f"Position closed (TP hit or filled)\n"
-                f"Price: {price:.{PRICE_DECIMALS}f} | Daily PnL: ${state.get('daily_pnl', 0):.4f}"
+                f"✅ <b>Trade closed</b> (TP hit)\n"
+                f"Price: {price:.{PRICE_DECIMALS}f} | Daily: ${state.get('daily_pnl', 0):.4f}"
             )
             return
 
+        # Order filled (position open) — just holding
+        if pos and not orders:
+            state["entry_ticket"] = None   # no more pending order
+
+        # 4H bias reversed against our position
         bias_reversed = (
             (trade_side == "short" and bias_4h == "long") or
             (trade_side == "long"  and bias_4h == "short")
         )
-
         if bias_reversed:
             state = exit_trade(state, f"4H bias reversed to {bias_4h.upper()}", price)
             save_state(state)
             return
 
-        # Hold - report status
-        pips_from_entry = abs(price - (state.get("entry_price") or price)) / PIP_SIZE
+        pips_from_entry = (
+            abs(price - (state.get("entry_price") or price)) / PIP_SIZE
+        )
         send_telegram(
-            f"{'Short' if trade_side == 'short' else 'Long'} <b>HOLDING [{trade_side.upper()}]</b>\n"
+            f"{'📉' if trade_side == 'short' else '📈'} <b>HOLDING [{trade_side.upper()}]</b>\n"
             f"Entry: {state.get('entry_price', '?')} | TP: {state.get('tp_price', '?')}\n"
             f"Current: {price:.{PRICE_DECIMALS}f} | PnL: ${live_pnl:.4f}\n"
             f"Pips from entry: {pips_from_entry:.1f} | Lots: {state.get('lot_size', '?')}\n"
             f"4H bias: {bias_4h.upper()}"
         )
+        save_state(state)
         return
 
     # == Not in trade: look for entry =========================================
     if bias_4h == "neutral":
         send_telegram(
-            f"WAITING - 4H neutral, no bias yet\n"
+            f"⏳ WAITING — 4H neutral\n"
             f"Price: {price:.{PRICE_DECIMALS}f}"
             + (f" | 4H avg: {avg_4h:.{PRICE_DECIMALS}f}" if avg_4h else "")
         )
+        save_state(state)
         return
 
-    # Check 1H for entry signal
     signal, tp_price, avg_1h, box_1h = get_entry_signal(bias_4h, price)
     state["avg_price_1h"] = avg_1h
 
@@ -898,10 +797,10 @@ def run_cycle():
         direction = "below" if bias_4h == "short" else "above"
         avg_str   = f"{avg_1h:.{PRICE_DECIMALS}f}" if avg_1h else "N/A"
         send_telegram(
-            f"WATCHING [{bias_4h.upper()}]\n"
-            f"4H bias confirmed | Waiting for 1H expansion\n"
+            f"👀 WATCHING [{bias_4h.upper()}]\n"
+            f"4H bias confirmed | Waiting for 1H pullback\n"
             f"Price: {price:.{PRICE_DECIMALS}f} | 1H avg: {avg_str}\n"
-            f"Need price {direction} 1H avg to enter"
+            f"Need price {direction} 1H avg"
         )
 
     save_state(state)
@@ -912,11 +811,22 @@ def run_cycle():
 def run_loop():
     clear_stop()
     send_telegram(
-        f"<b>EURUSD Master Pattern Bot</b>\n"
-        f"Symbol: {SYMBOL} | Category: {CATEGORY}\n"
-        f"Risk: {RISK_PCT*100:.0f}% equity/trade | Max adverse: {MAX_ADVERSE_PIPS} pips\n"
-        f"Checking existing positions..."
+        f"<b>MT5 Master Pattern Bot</b>\n"
+        f"Symbol: {SYMBOL} | MT5: {MT5_HOST}:{MT5_PORT}\n"
+        f"Risk: {RISK_PCT*100:.0f}% equity/trade | Connecting..."
     )
+
+    # Wait for MT5 to be ready (give it up to 60s on cold start)
+    for attempt in range(12):
+        try:
+            get_mt5()
+            break
+        except Exception as e:
+            print(f"[startup] MT5 not ready yet ({attempt+1}/12): {e}")
+            time.sleep(5)
+    else:
+        send_telegram("MT5 connection failed after 60s. Check MT5 service and VNC login.")
+        return
 
     state = load_state()
     try:
@@ -926,17 +836,13 @@ def run_loop():
         append_log("RECOVERY_ERROR", {"error": str(e)})
 
     equity = get_wallet_equity_usdt() or 0
-    lot_example = calculate_lot_size(equity)
+    lots   = calculate_lot_size(equity)
     send_telegram(
         f"<b>Bot Ready</b>\n"
-        f"Equity: ${equity:.2f} | Starting lot size: {lot_example}\n"
-        f"4H bias TF: {BIAS_TF} | 1H entry TF: {ENTRY_TF}\n"
+        f"Equity: ${equity:.2f} | Starting lots: {lots}\n"
         f"Emergency stop: ${PORTFOLIO_STOPLOSS} | Exit: TP or 4H bias reversal"
     )
-    append_log("START", {
-        "symbol": SYMBOL, "risk_pct": RISK_PCT,
-        "bias_tf": BIAS_TF, "entry_tf": ENTRY_TF, "equity": equity
-    })
+    append_log("START", {"symbol": SYMBOL, "equity": equity, "risk_pct": RISK_PCT})
 
     while not is_stop_requested():
         try:
