@@ -57,7 +57,8 @@ BOX_WINDOW         = int(os.environ.get("BOX_WINDOW", "5"))            # candles
 SETTLE_CANDLES     = int(os.environ.get("SETTLE_CANDLES", "2"))        # 4H candles needed to confirm bias
 
 # Risk
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "300"))      # seconds between cycles
+CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "60"))       # seconds between cycles (1 min)
+CLAUDE_INTERVAL    = int(os.environ.get("CLAUDE_INTERVAL", "1800"))    # Claude AI analysis every 30 min
 PORTFOLIO_STOPLOSS = float(os.environ.get("PORTFOLIO_STOPLOSS", "-4.0"))  # emergency close all
 
 BYBIT_ACCOUNT_TYPE = os.environ.get("BYBIT_ACCOUNT_TYPE", "UNIFIED")
@@ -102,8 +103,9 @@ def load_state():
         "mark_price":       None,
         "equity":           None,
         "last_fill_check":  0,
-        "trading_enabled":  True,
-        "paused_until":     0,
+        "trading_enabled":       True,
+        "paused_until":          0,
+        "last_claude_analysis":  0,
     }
 
 def save_state(state):
@@ -230,27 +232,48 @@ def send_telegram(msg):
     except:
         pass
 
+_working_category = None
+
 def get_price():
-    r = requests.get(
-        f"https://api.bybit.com/v5/market/tickers?category={CATEGORY}&symbol={SYMBOL}",
-        timeout=10)
-    return float(r.json()["result"]["list"][0]["lastPrice"])
+    global _working_category
+    # Try configured category first, then fallbacks for TradFi compatibility
+    for cat in [_working_category or CATEGORY, "spot", "linear", "inverse"]:
+        if not cat:
+            continue
+        try:
+            r    = requests.get(
+                f"https://api.bybit.com/v5/market/tickers?category={cat}&symbol={SYMBOL}",
+                timeout=10)
+            data = r.json()
+            lst  = data.get("result", {}).get("list", [])
+            if lst and lst[0].get("lastPrice"):
+                _working_category = cat   # remember the working category
+                return float(lst[0]["lastPrice"])
+        except Exception:
+            continue
+    raise Exception(
+        f"Cannot get price for {SYMBOL}. "
+        f"Check SYMBOL is correct for Bybit TradFi (try EURUSD.s or EURUSD)."
+    )
 
 def get_candles(interval, limit=100):
-    try:
-        r = requests.get(
-            f"https://api.bybit.com/v5/market/kline?category={CATEGORY}"
-            f"&symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=10)
-        data = r.json()
-        if not data.get("result") or not data["result"].get("list"):
-            return []
-        return [
-            {"open": float(c[1]), "high": float(c[2]),
-             "low":  float(c[3]), "close": float(c[4]), "volume": float(c[5])}
-            for c in reversed(data["result"]["list"])
-        ]
-    except:
-        return []
+    for cat in [_working_category or CATEGORY, "spot", "linear", "inverse"]:
+        try:
+            r    = requests.get(
+                f"https://api.bybit.com/v5/market/kline?category={cat}"
+                f"&symbol={SYMBOL}&interval={interval}&limit={limit}", timeout=10)
+            data = r.json()
+            lst  = data.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            return [
+                {"open": float(c[1]), "high": float(c[2]),
+                 "low":  float(c[3]), "close": float(c[4]), "volume": float(c[5])}
+                for c in reversed(lst)
+            ]
+        except Exception:
+            continue
+    return []
 
 def get_wallet_equity_usdt():
     for acct in [BYBIT_ACCOUNT_TYPE, "UNIFIED", "CONTRACT"]:
@@ -721,6 +744,48 @@ def recover_on_startup(state):
     return state
 
 
+# == CLAUDE AI MARKET ANALYSIS =================================================
+
+def claude_market_analysis(price, bias_4h, avg_4h, box_4h, avg_1h, state):
+    """
+    Call Claude AI every 30 minutes to analyze the market and send a
+    short, actionable Telegram update based on current conditions.
+    """
+    if not anthropic or not ANTHROPIC_API_KEY:
+        return
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        perf   = performance_summary(state)
+        prompt = (
+            f"You are a concise forex trading analyst reviewing a Master Pattern bot on EURUSD.\n\n"
+            f"Current snapshot:\n"
+            f"- Price: {price:.5f}\n"
+            f"- 4H Bias: {bias_4h}\n"
+            f"- 4H Contraction avg (key level): {avg_4h}\n"
+            f"- 1H Average: {avg_1h}\n"
+            f"- In trade: {state.get('in_trade')} ({state.get('trade_side')})\n"
+            f"- Live PnL: ${state.get('live_pnl', 0):.2f}\n"
+            f"- Daily PnL: ${state.get('daily_pnl', 0):.2f}\n"
+            f"- Equity: ${state.get('equity', 0):.2f}\n"
+            f"- Win rate: {perf['winrate']}% ({perf['wins']}W / {perf['losses']}L)\n\n"
+            f"Give exactly 3 short lines:\n"
+            f"1. Setup quality right now (valid / weak / wait)\n"
+            f"2. Key level to watch next\n"
+            f"3. One risk or thing to watch out for\n"
+            f"No fluff. Be direct."
+        )
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        analysis = response.content[0].text.strip()
+        send_telegram(f"<b>AI (30min read)</b>\n{analysis}")
+        append_log("CLAUDE_ANALYSIS", {"price": price, "bias": bias_4h, "summary": analysis[:300]})
+    except Exception as e:
+        print(f"[claude_analysis] {e}")
+
+
 # == MAIN CYCLE ================================================================
 
 def run_cycle():
@@ -768,6 +833,15 @@ def run_cycle():
     bias_4h, avg_4h, box_4h = get_directional_bias(price)
     state["bias_4h"]      = bias_4h
     state["avg_price_4h"] = avg_4h
+
+    # == Claude AI analysis every 30 minutes ==================================
+    now_ts = time.time()
+    if now_ts - state.get("last_claude_analysis", 0) >= CLAUDE_INTERVAL:
+        claude_market_analysis(
+            price, bias_4h, avg_4h, box_4h,
+            state.get("avg_price_1h"), state
+        )
+        state["last_claude_analysis"] = now_ts
 
     # == If in a trade: check exit conditions =================================
     if state.get("in_trade"):
