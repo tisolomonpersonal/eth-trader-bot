@@ -16,7 +16,21 @@ from mt5linux import MetaTrader5 as MT5Client
 
 # ── Config from environment ───────────────────────────────────────────────────
 MT5_HOST         = os.environ.get("MT5_HOST", "localhost")
-MT5_PORT         = int(os.environ.get("MT5_PORT", "8001"))
+DEFAULT_MT5_PORT = 8001
+APP_PORT         = os.environ.get("PORT")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+MT5_PORT         = _env_int("MT5_PORT", DEFAULT_MT5_PORT)
 MT5_LOGIN        = int(os.environ.get("MT5_LOGIN", "0"))
 MT5_PASSWORD     = os.environ.get("MT5_PASSWORD", "")
 MT5_SERVER       = os.environ.get("MT5_SERVER", "")   # e.g. "ICMarkets-Demo"
@@ -69,6 +83,38 @@ def log(event: str, **kwargs):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def _validate_mt5_target() -> bool:
+    issues = []
+    app_port = _env_int("PORT", 0)
+
+    if MT5_HOST.endswith(".zeabur.internal") and MT5_PORT == 8080:
+        issues.append("MT5_PORT is 8080, which is usually the web app port on Zeabur, not the MT5 bridge port")
+
+    if app_port and MT5_PORT == app_port and MT5_HOST != "localhost":
+        issues.append("MT5_PORT matches PORT; do not reuse the web app port for the MT5 bridge")
+
+    if MT5_PORT <= 0:
+        issues.append("MT5_PORT must be a positive integer")
+
+    if issues:
+        log(
+            "mt5_config_invalid",
+            host=MT5_HOST,
+            port=MT5_PORT,
+            app_port=APP_PORT,
+            issues=issues,
+        )
+        return False
+
+    log(
+        "mt5_target_config",
+        host=MT5_HOST,
+        port=MT5_PORT,
+        app_port=APP_PORT,
+    )
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -456,6 +502,10 @@ def performance_summary(state: dict | None = None) -> dict:
 def run_loop():
     log("bot_started", symbol=SYMBOL, lot=TRADE_LOT,
         grid_step=GRID_STEP_USD, tp=TAKE_PROFIT_USD, sl=STOP_LOSS_USD)
+
+    if not _validate_mt5_target():
+        log("bot_stopped", reason="invalid_mt5_target")
+        return
 
     # Initial MT5 connection — retry until connected or stopped
     while not _stop_event.is_set():
