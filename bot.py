@@ -1,66 +1,53 @@
 import os
-import sys
 import json
+from flask import Flask, jsonify
 from pybit.unified_trading import HTTP
 
-def test_tradfi_positions():
-    print("=== BYBIT TRADFI API CONNECTIVITY TEST ===")
+app = Flask(__name__)
+
+@app.route('/')
+def check_tradfi_trades():
+    print("=== TRADFI POSITION LOG TRIGGERED ===")
     
-    # 1. Pull environment variables from Zeabur
     api_key = os.environ.get("BYBIT_API_KEY")
     api_secret = os.environ.get("BYBIT_API_SECRET")
     
     if not api_key or not api_secret:
-        print("❌ ERROR: Missing API credentials in environment variables.")
-        print("Please ensure BYBIT_API_KEY and BYBIT_API_SECRET are set in Zeabur.")
-        sys.exit(1)
-        
-    print("✅ Found API credentials. Initializing V5 session...")
+        return jsonify({"status": "error", "message": "Missing API credentials in Zeabur env"}), 400
 
     try:
-        # Initialize the standard V5 Unified client
-        session = HTTP(
-            testnet=False,
-            api_key=api_key,
-            api_secret=api_secret
-        )
+        # Initialize standard V5 client
+        session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
         
-        print("\n--- [TEST 1: Fetching Active TradFi Positions] ---")
-        # Bybit processes TradFi (Forex, Commodities, Stocks) inside the 'linear' engine
-        position_response = session.get_positions(
-            category="linear",
-            settleCoin="USDT"  # TradFi balances settle in USDT margin
-        )
-        
+        # Pull positions from the linear engine (where TradFi lives)
+        position_response = session.get_positions(category="linear", settleCoin="USDT")
         positions = position_response.get("result", {}).get("list", [])
         
-        # Filter for known TradFi suffixes (.s for zero-fee) or symbol types
-        # Common pairs: XAUUSD.s, EURUSD.s, GBPUSD.s, US30.s
+        # Filter for TradFi asset formats
         tradfi_positions = [p for p in positions if ".s" in p.get("symbol", "") or "USD" in p.get("symbol", "")]
+        
+        # Try to pull a live asset ticker to verify the connection works
+        ticker_response = session.get_tickers(category="linear", symbol="XAUUSD.s")
+        gold_price = ticker_response.get("result", {}).get("list", [{}])[0].get("lastPrice", "N/A")
 
-        if not tradfi_positions:
-            print("⚠️ No active TradFi positions found on this sub/main account.")
-            print("If you have open trades in the UI, they might be isolated to a non-API subaccount.")
-            print(f"Total raw linear positions found: {len(positions)}")
-        else:
-            print(f"🎉 Success! Found {len(tradfi_positions)} TradFi positions:")
-            print(json.dumps(tradfi_positions, indent=2))
-
-        print("\n--- [TEST 2: Connectivity Check via Gold Ticker] ---")
-        ticker_response = session.get_tickers(
-            category="linear",
-            symbol="XAUUSD.s"
-        )
-        gold_price = ticker_response.get("result", {}).get("list", [{}])[0].get("lastPrice")
-        print(f"✅ Connection verified. Live Gold (XAUUSD.s) Price: ${gold_price}")
+        log_data = {
+            "status": "connected",
+            "live_gold_price": gold_price,
+            "total_raw_linear_positions": len(positions),
+            "tradfi_positions": tradfi_positions
+        }
+        
+        # This will print to your Zeabur runtime logs
+        print("RESULT TO LOG:", json.dumps(log_data, indent=2))
+        
+        # This will display directly on your screen if you visit the URL
+        return jsonify(log_data)
 
     except Exception as e:
-        print("\n❌ API Call Failed!")
-        print(f"Exception Type: {type(e).__name__}")
-        print(f"Error Details: {str(e)}")
-        print("\nPossible root causes:")
-        print("1. Your API key lacks 'Contract/Derivatives' read/write permissions.")
-        print("2. Your TradFi funds are in a distinct sub-account whose keys you haven't linked.")
+        error_msg = f"API call failed: {str(e)}"
+        print(f"❌ {error_msg}")
+        return jsonify({"status": "api_error", "details": error_msg}), 500
 
 if __name__ == "__main__":
-    test_tradfi_positions()
+    # Fallback for local testing
+    app.run(host="0.0.0.0", port=8080)
