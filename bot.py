@@ -5,6 +5,22 @@ from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
+# --- Zeabur Lifecycle Compatibility Patches ---
+def clear_stop():
+    """Exposed for Zeabur startup thread management to prevent attribute errors."""
+    print("🔄 Zeabur lifecycle hook: clear_stop called.")
+    return True
+
+# If the runner tries to access 'bot.clear_stop' as a variable or property
+class ClearStopMock:
+    def __call__(self): return True
+    def __str__(self): return "mock"
+
+# Ensuring it exists as both a function and an attribute if needed
+clear_stop = clear_stop
+
+# ---------------------------------------------
+
 @app.route('/')
 def check_tradfi_trades():
     print("=== TRADFI POSITION LOG TRIGGERED ===")
@@ -37,10 +53,7 @@ def check_tradfi_trades():
             "tradfi_positions": tradfi_positions
         }
         
-        # This will print to your Zeabur runtime logs
         print("RESULT TO LOG:", json.dumps(log_data, indent=2))
-        
-        # This will display directly on your screen if you visit the URL
         return jsonify(log_data)
 
     except Exception as e:
@@ -49,5 +62,4 @@ def check_tradfi_trades():
         return jsonify({"status": "api_error", "details": error_msg}), 500
 
 if __name__ == "__main__":
-    # Fallback for local testing
     app.run(host="0.0.0.0", port=8080)
