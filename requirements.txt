@@ -3,3 +3,6 @@ gunicorn>=21.2.0
 mt5linux>=0.1.6
 anthropic>=0.25.0
 requests>=2.31.0
+yfinance>=0.2.40
+feedparser>=6.0.11
+APScheduler>=3.10.4
