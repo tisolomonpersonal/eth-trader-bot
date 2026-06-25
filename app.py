@@ -109,6 +109,7 @@ if APS_AVAILABLE:
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=120,
+            next_run_time=datetime.now(),  # run immediately on startup, then every N hours
         )
         _scanner_scheduler.start()
         print(f"[app] Market scanner scheduled every {_SCAN_INTERVAL_HOURS}h")
