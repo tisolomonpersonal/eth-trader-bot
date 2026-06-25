@@ -1,0 +1,40 @@
+# zeabur.yaml — Multi-service deployment configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Two services in one Zeabur project:
+#   1. bot-app   — Flask web app + trading bot + scanner (existing)
+#   2. mt5-server — MetaTrader5 terminal + mt5linux RPC bridge (new)
+#
+# The bot-app connects to mt5-server via Zeabur internal DNS:
+#   MT5_HOST = mt5-server.zeabur.internal
+#   MT5_PORT = 8001
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── 1. Flask trading bot ───────────────────────────────────────────────────
+  - name: bot-app
+    domainPrefix: eth-bot          # public URL: eth-bot.zeabur.app
+    buildType: NIXPACKS            # Zeabur auto-detects Python from Procfile
+    # Required environment variables (set in Zeabur dashboard → Variables):
+    #   MT5_HOST         = mt5-server.zeabur.internal
+    #   MT5_PORT         = 8001
+    #   MT5_LOGIN        = <your broker account number>
+    #   MT5_PASSWORD     = <your broker password>
+    #   MT5_SERVER       = <broker server name, e.g. ICMarkets-Demo>
+    #   TELEGRAM_BOT_TOKEN = <your Telegram bot token>
+    #   TELEGRAM_CHAT_ID   = <your Telegram chat ID>
+    #   TRADE_SYMBOL     = ETHUSD
+    #   TRADE_LOT        = 0.01
+    #   ANTHROPIC_API_KEY or OPENAI_API_KEY or GROQ_API_KEY (for AI scanner)
+
+  # ── 2. MT5 RPC server (Wine + MetaTrader5 terminal) ───────────────────────
+  - name: mt5-server
+    domainPrefix: ~                # internal only — no public domain needed
+    buildType: DOCKER
+    dockerfilePath: mt5-server/Dockerfile
+    # Required environment variables (set in Zeabur dashboard → Variables):
+    #   MT5_PORT = 8001            (default, change if needed)
+    #   VNC_PASSWORD = <optional>  (set to enable VNC remote desktop on port 5900)
+    # Persistent volume (so Wine prefix & MT5 terminal survive redeploys):
+    volumes:
+      - mountPath: /root/.wine
+        name: wine-prefix
