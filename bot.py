@@ -507,12 +507,20 @@ def run_loop():
         log("bot_stopped", reason="invalid_mt5_target")
         return
 
-    # Initial MT5 connection — retry until connected or stopped
+    # Initial MT5 connection — retry with exponential backoff until connected or stopped
+    _retry_delay = 15
+    _retry_max   = 300  # cap at 5 minutes between retries
+    _retry_count = 0
     while not _stop_event.is_set():
         if _ensure_mt5():
             break
-        log("waiting_for_mt5", host=MT5_HOST, port=MT5_PORT)
-        time.sleep(15)
+        _retry_count += 1
+        # Only log every 4th attempt after the first minute to reduce noise
+        if _retry_count <= 4 or _retry_count % 4 == 0:
+            log("waiting_for_mt5", host=MT5_HOST, port=MT5_PORT,
+                retry=_retry_count, next_retry_s=_retry_delay)
+        _stop_event.wait(_retry_delay)
+        _retry_delay = min(_retry_delay * 2, _retry_max)
 
     _bias_tick = 0
 
