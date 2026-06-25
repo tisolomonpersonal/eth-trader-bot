@@ -1,32 +1,42 @@
 # mt5-server/Dockerfile
 # ─────────────────────────────────────────────────────────────────────────────
-# Runs MetaTrader5 terminal + mt5linux XML-RPC bridge under Wine on Linux.
-# Deploy this as a separate "mt5-server" service on Zeabur.
+# Runs MetaTrader5 terminal under Wine on Linux for Zeabur.
+#
+# Key pieces:
+#   • WineHQ stable (win64)
+#   • Xvfb virtual display
+#   • winetricks → installs vcrun2019 + dotnet48 (required by MT5 terminal)
+#   • Python 3.10 for Windows inside Wine
+#   • MetaTrader5 Python package + mt5linux inside Wine Python
+#   • MT5 terminal auto-login via start.ini (reads MT5_LOGIN/PASSWORD/SERVER)
+#   • mt5linux XML-RPC bridge on port 8001
+#
 # The Flask bot connects via Zeabur internal DNS:
-#   MT5_HOST=mt5-server.zeabur.internal   MT5_PORT=8001
+#   MT5_HOST = mt5-server.zeabur.internal   MT5_PORT = 8001
 # ─────────────────────────────────────────────────────────────────────────────
 FROM ubuntu:22.04
 
-LABEL maintainer="eth-trader-bot"
-LABEL description="MetaTrader5 under Wine — mt5linux RPC server for Zeabur"
+LABEL description="MetaTrader5 under Wine — mt5linux RPC server"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV DISPLAY=:99
 ENV MT5_PORT=8001
-# Wine screen size for the virtual display
-ENV SCREEN_RESOLUTION=1024x768x24
+ENV SCREEN_RES=1024x768x24
 
-# ── 1. System packages ────────────────────────────────────────────────────────
+# ── 1. WineHQ stable + all dependencies ──────────────────────────────────────
 RUN dpkg --add-architecture i386 \
  && apt-get update -qq \
  && apt-get install -y --no-install-recommends \
         ca-certificates gnupg2 wget curl software-properties-common \
-        xvfb x11vnc xdotool \
+        # virtual display
+        xvfb x11vnc \
+        # winetricks runtime deps
+        cabextract unzip p7zip-full zenity \
+        # general utils
         python3 python3-pip \
-        cabextract unzip p7zip-full \
-        supervisor procps net-tools \
+        procps net-tools supervisor \
  && wget -qO /usr/share/keyrings/winehq.gpg \
         "https://dl.winehq.org/wine-builds/winehq.key" \
  && echo "deb [signed-by=/usr/share/keyrings/winehq.gpg] \
@@ -36,13 +46,15 @@ RUN dpkg --add-architecture i386 \
  && apt-get install -y --install-recommends winehq-stable \
  && rm -rf /var/lib/apt/lists/*
 
-# ── 2. Host-side Python tools (healthcheck helper, log relay) ─────────────────
-RUN pip3 install --quiet requests
+# ── 2. winetricks (latest) ────────────────────────────────────────────────────
+RUN wget -q "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks" \
+        -O /usr/local/bin/winetricks \
+ && chmod +x /usr/local/bin/winetricks
 
-# ── 3. Pre-download Windows installers (build-time cache → fast restarts) ────
+# ── 3. Pre-download Windows installers at build time ─────────────────────────
 RUN mkdir -p /opt/mt5-setup
 
-# Python 3.10 for Windows x64 — needed for MetaTrader5 pip package
+# Python 3.10 for Windows x64 (needed by MetaTrader5 pip package)
 RUN wget -q \
     "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe" \
     -O /opt/mt5-setup/python-win.exe
@@ -52,19 +64,19 @@ RUN wget -q \
     "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" \
     -O /opt/mt5-setup/mt5setup.exe
 
-# ── 4. Copy runtime scripts ───────────────────────────────────────────────────
+# ── 4. Runtime scripts ────────────────────────────────────────────────────────
 WORKDIR /app
-COPY entrypoint.sh       /app/entrypoint.sh
-COPY supervisord.conf    /app/supervisord.conf
-COPY healthcheck.py      /app/healthcheck.py
-RUN chmod +x /app/entrypoint.sh
+COPY entrypoint.sh    /app/entrypoint.sh
+COPY healthcheck.py   /app/healthcheck.py
+COPY make-start-ini.sh /app/make-start-ini.sh
+RUN chmod +x /app/entrypoint.sh /app/make-start-ini.sh
 
 # ── 5. Ports ──────────────────────────────────────────────────────────────────
-# 8001 — mt5linux XML-RPC bridge (internal to Zeabur)
-# 5900 — VNC (optional; expose only if you need remote desktop access)
+# 8001 — mt5linux XML-RPC bridge (internal Zeabur service)
+# 5900 — VNC remote desktop (set VNC_PASSWORD env var to enable)
 EXPOSE 8001 5900
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
     CMD python3 /app/healthcheck.py
 
 ENTRYPOINT ["/app/entrypoint.sh"]

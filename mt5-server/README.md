@@ -1,77 +1,97 @@
 # mt5-server — MetaTrader5 on Zeabur (Wine)
 
-Runs MetaTrader5 terminal + the `mt5linux` XML-RPC bridge inside a Docker container on Zeabur.  
-The Flask trading bot (`bot-app`) connects to this service via Zeabur's internal private network.
+Runs MetaTrader5 terminal under Wine on Linux as a Zeabur Docker service.
+The Flask trading bot connects to it via Zeabur's private internal network.
 
-## Architecture
+## How it works
 
 ```
-Zeabur Project
-├── bot-app (Flask + gunicorn)          ← public URL
-│     └── connects to mt5-server:8001
-└── mt5-server (Docker / Wine)          ← internal only
-      ├── Xvfb (virtual display)
-      ├── MetaTrader5 terminal (Wine)
-      └── mt5linux XML-RPC bridge :8001
+Container boot sequence
+─────────────────────────────────────────────────────────
+1. Xvfb          — virtual display so Wine/MT5 has a screen
+2. wineboot      — initialise the Wine Windows environment
+3. winetricks    — install vcrun2019 (Visual C++ 2019) + dotnet48
+                   ← this is the "small Windows" step:
+                      these are the Windows DLLs MT5 needs to run
+4. Wine Python   — install Python 3.10 for Windows inside Wine
+5. pip (Wine)    — MetaTrader5 + mt5linux packages
+6. mt5setup.exe  — install MT5 terminal inside Wine
+7. start.ini     — auto-login config (reads MT5_LOGIN/PASSWORD/SERVER)
+8. terminal64.exe— MT5 terminal launches and auto-logs in to broker
+9. mt5linux RPC  — XML-RPC bridge on port 8001 → Flask bot connects here
 ```
 
-## Deploy on Zeabur (step by step)
+> **First cold start takes 5–10 minutes** because steps 2–6 only run once.
+> After that Wine prefix is persisted on a Zeabur volume — restarts take < 30 s.
 
-### 1. Add the mt5-server service
+## Deploy on Zeabur
 
-1. Open your Zeabur project → **Add Service** → **Git** → select your repo
+### Step 1 — Add the mt5-server service
+
+1. Zeabur dashboard → **Add Service** → **Git** → select your repo
 2. Set **Root Directory** to `mt5-server`
-3. Zeabur auto-detects the `Dockerfile` — click **Deploy**
+3. Zeabur detects the `Dockerfile` → click **Deploy**
 
-### 2. Set environment variables on mt5-server
+### Step 2 — Add a persistent volume
 
-| Variable | Value |
-|---|---|
-| `MT5_PORT` | `8001` |
-| `VNC_PASSWORD` | *(optional — enables VNC remote desktop on port 5900)* |
+Zeabur dashboard → mt5-server → **Storage** → Add Volume
+- Mount path: `/root/.wine`
+- Name: `wine-prefix`
 
-### 3. Set environment variables on bot-app
+This keeps the Wine prefix (and MT5 terminal installation) across redeploys.
+
+### Step 3 — Set environment variables on mt5-server
+
+| Variable | Value | Required |
+|---|---|---|
+| `MT5_PORT` | `8001` | Yes |
+| `MT5_LOGIN` | your broker account number | Yes (for auto-login) |
+| `MT5_PASSWORD` | your broker account password | Yes (for auto-login) |
+| `MT5_SERVER` | broker server name e.g. `ICMarkets-Demo` | Yes (for auto-login) |
+| `VNC_PASSWORD` | any string | No — enables VNC remote desktop |
+
+### Step 4 — Set environment variables on bot-app
 
 | Variable | Value |
 |---|---|
 | `MT5_HOST` | `mt5-server.zeabur.internal` |
 | `MT5_PORT` | `8001` |
-| `MT5_LOGIN` | Your broker account number |
-| `MT5_PASSWORD` | Your broker password |
-| `MT5_SERVER` | Your broker server name (e.g. `ICMarkets-Demo`) |
 
-> `mt5-server.zeabur.internal` is Zeabur's private DNS — it only works between services in the same project. No public port exposure needed.
+`mt5-server.zeabur.internal` is Zeabur's private DNS — only works between services in the same project. No public exposure needed.
 
-### 4. First-run time
+## What winetricks installs (the "small Windows")
 
-The first cold start takes **3–5 minutes** because:
-- Wine prefix is initialised
-- Python 3.10 for Windows is installed inside Wine
-- MetaTrader5 Python package is installed in Wine Python
-- MT5 terminal (`mt5setup.exe`) is installed
+| Component | Why MT5 needs it |
+|---|---|
+| `vcrun2019` | Visual C++ 2019 runtime — MT5 terminal is compiled with MSVC 2019; without this DLL it crashes silently on launch |
+| `dotnet48` | .NET Framework 4.8 — used by MT5's internal update and scripting components |
 
-Subsequent restarts are **under 30 seconds** because the Wine prefix is persisted on a Zeabur volume (`/root/.wine`).
+These are the minimal Windows DLLs MT5 requires. `winetricks` downloads and installs them automatically on first boot.
 
-## Persistent volume
+## Auto-login (start.ini)
 
-Mount `/root/.wine` as a persistent volume in Zeabur so the Wine prefix (and MT5 terminal installation) survive redeploys.
-
-Zeabur dashboard → mt5-server → **Storage** → Add Volume → path `/root/.wine`
+When `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER` are set, the container writes a `start.ini` file inside the MT5 directory before launching the terminal. MT5 reads this on startup and automatically connects to your broker — no manual clicking required.
 
 ## VNC remote desktop (optional)
 
-Set `VNC_PASSWORD=yourpassword` on the mt5-server service, then expose port **5900** in Zeabur.  
-Connect with any VNC client to see the MT5 terminal desktop.
+Set `VNC_PASSWORD=anything` on the mt5-server service in Zeabur, then expose port **5900**.
+Connect with any VNC viewer (e.g. RealVNC, TigerVNC) to see the live MT5 terminal desktop.
 
-## Healthcheck
+## Architecture
 
-The container runs `healthcheck.py` every 30 s — it checks that port 8001 is accepting TCP connections. Zeabur shows the service as healthy once the RPC bridge is up.
-
-## Environment variables reference
-
-| Variable | Default | Description |
-|---|---|---|
-| `MT5_PORT` | `8001` | XML-RPC port the bridge listens on |
-| `SCREEN_RESOLUTION` | `1024x768x24` | Xvfb display resolution |
-| `VNC_PASSWORD` | *(unset)* | Set to enable VNC on port 5900 |
-| `WINEPREFIX` | `/root/.wine` | Wine prefix directory (should be a volume) |
+```
+Zeabur Project
+│
+├── bot-app (Flask + gunicorn)            ← public URL (eth-bot.zeabur.app)
+│     bot.py → mt5linux client
+│          └── connects to port 8001 ──────────────────┐
+│                                                       │
+└── mt5-server (Docker)                                 │
+      ├── Xvfb :99 (virtual display)                   │
+      ├── Wine64 prefix (/root/.wine persistent vol)   │
+      │     ├── vcrun2019 + dotnet48 (winetricks)      │
+      │     ├── Python 3.10 for Windows                │
+      │     │     └── MetaTrader5 + mt5linux pip pkgs  │
+      │     └── MetaTrader5 terminal (auto-login)      │
+      └── mt5linux RPC bridge 0.0.0.0:8001 ←──────────┘
+```
