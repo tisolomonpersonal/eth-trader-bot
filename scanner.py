@@ -777,30 +777,51 @@ def run_scan() -> dict:
     ai_signals, outlook = _call_ai_analysis(all_assets, news)
     is_ai = bool(ai_signals)
 
+    # ── Back-fill zero prices from technical signals ───────────────────────────
+    # Small local models (Ollama 3B) often return entry/SL/TP as 0 because they
+    # don't compute prices. Fill them in from pre-calculated technical values.
+    if ai_signals:
+        sym_lookup  = {a["symbol"].upper(): a for a in all_assets}
+        name_lookup = {a["asset"].upper(): a  for a in all_assets}
+        for sig in ai_signals:
+            e  = float(sig.get("entry",      0) or 0)
+            sl = float(sig.get("stop_loss",  0) or 0)
+            tp = float(sig.get("take_profit",0) or 0)
+            if e == 0 or sl == 0 or tp == 0:
+                key   = sig.get("symbol", "").upper()
+                aname = sig.get("asset",  "").upper()
+                asset = sym_lookup.get(key) or name_lookup.get(aname)
+                if asset:
+                    tech = asset["signals"]
+                    if e  == 0: sig["entry"]       = tech["entry"]
+                    if sl == 0: sig["stop_loss"]   = tech["sl"]
+                    if tp == 0: sig["take_profit"]  = tech["tp"]
+                    # Copy RSI/MACD/BB for display
+                    sig.setdefault("rsi",       tech.get("rsi"))
+                    sig.setdefault("macd_hist", tech.get("macd_hist"))
+                    sig.setdefault("bb_pos",    tech.get("bb_pos"))
+                    sig.setdefault("confidence",tech.get("confidence", "MEDIUM"))
+
+    # ── Technical fallback when AI is unavailable ─────────────────────────────
     if not ai_signals:
         print("[scanner] AI unavailable — generating technical signals (RSI/MACD/BB)")
-        # Sort by absolute score strength — highest conviction first
         sorted_assets = sorted(
             all_assets,
             key=lambda x: abs(x["signals"].get("score", 0)),
             reverse=True,
         )
-        # Pick top 3 from different categories for diversification
-        seen_cats, ai_signals = set(), []
+        seen_cats, tech_signals = set(), []
         for a in sorted_assets:
             cat = a["category"]
             s   = a["signals"]
-            # Skip very low confidence in fallback
-            if abs(s.get("score", 0)) < 2 and len(ai_signals) >= 2:
-                continue
-            if cat not in seen_cats or len(ai_signals) < 3:
+            if cat not in seen_cats or len(tech_signals) < 3:
                 seen_cats.add(cat)
                 reasons_text = ". ".join(s.get("technical_reasons", []))
-                ai_signals.append({
-                    "rank":        len(ai_signals) + 1,
+                tech_signals.append({
+                    "rank":        len(tech_signals) + 1,
                     "asset":       a["asset"],
                     "symbol":      a["symbol"],
-                    "category":    a["category"],
+                    "category":    cat,
                     "direction":   s["direction"],
                     "entry":       s["entry"],
                     "stop_loss":   s["sl"],
@@ -808,26 +829,66 @@ def run_scan() -> dict:
                     "rr_ratio":    "1:2",
                     "confidence":  s["confidence"],
                     "reasoning":   reasons_text or "No strong technical signal detected.",
-                    # Pass through indicator values for display
                     "rsi":         s.get("rsi"),
                     "macd_hist":   s.get("macd_hist"),
                     "bb_pos":      s.get("bb_pos"),
                 })
-            if len(ai_signals) == 3:
+            if len(tech_signals) == 3:
                 break
+        ai_signals = tech_signals
         outlook = (
-            "Technical-only scan: AI provider not configured. "
-            "Signals generated from RSI(14), MACD(12,26,9), and Bollinger Bands(20) "
-            "computed from 60 days of real price history."
+            "Technical-only scan (RSI/MACD/Bollinger Bands, 60-day history). "
+            "Set OLLAMA_HOST or an AI API key for full AI analysis."
         )
 
-    if ai_signals:
-        _send_telegram(_format_summary(ai_signals, outlook, is_ai=is_ai))
-        time.sleep(1)
-        for i, sig in enumerate(ai_signals, 1):
-            sig["rank"] = i
-            _send_telegram(_format_signal(sig, i, len(ai_signals)))
-            time.sleep(0.6)
+    # ── No-trade filter ───────────────────────────────────────────────────────
+    # If every signal is LOW conviction (score < 3), markets are choppy/neutral.
+    # Send an informative "no trade" message instead of weak signals.
+    NO_TRADE_THRESHOLD = 3
+    best_score = max(
+        (abs(a["signals"].get("score", 0)) for a in all_assets),
+        default=0,
+    )
+    if best_score < NO_TRADE_THRESHOLD:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        # Collect the reason why each top asset doesn't qualify
+        top5 = sorted(all_assets, key=lambda x: abs(x["signals"].get("score", 0)), reverse=True)[:5]
+        reasons = []
+        for a in top5:
+            s = a["signals"]
+            reasons.append(
+                f"• {a['asset']}: RSI {s.get('rsi','?')} (neutral), "
+                f"MACD hist {s.get('macd_hist',0):+.6f} (flat), "
+                f"BB pos {round((s.get('bb_pos',0.5))*100)}% (mid-range)"
+            )
+        no_trade_msg = (
+            f"🔍 <b>SCAN — {now_str}</b>\n"
+            f"{'━'*32}\n"
+            f"⏸ <b>NO TRADE — Markets are neutral</b>\n\n"
+            f"No asset has a high-conviction setup right now.\n"
+            f"All RSI readings are between 40-60, MACD histograms are flat, "
+            f"and prices are mid-Bollinger-Band. Waiting for a clearer setup.\n\n"
+            f"<b>Top 5 assets checked:</b>\n"
+            + "\n".join(reasons) +
+            f"\n\n<i>Next scan in 30 min. No action needed.</i>"
+        )
+        _send_telegram(no_trade_msg)
+        elapsed = round(time.time() - t0, 1)
+        print(f"[scanner] Done in {elapsed}s — no trade (best score={best_score})")
+        return {
+            "status": "no_trade", "reason": "all signals below threshold",
+            "best_score": best_score, "threshold": NO_TRADE_THRESHOLD,
+            "assets_scanned": len(all_assets), "elapsed_seconds": elapsed,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ── Send signals to Telegram ──────────────────────────────────────────────
+    _send_telegram(_format_summary(ai_signals, outlook, is_ai=is_ai))
+    time.sleep(1)
+    for i, sig in enumerate(ai_signals, 1):
+        sig["rank"] = i
+        _send_telegram(_format_signal(sig, i, len(ai_signals)))
+        time.sleep(0.6)
 
     elapsed = round(time.time() - t0, 1)
     print(f"[scanner] Done in {elapsed}s — {len(ai_signals)} signals sent to Telegram")
