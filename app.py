@@ -85,8 +85,8 @@ except Exception as _e:
 _last_scan_result = {}
 _scan_lock = threading.Lock()
 
-# How often to auto-scan (default: every 4 hours; override with SCAN_INTERVAL_HOURS env)
-_SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "4"))
+# How often to auto-scan (default: every 30 min; override with SCAN_INTERVAL_HOURS env)
+_SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "0.5"))
 
 def _run_scanner_job():
     global _last_scan_result
