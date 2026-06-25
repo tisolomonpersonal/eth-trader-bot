@@ -487,6 +487,9 @@ Instructions:
 - Set SL and TP based on the provided ATR (Stop Loss ~1.5× ATR, Take Profit ~3× ATR for 1:2 RR).
 - Explain clearly WHY the technical setup is compelling, referencing the actual indicator values.
 
+CRITICAL: entry, stop_loss, and take_profit MUST be the real numeric price values from the market data above.
+NEVER use 0, null, or placeholder values. Use the provided entry/sl/tp values from the ATR-based calculations.
+
 Respond with ONLY valid JSON (no markdown fences, no text before or after):
 {{
   "signals": [
@@ -503,8 +506,32 @@ Respond with ONLY valid JSON (no markdown fences, no text before or after):
       "confidence": "HIGH",
       "reasoning": "RSI at 28 (oversold), MACD histogram just turned positive after bearish trend, price touching lower Bollinger Band — classic mean-reversion setup confirmed by [news context]."
     }},
-    {{"rank": 2, "asset": "...", "symbol": "...", "category": "...", "direction": "BUY", "entry": 0, "stop_loss": 0, "take_profit": 0, "rr_ratio": "1:2", "confidence": "MEDIUM", "reasoning": "..."}},
-    {{"rank": 3, "asset": "...", "symbol": "...", "category": "...", "direction": "BUY", "entry": 0, "stop_loss": 0, "take_profit": 0, "rr_ratio": "1:2", "confidence": "MEDIUM", "reasoning": "..."}}
+    {{
+      "rank": 2,
+      "asset": "GOLD",
+      "symbol": "GC=F",
+      "category": "metal",
+      "direction": "BUY",
+      "entry": 2350.50,
+      "stop_loss": 2315.20,
+      "take_profit": 2421.10,
+      "rr_ratio": "1:2",
+      "confidence": "MEDIUM",
+      "reasoning": "Use real entry/sl/tp from the market data — never use 0."
+    }},
+    {{
+      "rank": 3,
+      "asset": "EUR/USD",
+      "symbol": "EURUSD=X",
+      "category": "forex",
+      "direction": "SELL",
+      "entry": 1.08450,
+      "stop_loss": 1.08935,
+      "take_profit": 1.07480,
+      "rr_ratio": "1:2",
+      "confidence": "MEDIUM",
+      "reasoning": "Use real entry/sl/tp from the market data — never use 0."
+    }}
   ],
   "market_outlook": "2-3 sentence overall market sentiment referencing key indicator readings."
 }}"""
@@ -524,7 +551,7 @@ def _parse_ai_response(raw: str):
 def _build_ollama_prompt(market_data: list, news: list) -> str:
     """
     Shorter, simpler prompt optimised for small local models (3B-7B).
-    Fewer tokens in → faster response, better JSON adherence.
+    Includes pre-calculated entry/SL/TP so the model never needs to compute prices.
     """
     # Pick top 6 assets by absolute technical score for context
     scored = sorted(market_data, key=lambda a: abs(a.get("signals", {}).get("score", 0)), reverse=True)[:6]
@@ -532,21 +559,40 @@ def _build_ollama_prompt(market_data: list, news: list) -> str:
     for a in scored:
         s = a.get("signals", {})
         lines.append(
-            f"{a['asset']} ({a['category']}): price={a['price']}, 24h={a['change24h']}%, "
-            f"RSI={s.get('rsi','?')}, MACD_hist={s.get('macd_hist','?')}, "
-            f"BB_pos={s.get('bb_pos','?')}, signal={s.get('direction','?')}"
+            f"{a['asset']} ({a['symbol']}, {a['category']}): "
+            f"entry={s.get('entry', a['price'])}, sl={s.get('sl','?')}, tp={s.get('tp','?')}, "
+            f"direction={s.get('direction','?')}, RSI={s.get('rsi','?')}, "
+            f"MACD_hist={s.get('macd_hist','?')}, BB_pos={s.get('bb_pos','?')}"
         )
     top_news = "; ".join(news[:5]) if news else "none"
+    # Use the first scored asset's values as a concrete example to anchor the model
+    ex = scored[0] if scored else {}
+    ex_s = ex.get("signals", {})
+    ex_entry = ex_s.get("entry", ex.get("price", 100.0))
+    ex_sl    = ex_s.get("sl",    round(ex_entry * 0.97, 6))
+    ex_tp    = ex_s.get("tp",    round(ex_entry * 1.06, 6))
+    ex_sym   = ex.get("symbol", "BTC-USD")
+    ex_name  = ex.get("asset",  "Bitcoin")
+    ex_cat   = ex.get("category", "crypto")
+    ex_dir   = ex_s.get("direction", "BUY")
     return (
         "You are a trader. Pick the 3 best trades from this data. "
+        "IMPORTANT: Use the exact entry/sl/tp numbers provided — do NOT output 0. "
         "Reply ONLY with a JSON object, no other text.\n\n"
         "ASSETS:\n" + "\n".join(lines) + "\n\n"
         "NEWS: " + top_news + "\n\n"
-        'FORMAT (exact keys required):\n'
-        '{"signals":[{"rank":1,"asset":"NAME","symbol":"TICKER","category":"crypto","direction":"BUY",'
-        '"entry":0.0,"stop_loss":0.0,"take_profit":0.0,"rr_ratio":"1:2","confidence":"HIGH",'
-        '"reasoning":"brief reason using RSI/MACD/BB values"}],'
-        '"market_outlook":"one sentence"}'
+        f'FORMAT (use real numbers from ASSETS above, not 0):\n'
+        f'{{"signals":['
+        f'{{"rank":1,"asset":"{ex_name}","symbol":"{ex_sym}","category":"{ex_cat}","direction":"{ex_dir}",'
+        f'"entry":{ex_entry},"stop_loss":{ex_sl},"take_profit":{ex_tp},'
+        f'"rr_ratio":"1:2","confidence":"HIGH","reasoning":"brief reason using RSI/MACD/BB values"}},'
+        f'{{"rank":2,"asset":"NAME","symbol":"TICKER","category":"stock","direction":"BUY",'
+        f'"entry":150.25,"stop_loss":143.80,"take_profit":163.15,'
+        f'"rr_ratio":"1:2","confidence":"MEDIUM","reasoning":"..."}},'
+        f'{{"rank":3,"asset":"NAME","symbol":"TICKER","category":"forex","direction":"SELL",'
+        f'"entry":1.08500,"stop_loss":1.09225,"take_profit":1.07050,'
+        f'"rr_ratio":"1:2","confidence":"LOW","reasoning":"..."}}],'
+        f'"market_outlook":"one sentence"}}'
     )
 
 
@@ -777,26 +823,47 @@ def run_scan() -> dict:
     ai_signals, outlook = _call_ai_analysis(all_assets, news)
     is_ai = bool(ai_signals)
 
-    # ── Back-fill zero prices from technical signals ───────────────────────────
-    # Small local models (Ollama 3B) often return entry/SL/TP as 0 because they
-    # don't compute prices. Fill them in from pre-calculated technical values.
+    # ── Back-fill zero/missing prices from technical signals ─────────────────────
+    # AI models (especially small Ollama ones) sometimes return entry/SL/TP as 0
+    # or omit them entirely. Fill every gap from the pre-calculated ATR-based values.
     if ai_signals:
         sym_lookup  = {a["symbol"].upper(): a for a in all_assets}
         name_lookup = {a["asset"].upper(): a  for a in all_assets}
+
+        def _fuzzy_find_asset(sym_key: str, name_key: str):
+            """Exact match first, then substring search on symbol, then on name."""
+            asset = sym_lookup.get(sym_key) or name_lookup.get(name_key)
+            if asset:
+                return asset
+            # Partial symbol match (e.g. "BTC" hits "BTC-USD")
+            for k, v in sym_lookup.items():
+                if sym_key and (sym_key in k or k in sym_key):
+                    return v
+            # Partial name match (e.g. "BITCOIN" hits "Bitcoin")
+            for k, v in name_lookup.items():
+                if name_key and (name_key in k or k in name_key):
+                    return v
+            return None
+
         for sig in ai_signals:
-            e  = float(sig.get("entry",      0) or 0)
-            sl = float(sig.get("stop_loss",  0) or 0)
-            tp = float(sig.get("take_profit",0) or 0)
+            e  = float(sig.get("entry",       0) or 0)
+            sl = float(sig.get("stop_loss",   0) or 0)
+            tp = float(sig.get("take_profit", 0) or 0)
             if e == 0 or sl == 0 or tp == 0:
-                key   = sig.get("symbol", "").upper()
-                aname = sig.get("asset",  "").upper()
-                asset = sym_lookup.get(key) or name_lookup.get(aname)
+                sym_key  = sig.get("symbol", "").upper().replace(" ", "")
+                name_key = sig.get("asset",  "").upper().replace(" ", "")
+                asset = _fuzzy_find_asset(sym_key, name_key)
                 if asset:
                     tech = asset["signals"]
-                    if e  == 0: sig["entry"]       = tech["entry"]
-                    if sl == 0: sig["stop_loss"]   = tech["sl"]
+                    if e  == 0: sig["entry"]        = tech["entry"]
+                    if sl == 0: sig["stop_loss"]    = tech["sl"]
                     if tp == 0: sig["take_profit"]  = tech["tp"]
-                    # Copy RSI/MACD/BB for display
+                    print(f"[scanner] back-filled {sig.get('asset')} entry/SL/TP from technical signals")
+                else:
+                    print(f"[scanner] WARNING: could not back-fill {sig.get('asset')} ({sig.get('symbol')}) — no match found")
+                # Always copy RSI/MACD/BB for display if missing
+                if asset:
+                    tech = asset["signals"]
                     sig.setdefault("rsi",       tech.get("rsi"))
                     sig.setdefault("macd_hist", tech.get("macd_hist"))
                     sig.setdefault("bb_pos",    tech.get("bb_pos"))
@@ -851,30 +918,40 @@ def run_scan() -> dict:
     )
     if best_score < NO_TRADE_THRESHOLD:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        # Collect the reason why each top asset doesn't qualify
+        # Collect why each top asset doesn't qualify — use actual indicator values
         top5 = sorted(all_assets, key=lambda x: abs(x["signals"].get("score", 0)), reverse=True)[:5]
         reasons = []
         for a in top5:
             s = a["signals"]
+            rsi = s.get("rsi", "?")
+            hist = s.get("macd_hist", 0)
+            bb = s.get("bb_pos", 0.5)
+            score_val = s.get("score", 0)
+            # Explain concisely why the asset doesn't qualify
+            rsi_note = (
+                "overbought" if isinstance(rsi, (int, float)) and rsi > 60 else
+                "oversold"   if isinstance(rsi, (int, float)) and rsi < 40 else
+                "neutral"
+            )
             reasons.append(
-                f"• {a['asset']}: RSI {s.get('rsi','?')} (neutral), "
-                f"MACD hist {s.get('macd_hist',0):+.6f} (flat), "
-                f"BB pos {round((s.get('bb_pos',0.5))*100)}% (mid-range)"
+                f"• <b>{a['asset']}</b>: RSI {rsi} ({rsi_note}), "
+                f"MACD hist {hist:+.6f}, "
+                f"BB pos {round(bb * 100)}% — score {score_val:+d} (need ±{NO_TRADE_THRESHOLD})"
             )
         no_trade_msg = (
             f"🔍 <b>SCAN — {now_str}</b>\n"
             f"{'━'*32}\n"
-            f"⏸ <b>NO TRADE — Markets are neutral</b>\n\n"
-            f"No asset has a high-conviction setup right now.\n"
-            f"All RSI readings are between 40-60, MACD histograms are flat, "
-            f"and prices are mid-Bollinger-Band. Waiting for a clearer setup.\n\n"
-            f"<b>Top 5 assets checked:</b>\n"
+            f"⏸ <b>NO TRADE — No conviction setup found</b>\n\n"
+            f"Scanned {len(all_assets)} assets across crypto, stocks, metals & forex.\n"
+            f"Best signal score: <b>{best_score}</b> (minimum needed: {NO_TRADE_THRESHOLD}).\n"
+            f"Indicators are not strongly aligned — waiting for a clearer setup.\n\n"
+            f"<b>Top {len(top5)} assets checked:</b>\n"
             + "\n".join(reasons) +
-            f"\n\n<i>Next scan in 30 min. No action needed.</i>"
+            f"\n\n<i>🕐 Next scan in 30 min. No action needed.</i>"
         )
         _send_telegram(no_trade_msg)
         elapsed = round(time.time() - t0, 1)
-        print(f"[scanner] Done in {elapsed}s — no trade (best score={best_score})")
+        print(f"[scanner] Done in {elapsed}s — no trade (best score={best_score}, threshold={NO_TRADE_THRESHOLD})")
         return {
             "status": "no_trade", "reason": "all signals below threshold",
             "best_score": best_score, "threshold": NO_TRADE_THRESHOLD,
