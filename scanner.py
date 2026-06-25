@@ -521,28 +521,58 @@ def _parse_ai_response(raw: str):
     return parsed.get("signals", []), parsed.get("market_outlook", "")
 
 
+def _build_ollama_prompt(market_data: list, news: list) -> str:
+    """
+    Shorter, simpler prompt optimised for small local models (3B-7B).
+    Fewer tokens in → faster response, better JSON adherence.
+    """
+    # Pick top 6 assets by absolute technical score for context
+    scored = sorted(market_data, key=lambda a: abs(a.get("signals", {}).get("score", 0)), reverse=True)[:6]
+    lines = []
+    for a in scored:
+        s = a.get("signals", {})
+        lines.append(
+            f"{a['asset']} ({a['category']}): price={a['price']}, 24h={a['change24h']}%, "
+            f"RSI={s.get('rsi','?')}, MACD_hist={s.get('macd_hist','?')}, "
+            f"BB_pos={s.get('bb_pos','?')}, signal={s.get('direction','?')}"
+        )
+    top_news = "; ".join(news[:5]) if news else "none"
+    return (
+        "You are a trader. Pick the 3 best trades from this data. "
+        "Reply ONLY with a JSON object, no other text.\n\n"
+        "ASSETS:\n" + "\n".join(lines) + "\n\n"
+        "NEWS: " + top_news + "\n\n"
+        'FORMAT (exact keys required):\n'
+        '{"signals":[{"rank":1,"asset":"NAME","symbol":"TICKER","category":"crypto","direction":"BUY",'
+        '"entry":0.0,"stop_loss":0.0,"take_profit":0.0,"rr_ratio":"1:2","confidence":"HIGH",'
+        '"reasoning":"brief reason using RSI/MACD/BB values"}],'
+        '"market_outlook":"one sentence"}'
+    )
+
+
 def _call_ollama(prompt: str):
-    """Call a local Ollama instance via its OpenAI-compatible /v1 endpoint."""
+    """
+    Call a local Ollama instance via its OpenAI-compatible /v1 endpoint.
+    Hard 150-second timeout so slow CPU inference falls back gracefully.
+    """
     if not OAI_AVAILABLE:
         raise RuntimeError("openai package not installed")
     client = _OpenAI(
-        api_key="ollama",                    # required field but ignored by Ollama
+        api_key="ollama",            # required field, ignored by Ollama
         base_url=f"{OLLAMA_HOST}/v1",
+        timeout=150.0,               # fall back to technical signals if model is too slow
     )
     response = client.chat.completions.create(
         model=OLLAMA_MODEL,
-        max_tokens=2500,
+        max_tokens=1200,             # smaller cap — 3B models lose JSON coherence at high token counts
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a professional quantitative trader. "
-                    "Always respond with valid JSON only — no markdown, no explanation outside the JSON."
-                ),
+                "content": "You are a trading assistant. Always reply with valid JSON only. No markdown.",
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.3,
+        temperature=0.2,
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -596,20 +626,19 @@ def _call_ai_analysis(market_data: list, news: list):
         print("[scanner] No AI provider configured — set XAI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY")
         return [], "No AI provider configured."
 
-    prompt = _build_prompt(market_data, news)
     print(f"[scanner] Using AI provider: {provider}")
 
     try:
         if provider == "ollama":
-            raw = _call_ollama(prompt)
+            raw = _call_ollama(_build_ollama_prompt(market_data, news))
         elif provider == "xai":
-            raw = _call_xai(prompt)
+            raw = _call_xai(_build_prompt(market_data, news))
         elif provider == "groq":
-            raw = _call_groq(prompt)
+            raw = _call_groq(_build_prompt(market_data, news))
         elif provider == "openai":
-            raw = _call_openai(prompt)
+            raw = _call_openai(_build_prompt(market_data, news))
         else:
-            raw = _call_anthropic(prompt)
+            raw = _call_anthropic(_build_prompt(market_data, news))
         return _parse_ai_response(raw)
     except json.JSONDecodeError as e:
         print(f"[scanner] AI JSON parse error ({provider}): {e}")
