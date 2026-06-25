@@ -1,24 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # entrypoint.sh — Boot sequence for the MT5-under-Wine Zeabur service
-#
-# What "small Windows" means here:
-#   winetricks installs Visual C++ 2019 runtime + .NET 4.8 — the minimal
-#   Windows components MetaTrader5 terminal requires to launch at all.
-#   Without them the terminal silently crashes on startup.
-#
-# Boot flow:
-#   1. Xvfb virtual display
-#   2. Wine prefix init (first run only)
-#   3. winetricks: vcrun2019 + dotnet48 (first run only)
-#   4. Python 3.10 for Windows inside Wine (first run only)
-#   5. MetaTrader5 + mt5linux Python packages in Wine Python (first run only)
-#   6. MT5 terminal install (first run only)
-#   7. Write start.ini → MT5 auto-logs in on every boot
-#   8. Launch MT5 terminal
-#   9. Start mt5linux XML-RPC bridge on port $MT5_PORT
 # ─────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+# NOTE: intentionally NO set -e / set -euo pipefail.
+# Many Wine/winetricks commands return non-zero on warnings; we handle each
+# individually with || true so one hiccup doesn't kill the whole container.
+# ─────────────────────────────────────────────────────────────────────────────
 
 MT5_PORT="${MT5_PORT:-8001}"
 WINEPREFIX="${WINEPREFIX:-/root/.wine}"
@@ -30,56 +17,60 @@ SETUP_DONE="${WINEPREFIX}/.mt5_first_run_complete"
 export DISPLAY=:99
 export WINEPREFIX
 export WINEARCH=win64
-# Suppress Wine debug noise
-export WINEDEBUG=-all
+export WINEDEBUG=-all          # suppress Wine debug noise
 
-log() { echo "[mt5-server $(date '+%H:%M:%S')] $*"; }
+log() { echo "[mt5-server $(date '+%H:%M:%S')] $*" >&2; }
 
 # ── 1. Virtual display ────────────────────────────────────────────────────────
 log "Starting Xvfb (${SCREEN_RES:-1024x768x24}) ..."
 Xvfb :99 -screen 0 "${SCREEN_RES:-1024x768x24}" -nolisten tcp &
-sleep 2
+XVFB_PID=$!
 
-# Optional VNC — set VNC_PASSWORD env var to enable remote desktop
+# Wait until Xvfb is actually answering (up to 15 s)
+for i in $(seq 1 15); do
+    xdpyinfo -display :99 >/dev/null 2>&1 && break
+    sleep 1
+done
+if ! xdpyinfo -display :99 >/dev/null 2>&1; then
+    log "WARNING: Xvfb did not respond after 15 s — continuing anyway"
+fi
+log "Xvfb running (PID $XVFB_PID)"
+
+# Optional VNC
 if [ -n "${VNC_PASSWORD:-}" ]; then
     log "Starting VNC on port 5900 ..."
     x11vnc -display :99 -forever -shared -rfbport 5900 \
-           -passwd "${VNC_PASSWORD}" -bg -o /var/log/vnc.log 2>/dev/null
+           -passwd "${VNC_PASSWORD}" -bg -o /var/log/vnc.log 2>/dev/null || true
 fi
 
 # ── 2. First-run: Wine + Windows components + MT5 setup ──────────────────────
 if [ ! -f "$SETUP_DONE" ]; then
     log "═══ FIRST-RUN SETUP (takes 5-10 min) ═══"
 
-    # 2a. Initialise 64-bit Wine prefix
+    # 2a. Init Wine prefix
     log "[1/6] Initialising Wine64 prefix..."
-    wineboot --init 2>/dev/null
-    sleep 8
+    wineboot --init 2>/dev/null || true
+    sleep 10
 
-    # Silence Wine autorun popups
+    # Suppress Wine popup dialogs
     wine reg add 'HKCU\Software\Wine\DllOverrides' \
         /v winemenubuilder.exe /t REG_SZ /d "" /f 2>/dev/null || true
     wine reg add 'HKCU\Software\Wine\WineDbg' \
         /v ShowCrashDialog /t REG_DWORD /d 0 /f 2>/dev/null || true
 
-    # 2b. winetricks — install the "small Windows" components MT5 needs
-    #     vcrun2019 = Visual C++ 2019 Redistributable (MT5 hard requirement)
-    #     dotnet48  = .NET Framework 4.8 (used by MT5 internal components)
-    log "[2/6] Installing Windows components via winetricks (vcrun2019 + dotnet48)..."
-    log "      This is the 'small Windows' step — installs MS DLLs MT5 needs."
-    WINEDEBUG=-all winetricks -q vcrun2019 2>/dev/null || {
-        log "  vcrun2019 failed — trying vcrun2015..."
-        WINEDEBUG=-all winetricks -q vcrun2015 2>/dev/null || true
-    }
-    WINEDEBUG=-all winetricks -q dotnet48 2>/dev/null || {
-        log "  dotnet48 failed — trying dotnet461..."
-        WINEDEBUG=-all winetricks -q dotnet461 2>/dev/null || true
-    }
+    # 2b. winetricks — the "small Windows" step
+    #     vcrun2019 = Visual C++ 2019 runtime (MT5 hard requirement)
+    #     dotnet48  = .NET 4.8 (used by MT5 internal components)
+    log "[2/6] Installing Windows components via winetricks..."
+    log "      vcrun2019 (Visual C++ 2019) ..."
+    winetricks -q vcrun2019 2>/dev/null || winetricks -q vcrun2015 2>/dev/null || true
+    log "      dotnet48 (.NET 4.8) — this takes a few minutes ..."
+    winetricks -q dotnet48 2>/dev/null || winetricks -q dotnet461 2>/dev/null || true
     log "  winetricks done."
 
-    # 2c. Install Python 3.10 for Windows inside Wine
-    log "[3/6] Installing Python 3.10 (Windows x64) in Wine..."
-    if [ ! -f "$WINE_PYTHON" ]; then
+    # 2c. Python 3.10 for Windows inside Wine
+    log "[3/6] Installing Python 3.10 for Windows in Wine..."
+    if [ -f /opt/mt5-setup/python-win.exe ]; then
         wine /opt/mt5-setup/python-win.exe \
             InstallAllUsers=0 \
             TargetDir="C:\\Python310" \
@@ -88,28 +79,25 @@ if [ ! -f "$SETUP_DONE" ]; then
             Include_doc=0 \
             /quiet 2>/dev/null || true
         sleep 15
-        if [ -f "$WINE_PYTHON" ]; then
-            log "  Python 3.10 installed at C:\\Python310"
-        else
-            log "  WARNING: Python installer may have failed — check /tmp/python-install.log"
-        fi
+        [ -f "$WINE_PYTHON" ] \
+            && log "  Python 3.10 installed." \
+            || log "  WARNING: Python 3.10 installer may have failed."
     else
-        log "  Python 3.10 already present."
+        log "  WARNING: python-win.exe not found in /opt/mt5-setup"
     fi
 
-    # 2d. Install MetaTrader5 + mt5linux in Wine Python
+    # 2d. MetaTrader5 + mt5linux in Wine Python
     if [ -f "$WINE_PYTHON" ]; then
-        log "[4/6] Installing MetaTrader5 + mt5linux in Wine Python..."
-        wine "$WINE_PYTHON" -m pip install --quiet MetaTrader5 mt5linux 2>/dev/null || \
-            log "  pip install had warnings — continuing..."
+        log "[4/6] pip install MetaTrader5 mt5linux (in Wine Python)..."
+        wine "$WINE_PYTHON" -m pip install --quiet MetaTrader5 mt5linux 2>/dev/null || true
         sleep 5
     else
-        log "[4/6] SKIP — Wine Python not found, pip install skipped."
+        log "[4/6] SKIP — Wine Python not found"
     fi
 
-    # 2e. Install MT5 terminal
+    # 2e. MT5 terminal
     log "[5/6] Installing MetaTrader5 terminal..."
-    if [ ! -f "$MT5_TERMINAL" ]; then
+    if [ -f /opt/mt5-setup/mt5setup.exe ] && [ ! -f "$MT5_TERMINAL" ]; then
         wine /opt/mt5-setup/mt5setup.exe /auto 2>/dev/null &
         INSTALL_PID=$!
         for i in $(seq 1 120); do
@@ -117,9 +105,12 @@ if [ ! -f "$SETUP_DONE" ]; then
             [ -f "$MT5_TERMINAL" ] && { log "  MT5 terminal installed (${i}s)"; break; }
         done
         kill "$INSTALL_PID" 2>/dev/null || true
-        [ ! -f "$MT5_TERMINAL" ] && log "  WARNING: MT5 terminal not found after install wait"
-    else
+        [ -f "$MT5_TERMINAL" ] \
+            || log "  WARNING: MT5 terminal not found after install wait"
+    elif [ -f "$MT5_TERMINAL" ]; then
         log "  MT5 terminal already installed."
+    else
+        log "  WARNING: mt5setup.exe not found in /opt/mt5-setup"
     fi
 
     touch "$SETUP_DONE"
@@ -127,78 +118,81 @@ if [ ! -f "$SETUP_DONE" ]; then
 fi
 
 # ── 3. Write start.ini — MT5 auto-login ──────────────────────────────────────
-# This is the config file that makes MT5 automatically open and log in
-# to your broker every time the container starts — no manual clicking needed.
 if [ -n "${MT5_LOGIN:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
     log "Writing start.ini for auto-login (login=${MT5_LOGIN}, server=${MT5_SERVER})..."
     mkdir -p "${MT5_DIR}"
     /app/make-start-ini.sh > "${MT5_DIR}/start.ini"
-    log "  start.ini written — MT5 will auto-login on startup."
+    log "  start.ini written."
 else
-    log "WARNING: MT5_LOGIN / MT5_PASSWORD / MT5_SERVER not set."
-    log "         MT5 terminal will open but won't auto-login."
-    log "         Set these env vars in the Zeabur dashboard."
+    log "WARNING: MT5_LOGIN / MT5_PASSWORD / MT5_SERVER not set — MT5 won't auto-login."
 fi
 
 # ── 4. Launch MT5 terminal ────────────────────────────────────────────────────
 if [ -f "$MT5_TERMINAL" ]; then
-    log "Launching MetaTrader5 terminal (Wine)..."
+    log "Launching MT5 terminal (Wine, /portable)..."
     wine "$MT5_TERMINAL" /portable 2>/dev/null &
-    MT5_PID=$!
-    log "  MT5 terminal starting (PID $MT5_PID) — waiting 20s for init..."
     sleep 20
-    log "  MT5 terminal should now be running and logged in."
+    log "MT5 terminal launched."
 else
-    log "WARNING: MT5 terminal binary not found — RPC bridge will start but"
-    log "         trading calls will fail until terminal is installed."
+    log "WARNING: MT5 terminal binary not found — skipping terminal launch."
 fi
 
-# ── 5. Start mt5linux XML-RPC bridge ─────────────────────────────────────────
-log "Starting mt5linux XML-RPC bridge on 0.0.0.0:${MT5_PORT} ..."
-
-start_rpc() {
+# ── 5. mt5linux XML-RPC bridge ────────────────────────────────────────────────
+start_rpc_bridge() {
     if [ ! -f "$WINE_PYTHON" ]; then
-        log "FATAL: Wine Python not found — cannot start RPC server."
+        log "FATAL: Wine Python not found — RPC bridge cannot start."
         return 1
     fi
-    wine "$WINE_PYTHON" - <<'PYEOF' &
-import sys
+    # Write the server script to a temp file (avoids heredoc PID capture issues)
+    cat > /tmp/mt5_rpc_server.py <<'PYEOF'
+import os, sys
 sys.path.insert(0, r'C:\Python310\Lib\site-packages')
+port = int(os.environ.get('MT5_PORT', '8001'))
 try:
     from mt5linux.server import run
-    print('[mt5linux] RPC server starting...', flush=True)
-    run(host='0.0.0.0', port=__import__('os').environ.get('MT5_PORT', '8001'))
+    print(f'[mt5linux] Starting mt5linux RPC on 0.0.0.0:{port}', flush=True)
+    run(host='0.0.0.0', port=port)
 except ImportError as e:
-    print(f'[mt5linux] mt5linux not installed in Wine Python: {e}', flush=True)
-    print('[mt5linux] Falling back to minimal XML-RPC server...', flush=True)
+    print(f'[mt5linux] mt5linux not installed ({e}) — using fallback XML-RPC', flush=True)
     import MetaTrader5 as mt5
     from xmlrpc.server import SimpleXMLRPCServer
-    port = int(__import__('os').environ.get('MT5_PORT', '8001'))
     srv = SimpleXMLRPCServer(('0.0.0.0', port), allow_none=True, logRequests=False)
     srv.register_instance(mt5)
     srv.register_introspection_functions()
-    print(f'[mt5linux] Fallback RPC server running on 0.0.0.0:{port}', flush=True)
+    print(f'[mt5linux] Fallback RPC running on 0.0.0.0:{port}', flush=True)
     srv.serve_forever()
 PYEOF
-    echo $!
+    wine "$WINE_PYTHON" /tmp/mt5_rpc_server.py &
+    echo $!   # only line on stdout — captured cleanly by $()
 }
 
-RPC_PID=$(start_rpc)
-log "  RPC bridge PID: $RPC_PID"
-log "Ready. Bot should connect with MT5_HOST=<this-service> MT5_PORT=${MT5_PORT}"
+log "Starting mt5linux XML-RPC bridge on 0.0.0.0:${MT5_PORT} ..."
+RPC_PID=$(start_rpc_bridge 2>/dev/null)
+log "RPC bridge PID: ${RPC_PID:-UNKNOWN}"
 log ""
 log "  ┌─────────────────────────────────────────────────┐"
-log "  │  mt5linux RPC bridge  →  0.0.0.0:${MT5_PORT}        │"
-log "  │  MT5 terminal         →  Wine (auto-login)      │"
-log "  │  Virtual display      →  Xvfb :99              │"
+log "  │  mt5linux RPC  →  0.0.0.0:${MT5_PORT}               │"
+log "  │  MT5 terminal  →  Wine (auto-login via ini)     │"
+log "  │  Virtual disp  →  Xvfb :99                     │"
 log "  └─────────────────────────────────────────────────┘"
 
-# Keep-alive: restart RPC bridge if it exits
+# ── 6. Keep-alive watchdog ────────────────────────────────────────────────────
 while true; do
-    if [ -n "$RPC_PID" ] && ! kill -0 "$RPC_PID" 2>/dev/null; then
-        log "RPC bridge exited — restarting..."
-        RPC_PID=$(start_rpc)
-        log "  RPC bridge restarted (PID $RPC_PID)"
-    fi
     sleep 30
+
+    # Check RPC bridge
+    if [ -n "${RPC_PID:-}" ] && [ "$RPC_PID" -eq "$RPC_PID" ] 2>/dev/null; then
+        if ! kill -0 "$RPC_PID" 2>/dev/null; then
+            log "RPC bridge exited — restarting..."
+            RPC_PID=$(start_rpc_bridge 2>/dev/null)
+            log "  RPC bridge restarted (PID: ${RPC_PID:-UNKNOWN})"
+        fi
+    fi
+
+    # Check Xvfb
+    if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+        log "Xvfb crashed — restarting..."
+        Xvfb :99 -screen 0 "${SCREEN_RES:-1024x768x24}" -nolisten tcp &
+        XVFB_PID=$!
+    fi
 done
