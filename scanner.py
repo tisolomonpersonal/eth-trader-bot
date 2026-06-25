@@ -41,10 +41,13 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
+XAI_API_KEY        = os.environ.get("XAI_API_KEY", "")
 
-# Auto-detect which AI provider is available (Groq free → OpenAI → Anthropic)
+# Auto-detect which AI provider to use (xAI/Grok → Groq → OpenAI → Anthropic)
 def _detect_ai_provider() -> str:
-    if GROQ_API_KEY:
+    if XAI_API_KEY and OAI_AVAILABLE:
+        return "xai"
+    if GROQ_API_KEY and OAI_AVAILABLE:
         return "groq"
     if OPENAI_API_KEY and OAI_AVAILABLE:
         return "openai"
@@ -314,6 +317,23 @@ def _parse_ai_response(raw: str):
     return parsed.get("signals", []), parsed.get("market_outlook", "")
 
 
+def _call_xai(prompt: str):
+    """Call xAI Grok API (OpenAI-compatible, grok-3-mini)."""
+    if not OAI_AVAILABLE:
+        raise RuntimeError("openai package not installed")
+    client = _OpenAI(
+        api_key=XAI_API_KEY,
+        base_url="https://api.x.ai/v1",
+    )
+    response = client.chat.completions.create(
+        model="grok-3-mini",
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 def _call_groq(prompt: str):
     """Call Groq API (free tier, OpenAI-compatible, llama-3.3-70b)."""
     if not OAI_AVAILABLE:
@@ -361,14 +381,16 @@ def _call_anthropic(prompt: str):
 def _call_ai_analysis(market_data: list, news: list):
     provider = _detect_ai_provider()
     if provider == "none":
-        print("[scanner] No AI provider configured — set GROQ_API_KEY (free), OPENAI_API_KEY, or ANTHROPIC_API_KEY")
+        print("[scanner] No AI provider configured — set XAI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY")
         return [], "No AI provider configured."
 
     prompt = _build_prompt(market_data, news)
     print(f"[scanner] Using AI provider: {provider}")
 
     try:
-        if provider == "groq":
+        if provider == "xai":
+            raw = _call_xai(prompt)
+        elif provider == "groq":
             raw = _call_groq(prompt)
         elif provider == "openai":
             raw = _call_openai(prompt)
