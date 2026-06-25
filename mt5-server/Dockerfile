@@ -66,15 +66,19 @@ RUN wget -q \
 
 # ── 4. Runtime scripts ────────────────────────────────────────────────────────
 WORKDIR /app
-COPY entrypoint.sh    /app/entrypoint.sh
-COPY healthcheck.py   /app/healthcheck.py
+COPY entrypoint.sh     /app/entrypoint.sh
+COPY healthcheck.py    /app/healthcheck.py
 COPY make-start-ini.sh /app/make-start-ini.sh
+COPY status_server.py  /app/status_server.py
 RUN chmod +x /app/entrypoint.sh /app/make-start-ini.sh
 
+ENV STATUS_PORT=8002
+
 # ── 5. Ports ──────────────────────────────────────────────────────────────────
-# 8001 — mt5linux XML-RPC bridge (internal Zeabur service)
+# 8001 — mt5linux XML-RPC bridge (internal, bot connects here)
+# 8002 — /status JSON endpoint (expose in Zeabur dashboard to view in browser)
 # 5900 — VNC remote desktop (set VNC_PASSWORD env var to enable)
-EXPOSE 8001 5900
+EXPOSE 8001 8002 5900
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
     CMD python3 /app/healthcheck.py

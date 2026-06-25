@@ -169,14 +169,22 @@ PYEOF
 log "Starting mt5linux XML-RPC bridge on 0.0.0.0:${MT5_PORT} ..."
 RPC_PID=$(start_rpc_bridge 2>/dev/null)
 log "RPC bridge PID: ${RPC_PID:-UNKNOWN}"
-log ""
-log "  ┌─────────────────────────────────────────────────┐"
-log "  │  mt5linux RPC  →  0.0.0.0:${MT5_PORT}               │"
-log "  │  MT5 terminal  →  Wine (auto-login via ini)     │"
-log "  │  Virtual disp  →  Xvfb :99                     │"
-log "  └─────────────────────────────────────────────────┘"
 
-# ── 6. Keep-alive watchdog ────────────────────────────────────────────────────
+# ── 6. Status HTTP server (port 8002) ────────────────────────────────────────
+STATUS_PORT="${STATUS_PORT:-8002}"
+log "Starting /status server on 0.0.0.0:${STATUS_PORT} ..."
+python3 /app/status_server.py &
+STATUS_PID=$!
+log "Status server PID: $STATUS_PID"
+log ""
+log "  ┌──────────────────────────────────────────────────────┐"
+log "  │  mt5linux RPC   →  0.0.0.0:${MT5_PORT}                   │"
+log "  │  /status JSON   →  0.0.0.0:${STATUS_PORT}  ← browser here │"
+log "  │  MT5 terminal   →  Wine (auto-login via ini)        │"
+log "  │  Virtual disp   →  Xvfb :99                        │"
+log "  └──────────────────────────────────────────────────────┘"
+
+# ── 7. Keep-alive watchdog ────────────────────────────────────────────────────
 while true; do
     sleep 30
 
@@ -186,6 +194,16 @@ while true; do
             log "RPC bridge exited — restarting..."
             RPC_PID=$(start_rpc_bridge 2>/dev/null)
             log "  RPC bridge restarted (PID: ${RPC_PID:-UNKNOWN})"
+        fi
+    fi
+
+    # Check status server
+    if [ -n "${STATUS_PID:-}" ] && [ "$STATUS_PID" -eq "$STATUS_PID" ] 2>/dev/null; then
+        if ! kill -0 "$STATUS_PID" 2>/dev/null; then
+            log "Status server exited — restarting..."
+            python3 /app/status_server.py &
+            STATUS_PID=$!
+            log "  Status server restarted (PID: $STATUS_PID)"
         fi
     fi
 
