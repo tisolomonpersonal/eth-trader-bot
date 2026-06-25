@@ -15,7 +15,15 @@ try:
 except Exception:
     anthropic = None
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    APS_AVAILABLE = True
+except ImportError:
+    APS_AVAILABLE = False
+
 import bot as trader_bot
+import scanner as market_scanner
 
 app = Flask(__name__)
 
@@ -72,6 +80,42 @@ try:
     _start_bot_thread()
 except Exception as _e:
     print(f"[startup] bot thread failed to start: {_e}")
+
+# ── Scanner state + scheduler ─────────────────────────────────────────────────
+_last_scan_result = {}
+_scan_lock = threading.Lock()
+
+# How often to auto-scan (default: every 4 hours; override with SCAN_INTERVAL_HOURS env)
+_SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "4"))
+
+def _run_scanner_job():
+    global _last_scan_result
+    try:
+        print("[app] Auto-scan triggered by scheduler")
+        result = market_scanner.run_scan()
+        with _scan_lock:
+            _last_scan_result = result
+    except Exception as e:
+        print(f"[app] Scanner job error: {e}\n{traceback.format_exc()}")
+
+_scanner_scheduler = None
+if APS_AVAILABLE:
+    try:
+        _scanner_scheduler = BackgroundScheduler(daemon=True)
+        _scanner_scheduler.add_job(
+            _run_scanner_job,
+            trigger=IntervalTrigger(hours=_SCAN_INTERVAL_HOURS),
+            id="market_scan",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=120,
+        )
+        _scanner_scheduler.start()
+        print(f"[app] Market scanner scheduled every {_SCAN_INTERVAL_HOURS}h")
+    except Exception as _e:
+        print(f"[app] Scheduler start failed: {_e}")
+else:
+    print("[app] APScheduler not installed — auto-scan disabled (use /api/scan to trigger manually)")
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -908,6 +952,54 @@ def api_diagnose():
         "tip": "retCode 10016: enable Unified Trading or Derivatives permission in Bybit API settings. retCode 10003/10004: wrong key or secret. IP whitelist: add Zeabur IP or disable it."    }
 
     return jsonify(results)
+
+
+@app.route('/api/scan', methods=['POST'])
+def api_scan():
+    """Trigger a full multi-market AI scan immediately (async in background thread)."""
+    def _do_scan():
+        global _last_scan_result
+        try:
+            result = market_scanner.run_scan()
+            with _scan_lock:
+                _last_scan_result = result
+        except Exception as e:
+            print(f"[api/scan] error: {e}\n{traceback.format_exc()}")
+
+    t = threading.Thread(target=_do_scan, daemon=True, name="manual-scan")
+    t.start()
+    return jsonify({
+        "status": "scan_started",
+        "message": "AI market scan running in background — signals will arrive on Telegram shortly.",
+        "interval_hours": _SCAN_INTERVAL_HOURS,
+    })
+
+
+@app.route('/api/scan/status')
+def api_scan_status():
+    """Return the result of the last scan."""
+    with _scan_lock:
+        result = dict(_last_scan_result)
+    if not result:
+        return jsonify({"status": "no_scan_yet", "message": "No scan has run yet. POST /api/scan to trigger one."})
+    return jsonify(result)
+
+
+@app.route('/api/scan/next')
+def api_scan_next():
+    """Return when the next auto-scan is scheduled."""
+    if _scanner_scheduler is None:
+        return jsonify({"status": "scheduler_not_running", "message": "APScheduler not installed."})
+    try:
+        job = _scanner_scheduler.get_job("market_scan")
+        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        return jsonify({
+            "status": "ok",
+            "interval_hours": _SCAN_INTERVAL_HOURS,
+            "next_run": next_run,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)})
 
 
 if __name__ == '__main__':
