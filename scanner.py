@@ -30,9 +30,27 @@ try:
 except ImportError:
     ANTH_AVAILABLE = False
 
+try:
+    from openai import OpenAI as _OpenAI
+    OAI_AVAILABLE = True
+except ImportError:
+    OAI_AVAILABLE = False
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
+
+# Auto-detect which AI provider is available (Groq free → OpenAI → Anthropic)
+def _detect_ai_provider() -> str:
+    if GROQ_API_KEY:
+        return "groq"
+    if OPENAI_API_KEY and OAI_AVAILABLE:
+        return "openai"
+    if ANTHROPIC_API_KEY and ANTH_AVAILABLE:
+        return "anthropic"
+    return "none"
 
 CRYPTO_IDS = [
     "bitcoin", "ethereum", "binancecoin", "solana", "ripple",
@@ -235,10 +253,7 @@ def _calculate_signals(asset: dict) -> dict:
     }
 
 
-def _call_ai_analysis(market_data: list, news: list):
-    if not ANTH_AVAILABLE or not ANTHROPIC_API_KEY:
-        return [], "AI analysis unavailable — ANTHROPIC_API_KEY not set."
-
+def _build_prompt(market_data: list, news: list) -> str:
     lines = []
     for a in market_data:
         s = a.get("signals", {})
@@ -248,11 +263,9 @@ def _call_ai_analysis(market_data: list, news: list):
             f"tech_signal={s.get('direction','?')}, score={s.get('score',0)}, "
             f"entry={s.get('entry')}, sl={s.get('sl')}, tp={s.get('tp')}"
         )
-
     news_block = "\n".join(f"• {n}" for n in news[:20]) if news else "No news available."
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    prompt = f"""You are a professional multi-market trader and quantitative analyst.
+    return f"""You are a professional multi-market trader and quantitative analyst.
 Analyze this market data snapshot ({now_str}) plus recent news, then pick the TOP 3 best trade opportunities.
 
 MARKET DATA:
@@ -281,7 +294,7 @@ Respond with ONLY valid JSON (no markdown fences, no text before or after):
       "take_profit": 72900.00,
       "rr_ratio": "1:2",
       "confidence": "HIGH",
-      "reasoning": "Detailed reasoning here combining technical and news factors."
+      "reasoning": "Detailed reasoning combining technical and news factors."
     }},
     {{"rank": 2, "asset": "...", "symbol": "...", "category": "...", "direction": "BUY", "entry": 0, "stop_loss": 0, "take_profit": 0, "rr_ratio": "1:2", "confidence": "MEDIUM", "reasoning": "..."}},
     {{"rank": 3, "asset": "...", "symbol": "...", "category": "...", "direction": "BUY", "entry": 0, "stop_loss": 0, "take_profit": 0, "rr_ratio": "1:2", "confidence": "MEDIUM", "reasoning": "..."}}
@@ -289,26 +302,86 @@ Respond with ONLY valid JSON (no markdown fences, no text before or after):
   "market_outlook": "2-3 sentence overall market sentiment right now."
 }}"""
 
+
+def _parse_ai_response(raw: str):
+    raw = raw.strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+    parsed = json.loads(raw)
+    return parsed.get("signals", []), parsed.get("market_outlook", "")
+
+
+def _call_groq(prompt: str):
+    """Call Groq API (free tier, OpenAI-compatible, llama-3.3-70b)."""
+    if not OAI_AVAILABLE:
+        raise RuntimeError("openai package not installed")
+    client = _OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def _call_openai(prompt: str):
+    """Call OpenAI API."""
+    if not OAI_AVAILABLE:
+        raise RuntimeError("openai package not installed")
+    client = _OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def _call_anthropic(prompt: str):
+    """Call Anthropic Claude API."""
+    if not ANTH_AVAILABLE:
+        raise RuntimeError("anthropic package not installed")
+    client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return (response.content[0].text or "").strip()
+
+
+def _call_ai_analysis(market_data: list, news: list):
+    provider = _detect_ai_provider()
+    if provider == "none":
+        print("[scanner] No AI provider configured — set GROQ_API_KEY (free), OPENAI_API_KEY, or ANTHROPIC_API_KEY")
+        return [], "No AI provider configured."
+
+    prompt = _build_prompt(market_data, news)
+    print(f"[scanner] Using AI provider: {provider}")
+
     try:
-        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = (response.content[0].text or "").strip()
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else raw
-            if raw.startswith("json"):
-                raw = raw[4:].strip()
-        parsed = json.loads(raw)
-        return parsed.get("signals", []), parsed.get("market_outlook", "")
+        if provider == "groq":
+            raw = _call_groq(prompt)
+        elif provider == "openai":
+            raw = _call_openai(prompt)
+        else:
+            raw = _call_anthropic(prompt)
+
+        return _parse_ai_response(raw)
+
     except json.JSONDecodeError as e:
-        print(f"[scanner] AI JSON parse error: {e}")
+        print(f"[scanner] AI JSON parse error ({provider}): {e}")
         return [], ""
     except Exception as e:
-        print(f"[scanner] AI error: {e}\n{traceback.format_exc()}")
+        print(f"[scanner] AI error ({provider}): {e}\n{traceback.format_exc()}")
         return [], ""
 
 
