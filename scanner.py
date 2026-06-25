@@ -46,8 +46,16 @@ OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 XAI_API_KEY        = os.environ.get("XAI_API_KEY", "")
 
+# Ollama — free local inference running on your Zeabur server
+# Set OLLAMA_HOST=http://ollama.zeabur.internal:11434 and OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_HOST  = os.environ.get("OLLAMA_HOST", "").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+
 
 def _detect_ai_provider() -> str:
+    # Ollama first — free local inference, no API key needed
+    if OLLAMA_HOST and OAI_AVAILABLE:
+        return "ollama"
     if XAI_API_KEY and OAI_AVAILABLE:
         return "xai"
     if GROQ_API_KEY and OAI_AVAILABLE:
@@ -513,6 +521,32 @@ def _parse_ai_response(raw: str):
     return parsed.get("signals", []), parsed.get("market_outlook", "")
 
 
+def _call_ollama(prompt: str):
+    """Call a local Ollama instance via its OpenAI-compatible /v1 endpoint."""
+    if not OAI_AVAILABLE:
+        raise RuntimeError("openai package not installed")
+    client = _OpenAI(
+        api_key="ollama",                    # required field but ignored by Ollama
+        base_url=f"{OLLAMA_HOST}/v1",
+    )
+    response = client.chat.completions.create(
+        model=OLLAMA_MODEL,
+        max_tokens=2500,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional quantitative trader. "
+                    "Always respond with valid JSON only — no markdown, no explanation outside the JSON."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 def _call_xai(prompt: str):
     client = _OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
     response = client.chat.completions.create(
@@ -566,7 +600,9 @@ def _call_ai_analysis(market_data: list, news: list):
     print(f"[scanner] Using AI provider: {provider}")
 
     try:
-        if provider == "xai":
+        if provider == "ollama":
+            raw = _call_ollama(prompt)
+        elif provider == "xai":
             raw = _call_xai(prompt)
         elif provider == "groq":
             raw = _call_groq(prompt)
