@@ -299,6 +299,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .log-msg.close { color: #4ade80; }
         .info { background: #0f172a; padding: 12px; border-radius: 8px; font-size: 0.85rem; color: #94a3b8; }
         .info strong { color: #e2e8f0; }
+
+          /* MT5 status panel */
+          .mt5-panel { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+          .mt5-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+          .mt5-dot.connected { background: #4ade80; box-shadow: 0 0 8px #4ade80; }
+          .mt5-dot.disconnected { background: #f87171; box-shadow: 0 0 8px #f87171; }
+          .mt5-dot.unknown { background: #64748b; }
+          .mt5-label { font-size: 1rem; font-weight: 700; }
+          .mt5-meta { font-size: 0.8rem; color: #94a3b8; margin-top: 2px; }
+          .mt5-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-top: 12px; }
+          .mt5-stat { background: #0f172a; padding: 10px 14px; border-radius: 8px; }
+          .mt5-stat-label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.4px; }
+          .mt5-stat-value { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; margin-top: 2px; }
+          .mt5-stat-value.green { color: #4ade80; }
+          .mt5-stat-value.red { color: #f87171; }
+          .mt5-stat-value.blue { color: #38bdf8; }
         .last-update { text-align: center; color: #64748b; font-size: 0.85rem; margin-top: 20px; }
     </style>
 </head>
@@ -377,6 +393,44 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
         </div>
 
+
+          <div class="card" id="mt5Card">
+              <h2>🖥 MT5 Connection</h2>
+              <div class="mt5-panel">
+                  <div class="mt5-dot unknown" id="mt5Dot"></div>
+                  <div>
+                      <div class="mt5-label" id="mt5Label">Checking...</div>
+                      <div class="mt5-meta" id="mt5Meta">—</div>
+                  </div>
+              </div>
+              <div class="mt5-grid">
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Account</div>
+                      <div class="mt5-stat-value blue" id="mt5Account">—</div>
+                  </div>
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Server</div>
+                      <div class="mt5-stat-value" id="mt5Server">—</div>
+                  </div>
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Balance</div>
+                      <div class="mt5-stat-value green" id="mt5Balance">—</div>
+                  </div>
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Equity</div>
+                      <div class="mt5-stat-value" id="mt5Equity">—</div>
+                  </div>
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Free Margin</div>
+                      <div class="mt5-stat-value" id="mt5Margin">—</div>
+                  </div>
+                  <div class="mt5-stat">
+                      <div class="mt5-stat-label">Leverage</div>
+                      <div class="mt5-stat-value blue" id="mt5Leverage">—</div>
+                  </div>
+              </div>
+          </div>
+  
         <div class="card">
             <h2>Controls</h2>
             <div class="controls">
@@ -532,6 +586,46 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+
+          async function fetchMT5Status() {
+              try {
+                  const res = await fetch('/api/mt5_status');
+                  if (!res.ok) throw new Error(res.status);
+                  const d = await res.json();
+                  const dot   = document.getElementById('mt5Dot');
+                  const label = document.getElementById('mt5Label');
+                  const meta  = document.getElementById('mt5Meta');
+                  if (!d.rpc_reachable) {
+                      dot.className     = 'mt5-dot disconnected';
+                      label.textContent = d.error ? '⚠ ' + d.error : '✗ RPC bridge down';
+                      meta.textContent  = 'mt5-server not reachable';
+                  } else if (!d.mt5_connected) {
+                      dot.className     = 'mt5-dot disconnected';
+                      label.textContent = '✗ MT5 not connected to broker';
+                      meta.textContent  = 'Terminal up but not logged in';
+                  } else {
+                      dot.className     = 'mt5-dot connected';
+                      label.textContent = '✓ Connected';
+                      const a = d.account || {};
+                      meta.textContent  = `Build ${d.terminal_build || '?'} · Experts: ${d.expert_enabled ? 'on' : 'off'}`;
+                      const fmt = v => v != null ? '$' + Number(v).toFixed(2) : '—';
+                      document.getElementById('mt5Account').textContent  = a.login ? (a.name || '') + ' (#' + a.login + ')' : '—';
+                      document.getElementById('mt5Server').textContent   = a.server || '—';
+                      document.getElementById('mt5Balance').textContent  = fmt(a.balance);
+                      document.getElementById('mt5Equity').textContent   = fmt(a.equity);
+                      document.getElementById('mt5Margin').textContent   = fmt(a.margin_free);
+                      document.getElementById('mt5Leverage').textContent = a.leverage ? '1:' + a.leverage : '—';
+                  }
+              } catch(e) {
+                  const dot = document.getElementById('mt5Dot');
+                  if (dot) dot.className = 'mt5-dot unknown';
+                  const label = document.getElementById('mt5Label');
+                  if (label) label.textContent = '⚠ Status fetch failed';
+              }
+          }
+          setInterval(fetchMT5Status, 15000);
+          fetchMT5Status();
+  
         setInterval(fetchData, 5000);
         fetchData();
     </script>
@@ -750,7 +844,24 @@ def api_log():
     return jsonify({"log": get_last_lines(50)})
 
 
-@app.route('/api/diagnose')
+
+
+  @app.route('/api/mt5_status')
+  def api_mt5_status():
+      """Proxy the mt5-server /status endpoint so the dashboard can poll it."""
+      host = os.environ.get("MT5_HOST", "")
+      port = os.environ.get("STATUS_PORT", "8002")
+      if not host:
+          return jsonify({"error": "MT5_HOST env var not set", "rpc_reachable": False, "mt5_connected": False})
+      try:
+          r = requests.get(f"http://{host}:{port}/status", timeout=5)
+          return jsonify(r.json())
+      except requests.exceptions.ConnectionError:
+          return jsonify({"error": f"Cannot connect to {host}:{port}", "rpc_reachable": False, "mt5_connected": False})
+      except Exception as e:
+          return jsonify({"error": str(e), "rpc_reachable": False, "mt5_connected": False})
+
+  @app.route('/api/diagnose')
 def api_diagnose():
     """
     Tests every API key and returns a detailed pass/fail report.
