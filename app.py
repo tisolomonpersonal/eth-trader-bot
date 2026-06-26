@@ -846,22 +846,22 @@ def api_log():
 
 
 
-  @app.route('/api/mt5_status')
-  def api_mt5_status():
-      """Proxy the mt5-server /status endpoint so the dashboard can poll it."""
-      host = os.environ.get("MT5_HOST", "")
-      port = os.environ.get("STATUS_PORT", "8002")
-      if not host:
-          return jsonify({"error": "MT5_HOST env var not set", "rpc_reachable": False, "mt5_connected": False})
-      try:
-          r = requests.get(f"http://{host}:{port}/status", timeout=5)
-          return jsonify(r.json())
-      except requests.exceptions.ConnectionError:
-          return jsonify({"error": f"Cannot connect to {host}:{port}", "rpc_reachable": False, "mt5_connected": False})
-      except Exception as e:
-          return jsonify({"error": str(e), "rpc_reachable": False, "mt5_connected": False})
+@app.route('/api/mt5_status')
+def api_mt5_status():
+    """Proxy the mt5-server /status endpoint so the dashboard can poll it."""
+    host = os.environ.get("MT5_HOST", "")
+    port = os.environ.get("STATUS_PORT", "8002")
+    if not host:
+        return jsonify({"error": "MT5_HOST env var not set", "rpc_reachable": False, "mt5_connected": False})
+    try:
+        r = requests.get(f"http://{host}:{port}/status", timeout=5)
+        return jsonify(r.json())
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": f"Cannot connect to {host}:{port}", "rpc_reachable": False, "mt5_connected": False})
+    except Exception as e:
+        return jsonify({"error": str(e), "rpc_reachable": False, "mt5_connected": False})
 
-  @app.route('/api/diagnose')
+@app.route('/api/diagnose')
 def api_diagnose():
     """
     Tests every API key and returns a detailed pass/fail report.
