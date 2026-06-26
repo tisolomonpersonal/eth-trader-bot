@@ -1,5 +1,1 @@
-{
-  "build_type": "buildpack",
-  "python_version": "3.11",
-  "start_command": "python app.py"
-}
+{"build_type": "dockerfile"}
