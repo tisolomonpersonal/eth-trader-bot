@@ -542,26 +542,87 @@ def _parse_ai_response(raw: str):
     """
     Parse AI JSON response robustly.
 
-    qwen2.5:3b (and most small models) often:
-      - Wrap JSON in ```json ... ``` fences even when told not to
-      - Add preamble text like "Here is the JSON:"
-      - Mix explanation text with JSON
+    qwen2.5:3b often:
+      - Wraps JSON in markdown fences
+      - Truncates mid-JSON (tiny context window — only ~250 output tokens available)
+      - Adds preamble text
 
-    Strategy: strip fences, then find the first { ... } blob.
+    Strategy:
+      1. Strip fences, find outermost { } blob
+      2. Try json.loads()
+      3. On failure: extract all complete signal objects via regex (handles truncation)
+      4. Last resort: try to surgically close the truncated JSON
     """
-    import re
-    raw = raw.strip()
+    import re, json as _json
 
-    # 1. Strip markdown fences anywhere in the string
+    raw = raw.strip()
+    # Strip markdown fences
     raw = re.sub(r"```(?:json)?", "", raw).strip()
 
-    # 2. Extract the outermost JSON object (handles preamble text)
+    # Find the outermost JSON object
     match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        raw = match.group(0)
+    blob = match.group(0) if match else raw
 
-    parsed = json.loads(raw)
-    return parsed.get("signals", []), parsed.get("market_outlook", "")
+    # ── Attempt 1: clean parse ──────────────────────────────────────────────────
+    try:
+        parsed = _json.loads(blob)
+        return parsed.get("signals", []), parsed.get("market_outlook", "")
+    except Exception:
+        pass
+
+    # ── Attempt 2: extract individual complete signal objects via regex ──────────
+    # Match complete top-level signal dicts (must contain "direction" field)
+    signal_pattern = re.compile(
+        r'\{[^{}]*?"direction"\s*:\s*"(?:BUY|SELL)"[^{}]*?\}',
+        re.DOTALL
+    )
+    partial_signals = []
+    for m in signal_pattern.finditer(blob):
+        try:
+            sig = _json.loads(m.group(0))
+            # Must have at minimum: asset, direction, entry
+            if sig.get("asset") and sig.get("entry"):
+                partial_signals.append(sig)
+        except Exception:
+            continue
+    if partial_signals:
+        print(f"[scanner] Truncation recovery: extracted {len(partial_signals)} partial signal(s)")
+        outlook_m = re.search(r'"market_outlook"\s*:\s*"([^"]*)"', blob)
+        outlook = outlook_m.group(1) if outlook_m else "Market conditions mixed"
+        return partial_signals, outlook
+
+    # ── Attempt 3: close truncated JSON and retry ───────────────────────────────
+    # Truncation typically leaves a dangling string or value — strip back to last
+    # complete key:value and close the structure
+    try:
+        # Count open braces/brackets to determine needed closers
+        opens_brace   = blob.count("{")
+        closes_brace  = blob.count("}")
+        opens_bracket = blob.count("[")
+        closes_bracket = blob.count("]")
+        # Strip back to the last comma or closing brace of a complete field
+        # Find the last position where a clean value ended (number, bool, or string)
+        clean_end = re.search(
+            r'(\d+\.?\d*|"[^"]*"|true|false|null)(?=[^,:\[\{]*$)',
+            blob
+        )
+        if clean_end:
+            truncated = blob[:clean_end.end()]
+            closers = ("}" * (opens_brace - closes_brace) +
+                       "]" * (opens_bracket - closes_bracket))
+            patched = truncated + closers
+            parsed = _json.loads(patched)
+            sigs = parsed.get("signals", [])
+            # Only keep signals with all required price fields non-zero
+            sigs = [s for s in sigs if s.get("entry") and s.get("stop_loss") and s.get("take_profit")]
+            if sigs:
+                print(f"[scanner] Truncation recovery (close attempt): {len(sigs)} signal(s)")
+                return sigs, parsed.get("market_outlook", "Market conditions mixed")
+    except Exception:
+        pass
+
+    # All attempts failed
+    raise ValueError(f"Could not parse AI response after 3 recovery attempts (raw len={len(raw)})")
 
 
 def _build_ollama_prompt(market_data: list, news: list) -> str:
@@ -592,22 +653,16 @@ def _build_ollama_prompt(market_data: list, news: list) -> str:
     ex_cat   = ex.get("category", "crypto")
     ex_dir   = ex_s.get("direction", "BUY")
     return (
-        "You are a trader. Pick the 3 best trades from this data. "
+        "You are a trader. Pick the SINGLE best trade from this data. "
         "IMPORTANT: Use the exact entry/sl/tp numbers provided — do NOT output 0. "
-        "Reply ONLY with a JSON object, no other text.\n\n"
+        "Reply ONLY with a JSON object. No markdown, no explanation.\n\n"
         "ASSETS:\n" + "\n".join(lines) + "\n\n"
         "NEWS: " + top_news + "\n\n"
-        f'FORMAT (use real numbers from ASSETS above, not 0):\n'
-        f'{{"signals":['
-        f'{{"rank":1,"asset":"{ex_name}","symbol":"{ex_sym}","category":"{ex_cat}","direction":"{ex_dir}",'
+        f'OUTPUT exactly this JSON (fill in real values):\n'
+        f'{{"signals":[{{"rank":1,"asset":"{ex_name}","symbol":"{ex_sym}",'
+        f'"category":"{ex_cat}","direction":"{ex_dir}",'
         f'"entry":{ex_entry},"stop_loss":{ex_sl},"take_profit":{ex_tp},'
-        f'"rr_ratio":"1:2","confidence":"HIGH","reasoning":"brief reason using RSI/MACD/BB values"}},'
-        f'{{"rank":2,"asset":"NAME","symbol":"TICKER","category":"stock","direction":"BUY",'
-        f'"entry":150.25,"stop_loss":143.80,"take_profit":163.15,'
-        f'"rr_ratio":"1:2","confidence":"MEDIUM","reasoning":"..."}},'
-        f'{{"rank":3,"asset":"NAME","symbol":"TICKER","category":"forex","direction":"SELL",'
-        f'"entry":1.08500,"stop_loss":1.09225,"take_profit":1.07050,'
-        f'"rr_ratio":"1:2","confidence":"LOW","reasoning":"..."}}],'
+        f'"rr_ratio":"1:2","confidence":"HIGH","reasoning":"brief"}}],'
         f'"market_outlook":"one sentence"}}'
     )
 
