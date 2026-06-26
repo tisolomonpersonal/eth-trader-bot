@@ -669,7 +669,9 @@ def _call_anthropic(prompt: str):
 def _call_ai_analysis(market_data: list, news: list):
     provider = _detect_ai_provider()
     if provider == "none":
-        print("[scanner] No AI provider configured — set XAI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY")
+        print("[scanner] No AI provider configured.")
+        print("[scanner]   Using Ollama on Zeabur? Set OLLAMA_HOST=http://ollama.zeabur.internal:11434")
+        print("[scanner]   Also set OLLAMA_MODEL (e.g. qwen2.5:3b) — or ANTHROPIC_API_KEY/GROQ_API_KEY as fallback.")
         return [], "No AI provider configured."
 
     print(f"[scanner] Using AI provider: {provider}")
@@ -904,8 +906,9 @@ def run_scan() -> dict:
                 break
         ai_signals = tech_signals
         outlook = (
-            "Technical-only scan (RSI/MACD/Bollinger Bands, 60-day history). "
-            "Set OLLAMA_HOST or an AI API key for full AI analysis."
+            "Technical-only scan (RSI/MACD/Bollinger Bands). "
+            "To enable AI analysis: set OLLAMA_HOST=http://ollama.zeabur.internal:11434 "
+            "and OLLAMA_MODEL (e.g. qwen2.5:3b) on the bot-app service in Zeabur."
         )
 
     # ── No-trade filter ───────────────────────────────────────────────────────
