@@ -86,7 +86,8 @@ _last_scan_result = {}
 _scan_lock = threading.Lock()
 
 # How often to auto-scan (default: every 30 min; override with SCAN_INTERVAL_HOURS env)
-_SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "0.5"))
+# 10-minute default for ETH-only mode; override with SCAN_INTERVAL_HOURS env var
+_SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "0.1667"))
 
 def _run_scanner_job():
     global _last_scan_result
@@ -112,7 +113,7 @@ if APS_AVAILABLE:
             next_run_time=datetime.now(),  # run immediately on startup, then every N hours
         )
         _scanner_scheduler.start()
-        print(f"[app] Market scanner scheduled every {_SCAN_INTERVAL_HOURS}h")
+        print(f"[app] Market scanner scheduled every {round(_SCAN_INTERVAL_HOURS * 60)}min")
     except Exception as _e:
         print(f"[app] Scheduler start failed: {_e}")
 else:

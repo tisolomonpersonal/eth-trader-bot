@@ -17,6 +17,12 @@ import html
 import requests
 
 try:
+    import bybit_trader
+    BYBIT_AVAILABLE = True
+except ImportError:
+    BYBIT_AVAILABLE = False
+
+try:
     import yfinance as yf
     YF_AVAILABLE = True
 except ImportError:
@@ -72,45 +78,16 @@ def _detect_ai_provider() -> str:
 # All assets now use yfinance tickers so we get 60-day OHLC history for
 # real RSI / MACD / Bollinger Band calculation on every asset class.
 
-CRYPTO_TICKERS = {
-    "BTC-USD":  "Bitcoin",
-    "ETH-USD":  "Ethereum",
-    "BNB-USD":  "BNB",
-    "SOL-USD":  "Solana",
-    "XRP-USD":  "XRP",
-    "ADA-USD":  "Cardano",
-    "DOGE-USD": "Dogecoin",
-    "AVAX-USD": "Avalanche",
-    "DOT-USD":  "Polkadot",
-    "LINK-USD": "Chainlink",
+# ETH-only mode — focused scan every 10 minutes on Ethereum
+ETH_TICKERS = {
+    "ETH-USD": "Ethereum",
 }
 
-STOCK_TICKERS = {
-    "SPY":  "S&P 500 ETF",
-    "QQQ":  "NASDAQ ETF",
-    "AAPL": "Apple",
-    "MSFT": "Microsoft",
-    "NVDA": "NVIDIA",
-    "TSLA": "Tesla",
-    "AMZN": "Amazon",
-    "GOOGL": "Alphabet",
-    "META": "Meta",
-    "AMD":  "AMD",
-}
-
-METALS_TICKERS = {
-    "GC=F": "Gold",
-    "SI=F": "Silver",
-    "PL=F": "Platinum",
-}
-
-FOREX_TICKERS = {
-    "EURUSD=X": "EUR/USD",
-    "GBPUSD=X": "GBP/USD",
-    "USDJPY=X": "USD/JPY",
-    "AUDUSD=X": "AUD/USD",
-    "USDCHF=X": "USD/CHF",
-}
+# Legacy multi-market dicts kept for reference (not used in ETH-only mode)
+CRYPTO_TICKERS = ETH_TICKERS
+STOCK_TICKERS  = {}
+METALS_TICKERS = {}
+FOREX_TICKERS  = {}
 
 NEWS_RSS_FEEDS = [
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC&region=US&lang=en-US",
@@ -823,7 +800,7 @@ def _format_summary(signals: list, outlook: str, is_ai: bool = True) -> str:
         f"📡 <b>TRADE SCAN — {now_str}</b>\n"
         f"{'━' * 32}\n"
         f"Analysis: <b>{mode}</b>\n"
-        f"Markets: Crypto · Stocks · Metals · Forex\n"
+        f"Market: Ethereum (ETH/USDT)\n"
         f"Top picks: <b>{assets}</b>\n\n"
         f"🌍 <b>Market Outlook:</b>\n{html.escape(str(outlook))}\n"
         f"{'━' * 32}\n"
@@ -879,19 +856,13 @@ def _format_signal(signal: dict, rank: int, total: int) -> str:
 # ── Main scan ──────────────────────────────────────────────────────────────────
 
 def run_scan() -> dict:
-    print("[scanner] ── Starting multi-market AI scan ──")
+    print("[scanner] ── Starting ETH scan ──")
     t0 = time.time()
 
-    # All asset classes now use yfinance — 60 days of real OHLC for indicator math
-    crypto = _fetch_yfinance(CRYPTO_TICKERS, "crypto")
-    stocks = _fetch_yfinance(STOCK_TICKERS, "stock")
-    metals = _fetch_yfinance(METALS_TICKERS, "metal")
-    forex  = _fetch_yfinance(FOREX_TICKERS,  "forex")
-
-    all_assets = crypto + stocks + metals + forex
-    print(f"[scanner] {len(all_assets)} assets fetched "
-          f"({len(crypto)} crypto, {len(stocks)} stocks, "
-          f"{len(metals)} metals, {len(forex)} forex)")
+    # ETH-only mode — single asset, deep analysis every 10 min
+    eth_assets = _fetch_yfinance(ETH_TICKERS, "crypto")
+    all_assets = eth_assets
+    print(f"[scanner] {len(all_assets)} asset(s) fetched (ETH-only mode)")
 
     # Compute real technical indicators for every asset
     for a in all_assets:
@@ -1023,12 +994,12 @@ def run_scan() -> dict:
             f"🔍 <b>SCAN — {now_str}</b>\n"
             f"{'━'*32}\n"
             f"⏸ <b>NO TRADE — No conviction setup found</b>\n\n"
-            f"Scanned {len(all_assets)} assets across crypto, stocks, metals & forex.\n"
+            f"Scanned ETH — indicators not yet aligned for a clear entry.\n"
             f"Best signal score: <b>{best_score}</b> (minimum needed: {NO_TRADE_THRESHOLD}).\n"
             f"Indicators are not strongly aligned — waiting for a clearer setup.\n\n"
             f"<b>Top {len(top5)} assets checked:</b>\n"
             + "\n".join(reasons) +
-            f"\n\n<i>🕐 Next scan in 30 min. No action needed.</i>"
+            f"\n\n<i>🕐 Next ETH scan in 10 min. No action needed.</i>"
         )
         _send_telegram(no_trade_msg)
         elapsed = round(time.time() - t0, 1)
@@ -1036,7 +1007,7 @@ def run_scan() -> dict:
         return {
             "status": "no_trade", "reason": "all signals below threshold",
             "best_score": best_score, "threshold": NO_TRADE_THRESHOLD,
-            "assets_scanned": len(all_assets), "elapsed_seconds": elapsed,
+            "assets_scanned": 1, "elapsed_seconds": elapsed,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1048,15 +1019,29 @@ def run_scan() -> dict:
         _send_telegram(_format_signal(sig, i, len(ai_signals)))
         time.sleep(0.6)
 
+    # ── Auto-execute on Bybit ─────────────────────────────────────────────────
+    bybit_results = []
+    for sig in ai_signals:
+        if BYBIT_AVAILABLE:
+            trade_result = bybit_trader.execute_trade(sig)
+            bybit_results.append(trade_result)
+            tg_trade_msg = bybit_trader.format_trade_result(trade_result)
+            _send_telegram(tg_trade_msg)
+            time.sleep(0.5)
+        else:
+            print("[scanner] bybit_trader not available — skipping auto-trade")
+
     elapsed = round(time.time() - t0, 1)
-    print(f"[scanner] Done in {elapsed}s — {len(ai_signals)} signals sent to Telegram")
+    print(f"[scanner] Done in {elapsed}s — {len(ai_signals)} signal(s), "
+          f"{sum(1 for r in bybit_results if r.get('status') == 'executed')} Bybit order(s)")
 
     return {
         "status":          "ok",
         "ai_used":         is_ai,
         "signals":         ai_signals,
         "outlook":         outlook,
-        "assets_scanned":  len(all_assets),
+        "bybit_trades":    bybit_results,
+        "assets_scanned":  1,
         "headlines_found": len(news),
         "elapsed_seconds": elapsed,
         "timestamp":       datetime.now(timezone.utc).isoformat(),
