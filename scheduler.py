@@ -1,10 +1,9 @@
 """
 Main bot loop: 1-minute trading cycles + hourly Telegram summary.
-Handles graceful shutdown and automatic recovery from errors.
+Signal handling is NOT done here — gunicorn owns the process signals.
+The bot thread runs as a daemon inside the gunicorn worker.
 """
-import sys
 import time
-import signal
 import traceback
 from datetime import datetime, timezone
 
@@ -20,27 +19,21 @@ log = get_logger("scheduler")
 _running = True
 
 
-def _stop_handler(sig, frame):
+def stop():
+    """Called by gunicorn worker_exit hook to request a clean shutdown."""
     global _running
-    log.info("Shutdown signal received")
-    tg.alert_stopped()
-    sys.exit(0)
+    _running = False
 
 
 def run_bot() -> None:
-    """Entry point — starts the main loop."""
-    global _running
-
-    signal.signal(signal.SIGTERM, _stop_handler)
-    signal.signal(signal.SIGINT,  _stop_handler)
-
+    """Main bot loop — runs inside the gunicorn worker thread."""
     log.info(f"BNB/USDT Spot Bot starting | paper={config.PAPER_MODE} | "
              f"testnet={config.BYBIT_TESTNET}")
 
     tg.alert_started()
 
-    state      = strategy.load_state()
-    last_hour  = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    state        = strategy.load_state()
+    last_hour    = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     error_streak = 0
 
     while _running:
@@ -62,11 +55,10 @@ def run_bot() -> None:
             elif error_streak == 4:
                 tg.alert_critical(
                     f"Bot has failed {error_streak} consecutive cycles.\n"
-                    f"Last error: {err_msg}\n"
-                    "Check logs urgently."
+                    f"Last error: {err_msg}\nCheck Zeabur logs urgently."
                 )
 
-            # Exponential back-off: 30s, 60s, 120s, cap at 300s
+            # Exponential back-off: 30s → 60s → 120s → cap at 300s
             backoff = min(30 * (2 ** (error_streak - 1)), 300)
             log.info(f"Retrying in {backoff}s")
             time.sleep(backoff)
@@ -85,7 +77,7 @@ def run_bot() -> None:
                 log.error(f"Hourly summary error: {e}")
 
         # Sleep the remainder of the 60-second cycle
-        elapsed  = time.time() - cycle_start
-        sleep_s  = max(5, 60 - elapsed)
-        log.debug(f"Cycle done in {elapsed:.1f}s — sleeping {sleep_s:.0f}s")
-        time.sleep(sleep_s)
+        elapsed = time.time() - cycle_start
+        time.sleep(max(5, 60 - elapsed))
+
+    log.info("Bot loop exited cleanly")
