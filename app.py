@@ -119,6 +119,92 @@ else:
     print("[app] APScheduler not installed — auto-scan disabled (use /api/scan to trigger manually)")
 
 
+# ── MT5 connection monitor + Telegram alerts ──────────────────────────────────
+_mt5_last_state = None   # None=unknown, True=connected, False=disconnected
+_mt5_monitor_lock = threading.Lock()
+
+
+def _send_telegram(text):
+    """Send a Telegram message. Silently no-ops if env vars are missing."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            "https://api.telegram.org/bot{}/sendMessage".format(token),
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=8,
+        )
+    except Exception as e:
+        print("[mt5-monitor] Telegram send failed: {}".format(e))
+
+
+def _mt5_monitor_loop():
+    """Background thread: polls MT5 status every 60 s, sends Telegram alert on change."""
+    global _mt5_last_state
+    host        = os.environ.get("MT5_HOST", "")
+    status_port = os.environ.get("STATUS_PORT", "8002")
+    interval    = int(os.environ.get("MT5_MONITOR_INTERVAL", "60"))
+
+    if not host:
+        print("[mt5-monitor] MT5_HOST not set — monitor disabled.")
+        return
+
+    print("[mt5-monitor] Watching {}:{} every {}s".format(host, status_port, interval))
+    data = {}
+
+    while True:
+        try:
+            r = requests.get("http://{}:{}/status".format(host, status_port), timeout=6)
+            data = r.json()
+            connected = bool(data.get("mt5_connected", False))
+        except Exception:
+            data = {}
+            connected = False
+
+        with _mt5_monitor_lock:
+            prev = _mt5_last_state
+            _mt5_last_state = connected
+
+        if prev is None:
+            # First poll — record baseline, no alert
+            pass
+        elif connected and not prev:
+            acct   = data.get("account") or {}
+            name   = acct.get("name", "")
+            server = acct.get("server", "")
+            bal    = acct.get("balance")
+            bal_str = "${:.2f}".format(bal) if bal is not None else "?"
+            _send_telegram(
+                "*MT5 Connected* ✅\n"
+                "Account: {}\n"
+                "Server: {}\n"
+                "Balance: {}".format(name, server, bal_str)
+            )
+            print("[mt5-monitor] Connected — Telegram alert sent.")
+        elif not connected and prev:
+            _send_telegram(
+                "*MT5 Disconnected* 🔴\n"
+                "Lost connection to broker on `{}`.\n"
+                "Bot cannot trade until MT5 reconnects.".format(host)
+            )
+            print("[mt5-monitor] Disconnected — Telegram alert sent.")
+
+        time.sleep(interval)
+
+
+# Start monitor (only if MT5_HOST is configured)
+if os.environ.get("MT5_HOST"):
+    _mt5_monitor_thread = threading.Thread(
+        target=_mt5_monitor_loop, daemon=True, name="mt5-monitor"
+    )
+    _mt5_monitor_thread.start()
+    print("[mt5-monitor] Monitor thread started.")
+else:
+    print("[mt5-monitor] MT5_HOST not set — monitor thread skipped.")
+
+
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 @app.route('/static/emotions/<path:filename>')
