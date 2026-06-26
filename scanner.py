@@ -538,12 +538,27 @@ Respond with ONLY valid JSON (no markdown fences, no text before or after):
 
 
 def _parse_ai_response(raw: str):
+    """
+    Parse AI JSON response robustly.
+
+    qwen2.5:3b (and most small models) often:
+      - Wrap JSON in ```json ... ``` fences even when told not to
+      - Add preamble text like "Here is the JSON:"
+      - Mix explanation text with JSON
+
+    Strategy: strip fences, then find the first { ... } blob.
+    """
+    import re
     raw = raw.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
-        if raw.startswith("json"):
-            raw = raw[4:].strip()
+
+    # 1. Strip markdown fences anywhere in the string
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+
+    # 2. Extract the outermost JSON object (handles preamble text)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
+
     parsed = json.loads(raw)
     return parsed.get("signals", []), parsed.get("market_outlook", "")
 
@@ -606,7 +621,7 @@ def _call_ollama(prompt: str):
     client = _OpenAI(
         api_key="ollama",            # required field, ignored by Ollama
         base_url=f"{OLLAMA_HOST}/v1",
-        timeout=150.0,               # fall back to technical signals if model is too slow
+        timeout=300.0,               # qwen2.5:3b can be slow on cold start — allow 5 min
     )
     response = client.chat.completions.create(
         model=OLLAMA_MODEL,
@@ -678,7 +693,10 @@ def _call_ai_analysis(market_data: list, news: list):
 
     try:
         if provider == "ollama":
-            raw = _call_ollama(_build_ollama_prompt(market_data, news))
+            prompt = _build_ollama_prompt(market_data, news)
+            print(f"[scanner] Calling Ollama at {OLLAMA_HOST} model={OLLAMA_MODEL} ...")
+            raw = _call_ollama(prompt)
+            print(f"[scanner] Ollama raw response ({len(raw)} chars): {raw[:200]!r}")
         elif provider == "xai":
             raw = _call_xai(_build_prompt(market_data, news))
         elif provider == "groq":
@@ -689,10 +707,12 @@ def _call_ai_analysis(market_data: list, news: list):
             raw = _call_anthropic(_build_prompt(market_data, news))
         return _parse_ai_response(raw)
     except json.JSONDecodeError as e:
-        print(f"[scanner] AI JSON parse error ({provider}): {e}")
+        print(f"[scanner] JSON parse error ({provider}): {e}")
+        print(f"[scanner] Raw was: {raw[:500]!r}")
         return [], ""
     except Exception as e:
-        print(f"[scanner] AI error ({provider}): {e}\n{traceback.format_exc()}")
+        print(f"[scanner] AI call failed ({provider}): {type(e).__name__}: {e}")
+        print(traceback.format_exc())
         return [], ""
 
 
