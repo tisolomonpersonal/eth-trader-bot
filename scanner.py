@@ -13,6 +13,7 @@ import json
 import traceback
 from datetime import datetime, timezone
 
+import html
 import requests
 
 try:
@@ -625,7 +626,7 @@ def _call_ollama(prompt: str):
     )
     response = client.chat.completions.create(
         model=OLLAMA_MODEL,
-        max_tokens=1200,             # smaller cap — 3B models lose JSON coherence at high token counts
+        max_tokens=2000,             # 1200 was truncating qwen2.5:3b mid-JSON causing parse errors
         messages=[
             {
                 "role": "system",
@@ -769,7 +770,7 @@ def _format_summary(signals: list, outlook: str, is_ai: bool = True) -> str:
         f"Analysis: <b>{mode}</b>\n"
         f"Markets: Crypto · Stocks · Metals · Forex\n"
         f"Top picks: <b>{assets}</b>\n\n"
-        f"🌍 <b>Market Outlook:</b>\n{outlook}\n"
+        f"🌍 <b>Market Outlook:</b>\n{html.escape(str(outlook))}\n"
         f"{'━' * 32}\n"
         f"Sending {len(signals)} signal(s) below ↓"
     )
@@ -783,6 +784,8 @@ def _format_signal(signal: dict, rank: int, total: int) -> str:
     conf      = signal.get("confidence", "MEDIUM")
     conf_emoji = {"HIGH": "🔥", "MEDIUM": "⚡", "LOW": "⚠️"}.get(conf, "⚡")
     conf_str  = f"{conf_emoji} {conf}"
+    # Escape HTML special chars from AI-generated text — Telegram rejects < > & in HTML mode
+    def _esc(v): return html.escape(str(v)) if v else ""
 
     entry = signal.get("entry", 0)
     sl    = signal.get("stop_loss", 0)
@@ -802,7 +805,7 @@ def _format_signal(signal: dict, rank: int, total: int) -> str:
         )
 
     return (
-        f"{cat_emoji} <b>SIGNAL {rank}/{total} — {signal.get('asset', '?')}</b>\n"
+        f"{cat_emoji} <b>SIGNAL {rank}/{total} — {_esc(signal.get('asset', '?'))}</b>\n"
         f"{'─' * 32}\n"
         f"Direction:   {dir_str}\n"
         f"Confidence:  {conf_str}\n"
@@ -812,7 +815,7 @@ def _format_signal(signal: dict, rank: int, total: int) -> str:
         f"🛑 <b>Stop Loss:</b>   {_fmt_price(sl, category)}\n"
         f"🎯 <b>Take Profit:</b> {_fmt_price(tp, category)}\n"
         f"⚖️ <b>Risk:Reward:</b> {rr}\n\n"
-        f"📋 <b>Why:</b>\n{signal.get('reasoning', 'No reasoning provided.')}\n"
+        f"📋 <b>Why:</b>\n{_esc(signal.get('reasoning', 'No reasoning provided.'))}\n"
         f"{'─' * 32}\n"
         f"<i>⚠️ Not financial advice. Always manage your own risk.</i>"
     )
