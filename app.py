@@ -60,7 +60,7 @@ def tradfi_status():
     history = get_history()[-5:]
     return jsonify({
         "status":     "ok",
-        "paper_mode": config.PAPER_MODE,
+        "paper_mode": config.TRADFI_PAPER,
         "symbol":     config.TRADFI_SYMBOL,
         "state":      state,
         "recent_trades": history,
@@ -89,7 +89,9 @@ def tradfi_debug():
         "requested_symbol":  base,
         "tradfi_mode":       config.TRADFI_MODE,
         "interval_min":      config.TRADFI_INTERVAL,
-        "paper_mode":        config.PAPER_MODE,
+        "paper_mode":        config.TRADFI_PAPER,
+        "mt5_host_set":      bool(config.MT5_HOST),
+        "mt5_creds_set":     bool(config.MT5_LOGIN and config.MT5_PASSWORD and config.MT5_SERVER),
     }
     try:
         resolved = tc.resolve_symbol(base)

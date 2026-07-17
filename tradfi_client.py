@@ -1,28 +1,25 @@
 """
-Bybit TradFi client (stocks / forex / metals / indices CFD-style perpetuals).
+Bybit TradFi client — MetaTrader 5 edition.
 
-TradFi is NOT a separate API — it runs through the same V5 endpoints as
-crypto derivatives, using category="linear". No new host, no new keys:
-it reuses BYBIT_API_KEY / BYBIT_API_SECRET from config.py and sits under
-the Unified Trading Account (UTA).
+Bybit TradFi (Forex, Metals, Indices, Commodities, Stock CFDs) does NOT live on
+Bybit's V5 crypto API. It runs on a separate MetaTrader 5 (MT5) system, and the
+only way to automate it is to talk to an MT5 terminal. This module connects to
+the `mt5-server` service (Wine + MetaTrader5 + mt5linux RPC bridge) and exposes
+the SAME public interface the old V5 client had, so tradfi_strategy.py /
+scheduler.py / tradfi_risk.py keep working unchanged:
 
-Two important differences from bybit_client.py (crypto spot):
-  1. Symbol suffix depends on account mode:
-       Zero-Fee Mode    -> ".s" suffix, e.g. "XAUUSD.s", "EURUSD.s"
-       Tight-Spread Mode -> no suffix,   e.g. "XAUUSD",   "EURUSD"
-     (Tight-Spread requires meeting an asset threshold — see Bybit's
-     "TradFi Trading Account Modes" help article.)
-  2. Market hours are NOT 24/7. Forex is ~24h on weekdays; indices,
-     commodities, and US stocks follow their underlying market sessions.
-     Outside trading hours the API can return empty orderbooks or stale
-     prices — callers should check is_market_open-style signals from
-     get_instrument_info() (tradingStatus) before firing orders.
+    resolve_symbol, get_klines, list_symbols, get_instrument_info,
+    is_market_open, get_balance, get_position, get_swap_fee,
+    place_market_order, place_market_buy, place_market_sell, close_position
 
-This module is intentionally standalone (not wired into strategy.py /
-scheduler.py). The existing bot's strategy loop is written around a single
-crypto spot symbol with crypto-appropriate position sizing and always-on
-market hours — bolting TradFi into that loop needs a real decision about
-which instrument, sizing, and leverage to use, not a guess.
+Symbols follow Bybit TradFi naming: Zero-Fee mode adds a ".s" suffix
+(EURUSD.s, XAUUSD.s); Tight-Spread mode has no suffix. TRADFI_MODE controls it,
+and resolve_symbol auto-detects whichever variant the terminal actually lists.
+
+Connection settings (config / env):
+    MT5_HOST, MT5_PORT   — where the mt5linux RPC bridge listens
+    MT5_LOGIN, MT5_PASSWORD, MT5_SERVER — Bybit MT5 account credentials
+When those aren't set, config.TRADFI_PAPER is True and no live orders are sent.
 """
 import time
 from datetime import datetime, timezone
@@ -36,27 +33,51 @@ from logger import get_logger
 log = get_logger("tradfi")
 
 _MAX_RETRIES = 3
-_RETRY_DELAY = 5  # seconds between retries
+_RETRY_DELAY = 3  # seconds between retries
 
-_http = None  # lazy singleton — shared client pattern, same as bybit_client.py
+_mt5_proxy = None          # cached mt5linux MetaTrader5 proxy
+_symbol_cache: dict = {}   # base symbol -> the variant the terminal actually lists
 
 
-def _client():
-    global _http
-    if _http is None:
-        from pybit.unified_trading import HTTP
-        _http = HTTP(
-            testnet=config.BYBIT_TESTNET,
-            api_key=config.BYBIT_API_KEY    or None,
-            api_secret=config.BYBIT_API_SECRET or None,
-        )
-        log.info(f"TradFi client ready (testnet={config.BYBIT_TESTNET})")
-    return _http
+# ── Connection ────────────────────────────────────────────────────────────────
+
+def _mt5():
+    """Return a connected mt5linux MetaTrader5 proxy (lazy singleton)."""
+    global _mt5_proxy
+    if _mt5_proxy is not None:
+        return _mt5_proxy
+
+    if not config.MT5_HOST:
+        raise RuntimeError("MT5_HOST not set — cannot reach the MT5 terminal.")
+
+    from mt5linux import MetaTrader5  # imported lazily so paper/local runs don't need it
+
+    m = MetaTrader5(host=config.MT5_HOST, port=config.MT5_PORT)
+
+    login = int(config.MT5_LOGIN) if str(config.MT5_LOGIN).isdigit() else None
+    initialized = False
+    if login:
+        initialized = bool(m.initialize(login=login,
+                                        password=config.MT5_PASSWORD,
+                                        server=config.MT5_SERVER))
+    if not initialized:
+        initialized = bool(m.initialize())
+    if not initialized:
+        raise RuntimeError(f"MT5 initialize() failed: {m.last_error()}")
+
+    # Make sure we're actually logged in to the broker.
+    if login and m.account_info() is None:
+        if not m.login(login, password=config.MT5_PASSWORD, server=config.MT5_SERVER):
+            raise RuntimeError(f"MT5 login failed: {m.last_error()}")
+
+    _mt5_proxy = m
+    log.info(f"MT5 connected via {config.MT5_HOST}:{config.MT5_PORT}")
+    return m
 
 
 def _reset_client():
-    global _http
-    _http = None
+    global _mt5_proxy
+    _mt5_proxy = None
 
 
 def _retry(fn, label: str):
@@ -71,11 +92,21 @@ def _retry(fn, label: str):
             time.sleep(_RETRY_DELAY * attempt)
 
 
-_symbol_cache: dict = {}  # base -> the variant the exchange actually accepts
+def _timeframe(m, interval):
+    """Map a minutes-string interval to an MT5 TIMEFRAME_* constant."""
+    mapping = {
+        "1": "TIMEFRAME_M1", "3": "TIMEFRAME_M3", "5": "TIMEFRAME_M5",
+        "15": "TIMEFRAME_M15", "30": "TIMEFRAME_M30", "60": "TIMEFRAME_H1",
+        "120": "TIMEFRAME_H2", "240": "TIMEFRAME_H4", "D": "TIMEFRAME_D1",
+        "1D": "TIMEFRAME_D1", "W": "TIMEFRAME_W1",
+    }
+    return getattr(m, mapping.get(str(interval), "TIMEFRAME_M15"))
 
+
+# ── Symbol resolution ─────────────────────────────────────────────────────────
 
 def _normalize_base(sym: str) -> str:
-    sym = sym.upper()
+    sym = str(sym).upper()
     if sym.endswith(".S"):
         sym = sym[:-2]
     return sym
@@ -83,13 +114,12 @@ def _normalize_base(sym: str) -> str:
 
 def resolve_symbol(base_symbol: Optional[str] = None) -> str:
     """
-    Return the symbol variant the exchange actually lists.
+    Return the symbol variant the terminal actually lists.
 
-    TRADFI_MODE gives us a *preferred* suffix (zero_fee -> ".s", tight_spread ->
-    none), but if the account mode doesn't match, the preferred variant won't
-    exist and every call fails as "closed". So we probe both variants once,
-    cache whichever the exchange knows, and reuse it. Falls back to the
-    configured guess (no crash) if neither can be verified.
+    TRADFI_MODE gives a preferred suffix (zero_fee -> ".s", tight_spread -> none).
+    If the preferred variant isn't found we probe the alternate, cache whichever
+    the terminal knows, and add it to Market Watch. Falls back to the configured
+    guess (no crash) if the terminal is unreachable.
     """
     base = _normalize_base(base_symbol or config.TRADFI_SYMBOL)
     if base in _symbol_cache:
@@ -98,214 +128,283 @@ def resolve_symbol(base_symbol: Optional[str] = None) -> str:
     preferred = f"{base}.s" if config.TRADFI_MODE == "zero_fee" else base
     candidates = [preferred, base if preferred.endswith(".s") else f"{base}.s"]
 
-    for cand in candidates:
-        try:
-            resp = _client().get_instruments_info(
-                category=config.TRADFI_CATEGORY, symbol=cand)
-            if resp.get("result", {}).get("list"):
+    try:
+        m = _mt5()
+        for cand in candidates:
+            if m.symbol_info(cand) is not None:
+                m.symbol_select(cand, True)
                 if cand != preferred:
                     log.warning(f"Symbol {preferred} not found — using {cand} "
                                 f"(check TRADFI_MODE matches your account)")
                 _symbol_cache[base] = cand
                 return cand
-        except Exception as e:
-            log.warning(f"Symbol probe {cand} failed: {e}")
+        log.warning(f"Neither {candidates} found in terminal for base {base}")
+    except Exception as e:
+        log.warning(f"Symbol probe failed ({e}); using {preferred}")
 
-    return preferred  # unverified fallback; don't block resolution
+    return preferred
 
 
-# ── Market data (public — no auth required) ───────────────────────────────────
+# ── Market data ───────────────────────────────────────────────────────────────
 
 def get_klines(symbol: Optional[str] = None, interval: Optional[str] = None,
-                limit: int = 250) -> pd.DataFrame:
-    """Fetch OHLCV candles for a TradFi instrument. Returns DataFrame oldest→newest."""
+               limit: int = 250) -> pd.DataFrame:
+    """Fetch OHLCV candles. Returns a DataFrame (oldest→newest) with columns
+    ts, open, high, low, close, vol — the shape indicators.calculate expects."""
     sym = resolve_symbol(symbol)
     itv = interval or config.TRADFI_INTERVAL
+    cols = ["ts", "open", "high", "low", "close", "vol"]
 
     def _fetch():
-        resp = _client().get_kline(
-            category=config.TRADFI_CATEGORY,
-            symbol=sym,
-            interval=itv,
-            limit=limit,
-        )
-        rows = resp["result"]["list"]
-        if not rows:
+        m = _mt5()
+        m.symbol_select(sym, True)
+        rates = m.copy_rates_from_pos(sym, _timeframe(m, itv), 0, limit)
+        if rates is None or len(rates) == 0:
             log.warning(f"No candles returned for {sym} — market may be closed")
-        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "vol", "turn"])
-        df = df.astype({
-            "ts":    "int64",
-            "open":  "float64",
-            "high":  "float64",
-            "low":   "float64",
-            "close": "float64",
-            "vol":   "float64",
+            return pd.DataFrame(columns=cols)
+
+        df = pd.DataFrame(rates)
+        if "tick_volume" in df.columns:
+            df["vol"] = df["tick_volume"]
+        elif "real_volume" in df.columns:
+            df["vol"] = df["real_volume"]
+        else:
+            df["vol"] = 0.0
+        df["ts"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df[cols].astype({
+            "open": "float64", "high": "float64", "low": "float64",
+            "close": "float64", "vol": "float64",
         })
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df.sort_values("ts").reset_index(drop=True)
 
     return _retry(_fetch, "tradfi_get_klines")
 
 
 def list_symbols(search: Optional[str] = None, limit: int = 1000) -> list:
-    """
-    Return the TradFi (linear) instrument symbols the account can actually see,
-    optionally filtered by a case-insensitive substring. Use this to discover
-    the exact ticker Bybit expects (e.g. is it EURUSD.s, EURUSDT, or not listed).
-    """
+    """List instrument symbols the terminal exposes, optionally filtered by a
+    case-insensitive substring (e.g. search='EUR')."""
     def _fetch():
-        resp = _client().get_instruments_info(
-            category=config.TRADFI_CATEGORY, limit=limit)
-        rows = resp.get("result", {}).get("list", []) or []
-        syms = [r.get("symbol", "") for r in rows]
+        m = _mt5()
+        syms = m.symbols_get() or []
+        names = [getattr(s, "name", "") for s in syms]
         if search:
             s = search.upper()
-            syms = [x for x in syms if s in x.upper()]
-        return sorted(syms)
+            names = [x for x in names if s in x.upper()]
+        return sorted(names)[:limit]
 
     return _retry(_fetch, "tradfi_list_symbols")
 
 
 def get_instrument_info(symbol: Optional[str] = None) -> dict:
     """
-    Returns instrument metadata: lot size, tick size, leverage limits,
-    and tradingStatus (use this to check if the market is currently open
-    before placing orders — TradFi is NOT 24/7 like crypto).
+    Return instrument metadata in a shape tradfi_risk.calculate_position_qty
+    understands. lotSizeFilter mirrors the old V5 keys (qtyStep/minOrderQty),
+    now sourced from MT5's volume_step/volume_min. Also includes contract_size
+    and margin_per_lot so position sizing can budget by real margin.
     """
-    sym = resolve_symbol(symbol)
-
     def _fetch():
-        resp = _client().get_instruments_info(category=config.TRADFI_CATEGORY, symbol=sym)
-        return resp["result"]["list"][0]
+        m = _mt5()
+        sym = resolve_symbol(symbol)
+        m.symbol_select(sym, True)
+        info = m.symbol_info(sym)
+        if info is None:
+            raise RuntimeError(f"symbol_info({sym}) returned None")
+
+        vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+        vstep = float(getattr(info, "volume_step", vmin) or vmin)
+        vmax = float(getattr(info, "volume_max", 0) or 0)
+        contract = float(getattr(info, "trade_contract_size", 1) or 1)
+
+        margin_per_lot = None
+        try:
+            tick = m.symbol_info_tick(sym)
+            price = float(getattr(tick, "ask", 0) or getattr(tick, "bid", 0) or 0)
+            if price > 0:
+                margin_per_lot = m.order_calc_margin(m.ORDER_TYPE_BUY, sym, 1.0, price)
+        except Exception as e:
+            log.debug(f"order_calc_margin failed for {sym}: {e}")
+
+        return {
+            "symbol": sym,
+            "digits": int(getattr(info, "digits", 2) or 2),
+            "contract_size": contract,
+            "margin_per_lot": float(margin_per_lot) if margin_per_lot else None,
+            "lotSizeFilter": {
+                "qtyStep": vstep,
+                "minOrderQty": vmin,
+                "maxOrderQty": vmax,
+            },
+        }
 
     return _retry(_fetch, "tradfi_instrument_info")
 
 
 def is_market_open(symbol: Optional[str] = None) -> bool:
     """
-    Open == the exchange is still producing fresh candles for this symbol.
-
-    This is far more reliable than the instrument "status" field, which reports
-    the *listing* status ("Trading" = the instrument is listed), NOT whether the
-    session is currently open. During real market hours candles keep advancing;
-    over the weekend / session close they go stale. We consider the market open
-    when the newest candle is younger than ~3 intervals.
+    Open == the terminal has a live, fresh tick for the symbol and trading is
+    enabled. MT5 server time may be offset from UTC by a few hours, so we treat
+    a tick as "live" when it's younger than TRADFI_MARKET_MAX_TICK_AGE_HRS
+    (default 6h) — enough to absorb the offset while still flagging a real
+    weekend/overnight closure (many hours or days stale). Fails safe to closed.
     """
     try:
-        df = get_klines(symbol, limit=2)
-        if df is None or df.empty:
+        m = _mt5()
+        sym = resolve_symbol(symbol)
+        info = m.symbol_info(sym)
+        if info is None:
             return False
-        last_ts = df["ts"].iloc[-1].to_pydatetime()
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
-        try:
-            interval_min = int(config.TRADFI_INTERVAL)
-        except (TypeError, ValueError):
-            interval_min = 15  # non-numeric intervals (e.g. "D") -> daily-ish
-        age_min = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60.0
-        fresh_window = max(3 * interval_min, 10)
-        is_open = age_min <= fresh_window
-        if not is_open:
-            log.info(f"Market looks closed: newest candle {age_min:.0f}m old "
-                     f"(> {fresh_window}m window)")
-        return is_open
+        if not getattr(info, "visible", True):
+            m.symbol_select(sym, True)
+            info = m.symbol_info(sym)
+        if int(getattr(info, "trade_mode", 4) or 0) == 0:  # SYMBOL_TRADE_MODE_DISABLED
+            log.info(f"{sym} trading disabled by broker")
+            return False
+
+        tick = m.symbol_info_tick(sym)
+        if tick is None or float(getattr(tick, "time", 0) or 0) == 0 \
+                or float(getattr(tick, "bid", 0) or 0) <= 0:
+            return False
+
+        age_hrs = (datetime.now(timezone.utc).timestamp() - float(tick.time)) / 3600.0
+        if age_hrs > config.TRADFI_MARKET_MAX_TICK_AGE_HRS:
+            log.info(f"{sym} last tick {age_hrs:.1f}h old "
+                     f"(> {config.TRADFI_MARKET_MAX_TICK_AGE_HRS}h) — market closed")
+            return False
+        return True
     except Exception as e:
-        log.warning(f"Could not determine market status: {e}")
+        log.warning(f"Could not determine MT5 market status: {e}")
         return False
 
 
-# ── Account data (requires auth) ──────────────────────────────────────────────
+# ── Account data ──────────────────────────────────────────────────────────────
 
 def get_balance() -> dict:
-    """Returns {'usdt': float} available in the Unified Trading Account backing TradFi."""
-    if config.PAPER_MODE:
-        return {"usdt": config.MAX_INVESTMENT_USDT * 2}
+    """Returns {'usdt': spendable_amount, ...}. In TradFi 'usdt' is really the
+    account currency (usually USD); the key is kept for interface compatibility."""
+    if config.TRADFI_PAPER:
+        return {"usdt": config.TRADFI_MAX_INVESTMENT_USDT * 2}
 
     def _fetch():
-        resp = _client().get_wallet_balance(accountType=config.TRADFI_ACCOUNT_TYPE)
-        coins = resp["result"]["list"][0]["coin"]
-        bal = {"usdt": 0.0}
-        for c in coins:
-            if c["coin"].upper() == "USDT":
-                bal["usdt"] = float(c.get("walletBalance") or 0)
-        return bal
+        m = _mt5()
+        acc = m.account_info()
+        if acc is None:
+            raise RuntimeError("account_info() returned None (not logged in?)")
+        balance = float(getattr(acc, "balance", 0.0) or 0.0)
+        free = getattr(acc, "margin_free", None)
+        spendable = float(free) if (free is not None and float(free) > 0) else balance
+        return {
+            "usdt": spendable,
+            "balance": balance,
+            "equity": float(getattr(acc, "equity", balance) or balance),
+            "currency": getattr(acc, "currency", "USD"),
+        }
 
     return _retry(_fetch, "tradfi_get_balance")
 
 
 def get_position(symbol: Optional[str] = None) -> Optional[dict]:
-    """Returns the open TradFi position for symbol, or None if flat."""
-    sym = resolve_symbol(symbol)
-
+    """Return the open position for symbol as a normalized dict, or None if flat."""
     def _fetch():
-        resp = _client().get_positions(category=config.TRADFI_CATEGORY, symbol=sym)
-        rows = resp["result"]["list"]
-        if not rows or float(rows[0].get("size") or 0) == 0:
+        m = _mt5()
+        sym = resolve_symbol(symbol)
+        positions = m.positions_get(symbol=sym)
+        if not positions:
             return None
-        return rows[0]
+        p = positions[0]
+        side = "Buy" if int(getattr(p, "type", 0) or 0) == 0 else "Sell"  # 0 = POSITION_TYPE_BUY
+        return {
+            "side": side,
+            "size": float(getattr(p, "volume", 0) or 0),
+            "entry": float(getattr(p, "price_open", 0) or 0),
+            "ticket": int(getattr(p, "ticket", 0) or 0),
+            "profit": float(getattr(p, "profit", 0) or 0),
+        }
 
     return _retry(_fetch, "tradfi_get_position")
 
 
 def get_swap_fee(symbol: Optional[str] = None) -> Optional[dict]:
-    """
-    Overnight swap/financing fee for holding a TradFi position past daily
-    market close. Check this before sizing positions you intend to hold overnight.
-    """
-    sym = resolve_symbol(symbol)
-
-    def _fetch():
-        # Bybit exposes this under the funding-rate style endpoint for linear
-        # instruments; TradFi swap fee mirrors crypto funding-rate history.
-        resp = _client().get_funding_rate_history(category=config.TRADFI_CATEGORY, symbol=sym, limit=1)
-        rows = resp["result"]["list"]
-        return rows[0] if rows else None
-
+    """Overnight swap (financing) rates for holding a position, if available."""
     try:
-        return _retry(_fetch, "tradfi_swap_fee")
-    except Exception as e:
-        log.warning(f"Swap fee lookup failed for {sym}: {e}")
+        m = _mt5()
+        info = m.symbol_info(resolve_symbol(symbol))
+        if info is None:
+            return None
+        return {
+            "swap_long": getattr(info, "swap_long", None),
+            "swap_short": getattr(info, "swap_short", None),
+        }
+    except Exception:
         return None
 
 
 # ── Order execution ────────────────────────────────────────────────────────────
 
-def place_market_order(side: str, qty: float, symbol: Optional[str] = None,
-                        reduce_only: bool = False) -> dict:
-    """
-    Place a market order on a TradFi instrument.
-    side: "Buy" or "Sell". qty is in lots/contracts per the instrument's lotSizeFilter
-    (call get_instrument_info() first to get the correct qtyStep/minOrderQty).
+def _filling_mode(m, info):
+    """Pick an order filling mode the symbol accepts (IOC > FOK > RETURN)."""
+    flags = int(getattr(info, "filling_mode", 0) or 0)
+    if flags & 2:   # SYMBOL_FILLING_IOC
+        return m.ORDER_FILLING_IOC
+    if flags & 1:   # SYMBOL_FILLING_FOK
+        return m.ORDER_FILLING_FOK
+    return m.ORDER_FILLING_RETURN
 
-    NOTE: TradFi does not use isolated/cross/portfolio margin modes like
-    crypto derivatives — margin behaves like a cross-margin variant
-    automatically. There is no separate leverage call needed for most
-    symbols; each symbol has fixed/unique leverage set by Bybit.
+
+def place_market_order(side: str, qty: float, symbol: Optional[str] = None,
+                       reduce_only: bool = False,
+                       position_ticket: Optional[int] = None) -> dict:
+    """
+    Send a market order via MT5. side is 'Buy'/'Sell'; qty is in LOTS.
+    Pass position_ticket to close/reduce a specific open position.
     """
     sym = resolve_symbol(symbol)
-
     if side not in ("Buy", "Sell"):
         raise ValueError(f"side must be 'Buy' or 'Sell', got {side!r}")
 
-    if config.PAPER_MODE:
+    if config.TRADFI_PAPER:
         log.info(f"[PAPER {side.upper()}] {qty} {sym} (reduce_only={reduce_only})")
         return {"paper": True, "symbol": sym, "side": side, "qty": qty}
 
-    if not is_market_open(sym):
-        raise RuntimeError(f"{sym} market appears closed — refusing to place live order")
-
     def _order():
-        resp = _client().place_order(
-            category=config.TRADFI_CATEGORY,
-            symbol=sym,
-            side=side,
-            orderType="Market",
-            qty=str(qty),
-            timeInForce="IOC",
-            reduceOnly=reduce_only,
-        )
-        log.info(f"TradFi {side.upper()} order placed on {sym}: {resp['result']}")
-        return resp["result"]
+        m = _mt5()
+        m.symbol_select(sym, True)
+        info = m.symbol_info(sym)
+        tick = m.symbol_info_tick(sym)
+        if info is None or tick is None:
+            raise RuntimeError(f"No symbol/tick data for {sym}")
+
+        order_type = m.ORDER_TYPE_BUY if side == "Buy" else m.ORDER_TYPE_SELL
+        price = float(getattr(tick, "ask") if side == "Buy" else getattr(tick, "bid"))
+
+        request = {
+            "action": m.TRADE_ACTION_DEAL,
+            "symbol": sym,
+            "volume": float(qty),
+            "type": order_type,
+            "price": price,
+            "deviation": config.MT5_DEVIATION,
+            "magic": config.MT5_MAGIC,
+            "comment": "eth-trader-bot",
+            "type_time": m.ORDER_TIME_GTC,
+            "type_filling": _filling_mode(m, info),
+        }
+        if position_ticket:
+            request["position"] = int(position_ticket)
+
+        res = m.order_send(request)
+        retcode = getattr(res, "retcode", None)
+        if res is None or retcode != m.TRADE_RETCODE_DONE:
+            raise RuntimeError(
+                f"order_send rejected: retcode={retcode} "
+                f"comment={getattr(res, 'comment', '')}")
+        log.info(f"TradFi {side.upper()} {qty} {sym} filled @ "
+                 f"{getattr(res, 'price', price)} (order {getattr(res, 'order', '?')})")
+        return {
+            "order": getattr(res, "order", None),
+            "price": float(getattr(res, "price", price) or price),
+            "volume": float(getattr(res, "volume", qty) or qty),
+            "retcode": retcode,
+        }
 
     return _retry(_order, "tradfi_place_order")
 
@@ -319,10 +418,26 @@ def place_market_sell(qty: float, symbol: Optional[str] = None) -> dict:
 
 
 def close_position(symbol: Optional[str] = None) -> Optional[dict]:
-    """Flatten any open position on symbol with a reduce-only market order."""
-    pos = get_position(symbol)
-    if not pos:
-        log.info(f"No open TradFi position on {resolve_symbol(symbol)} to close")
-        return None
-    side = "Sell" if pos["side"] == "Buy" else "Buy"
-    return place_market_order(side, float(pos["size"]), symbol, reduce_only=True)
+    """Flatten every open position on symbol by sending offsetting market orders
+    referencing each position ticket (the MT5 way to close)."""
+    sym = resolve_symbol(symbol)
+
+    if config.TRADFI_PAPER:
+        log.info(f"[PAPER CLOSE] {sym}")
+        return {"paper": True, "symbol": sym}
+
+    def _close():
+        m = _mt5()
+        positions = m.positions_get(symbol=sym)
+        if not positions:
+            log.info(f"No open TradFi position on {sym} to close")
+            return None
+        results = []
+        for p in positions:
+            side = "Sell" if int(getattr(p, "type", 0) or 0) == 0 else "Buy"
+            results.append(place_market_order(
+                side, float(getattr(p, "volume", 0) or 0), symbol,
+                reduce_only=True, position_ticket=int(getattr(p, "ticket", 0) or 0)))
+        return results
+
+    return _retry(_close, "tradfi_close_position")

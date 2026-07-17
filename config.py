@@ -67,8 +67,25 @@ TRADFI_ALLOW_AVERAGING_DOWN = os.environ.get("TRADFI_ALLOW_AVERAGING_DOWN", "fal
 TRADFI_MIN_AI_CONFIDENCE    = int(os.environ.get("TRADFI_MIN_AI_CONFIDENCE",     "65"))  # higher bar than crypto by default
 TRADFI_CYCLE_SECONDS        = int(os.environ.get("TRADFI_CYCLE_SECONDS",         "300")) # 5 min — matched to coarser TRADFI_INTERVAL
 
+# ── MetaTrader 5 (Bybit TradFi runs on MT5, NOT the V5 crypto API) ─────────────
+# TradFi FX/metals/indices/CFDs are only reachable through an MT5 terminal.
+# The bot-app connects to the mt5-server service over the mt5linux RPC bridge.
+MT5_HOST      = os.environ.get("MT5_HOST", "")            # e.g. mt5-server.zeabur.internal
+MT5_PORT      = int(os.environ.get("MT5_PORT", "8001"))
+MT5_LOGIN     = os.environ.get("MT5_LOGIN", "")           # Bybit MT5 account number
+MT5_PASSWORD  = os.environ.get("MT5_PASSWORD", "")
+MT5_SERVER    = os.environ.get("MT5_SERVER", "")          # Bybit MT5 server name
+MT5_DEVIATION = int(os.environ.get("MT5_DEVIATION", "20"))    # max slippage, points
+MT5_MAGIC     = int(os.environ.get("MT5_MAGIC", "770177"))    # order tag for this bot
+# A live tick older than this many hours counts as "market closed". MT5 server
+# time can be offset from UTC by a few hours, so 6h absorbs the offset while
+# still catching a real weekend/overnight closure.
+TRADFI_MARKET_MAX_TICK_AGE_HRS = float(os.environ.get("TRADFI_MARKET_MAX_TICK_AGE_HRS", "6"))
+
 # ── Mode ──────────────────────────────────────────────────────────────────────
 PAPER_MODE = not bool(BYBIT_API_KEY and BYBIT_API_SECRET)
+# TradFi trades live only when we can actually reach an MT5 terminal with creds.
+TRADFI_PAPER = not bool(MT5_HOST and MT5_LOGIN and MT5_PASSWORD and MT5_SERVER)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR      = Path(os.environ.get("DATA_DIR",   "/data"))

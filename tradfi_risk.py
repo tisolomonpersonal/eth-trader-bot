@@ -77,24 +77,49 @@ def validate_action(
 
 def calculate_position_qty(balance_usdt: float, price: float, instrument_info: dict) -> float:
     """
-    Convert the USDT amount to deploy into a valid order qty (lots/contracts),
-    respecting the instrument's qtyStep and minOrderQty from Bybit's
-    instruments-info response.
+    Convert the budget (TRADFI_MAX_INVESTMENT_USDT * risk%) into a valid MT5
+    order size in LOTS.
+
+    Sizing is by NOTIONAL exposure, not margin — this matches how the crypto
+    bot treats the budget and, crucially, prevents Bybit's very high FX leverage
+    from turning a small margin budget into a huge position. margin_per_lot is
+    used only to (a) cap the size to what the account's free margin can actually
+    support and (b) decide whether the minimum lot is affordable.
     """
-    max_trade = config.TRADFI_MAX_INVESTMENT_USDT * config.TRADFI_RISK_PER_TRADE_PCT / 100
-    usdt_to_use = min(balance_usdt, max_trade)
+    budget_notional = config.TRADFI_MAX_INVESTMENT_USDT * config.TRADFI_RISK_PER_TRADE_PCT / 100
 
-    lot_filter = instrument_info.get("lotSizeFilter", {})
-    qty_step   = float(lot_filter.get("qtyStep", 0.01) or 0.01)
-    min_qty    = float(lot_filter.get("minOrderQty", qty_step) or qty_step)
+    lot_filter     = instrument_info.get("lotSizeFilter", {})
+    qty_step       = float(lot_filter.get("qtyStep", 0.01) or 0.01)
+    min_qty        = float(lot_filter.get("minOrderQty", qty_step) or qty_step)
+    max_qty        = float(lot_filter.get("maxOrderQty", 0) or 0)
+    contract       = float(instrument_info.get("contract_size", 1) or 1)
+    margin_per_lot = instrument_info.get("margin_per_lot")
 
-    raw_qty = usdt_to_use / price if price > 0 else 0
-    steps = math.floor(raw_qty / qty_step)
-    qty   = round(steps * qty_step, 8)
+    denom = price * contract
+    if denom <= 0:
+        return 0.0
 
+    # 1) size by notional budget
+    raw_lots = budget_notional / denom
+    steps    = math.floor(raw_lots / qty_step) if qty_step > 0 else 0
+    qty      = round(steps * qty_step, 8)
+
+    # 2) never exceed what free margin can support (keep 5% buffer)
+    if margin_per_lot and margin_per_lot > 0:
+        affordable = math.floor((balance_usdt * 0.95 / margin_per_lot) / qty_step) * qty_step
+        qty = min(qty, round(affordable, 8))
+
+    if max_qty and qty > max_qty:
+        qty = max_qty
+
+    # 3) if below one min-lot, take the min lot only when its margin is affordable
     if qty < min_qty:
-        log.warning(f"Calculated qty {qty} below minOrderQty {min_qty} — "
-                    f"insufficient balance for a valid TradFi order.")
+        min_cost = (margin_per_lot * min_qty) if (margin_per_lot and margin_per_lot > 0) \
+                   else (denom * min_qty)
+        if min_cost <= balance_usdt:
+            return round(min_qty, 8)
+        log.warning(f"Cannot afford minimum lot {min_qty} "
+                    f"(needs ~${min_cost:.2f}, have ${balance_usdt:.2f}).")
         return 0.0
 
     return qty
