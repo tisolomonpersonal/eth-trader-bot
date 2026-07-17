@@ -6,13 +6,23 @@ import os
 import threading
 import json
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 
 from logger import get_logger
 import config
 
 log = get_logger("app")
 app = Flask(__name__)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.route("/")
+@app.route("/dashboard")
+def dashboard():
+    """Serve the monitoring console (single-file HTML)."""
+    return send_from_directory(_HERE, "dashboard.html")
+
 
 
 @app.route("/healthz")
@@ -29,6 +39,7 @@ def status():
     return jsonify({
         "status":     "ok",
         "paper_mode": config.PAPER_MODE,
+        "symbol":     config.SYMBOL,
         "state":      state,
         "recent_trades": history,
     })
