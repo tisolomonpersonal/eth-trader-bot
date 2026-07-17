@@ -75,6 +75,51 @@ def tradfi_history():
     return jsonify(get_history())
 
 
+@app.route("/tradfi/debug")
+def tradfi_debug():
+    """Diagnostics: shows exactly what the market-open check sees for a symbol.
+    Use ?symbol=EURUSD to test any instrument (defaults to config.TRADFI_SYMBOL)."""
+    from datetime import datetime, timezone
+    from flask import request
+    import tradfi_client as tc
+
+    base = request.args.get("symbol", config.TRADFI_SYMBOL)
+    out = {
+        "configured_symbol": config.TRADFI_SYMBOL,
+        "requested_symbol":  base,
+        "tradfi_mode":       config.TRADFI_MODE,
+        "interval_min":      config.TRADFI_INTERVAL,
+        "paper_mode":        config.PAPER_MODE,
+    }
+    try:
+        resolved = tc.resolve_symbol(base)
+        out["resolved_symbol"] = resolved
+    except Exception as e:
+        out["resolve_error"] = str(e)
+        return jsonify(out)
+
+    try:
+        df = tc.get_klines(base, limit=3)
+        out["candles_returned"] = 0 if df is None else int(len(df))
+        if df is not None and not df.empty:
+            last = df["ts"].iloc[-1].to_pydatetime()
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - last).total_seconds() / 60.0
+            out["newest_candle_utc"] = last.isoformat()
+            out["newest_candle_age_min"] = round(age, 1)
+            out["last_close"] = float(df["close"].iloc[-1])
+    except Exception as e:
+        out["klines_error"] = str(e)
+
+    try:
+        out["is_market_open"] = tc.is_market_open(base)
+    except Exception as e:
+        out["market_open_error"] = str(e)
+
+    return jsonify(out)
+
+
 def _bot_thread():
     from scheduler import run_bot
     run_bot()
