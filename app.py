@@ -120,6 +120,19 @@ def tradfi_debug():
     return jsonify(out)
 
 
+@app.route("/tradfi/symbols")
+def tradfi_symbols():
+    """List available TradFi symbols. Use ?search=EUR to filter."""
+    from flask import request
+    import tradfi_client as tc
+    search = request.args.get("search")
+    try:
+        syms = tc.list_symbols(search)
+        return jsonify({"count": len(syms), "search": search, "symbols": syms})
+    except Exception as e:
+        return jsonify({"error": str(e), "search": search})
+
+
 def _bot_thread():
     from scheduler import run_bot
     run_bot()

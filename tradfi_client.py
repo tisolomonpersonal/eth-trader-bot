@@ -147,6 +147,25 @@ def get_klines(symbol: Optional[str] = None, interval: Optional[str] = None,
     return _retry(_fetch, "tradfi_get_klines")
 
 
+def list_symbols(search: Optional[str] = None, limit: int = 1000) -> list:
+    """
+    Return the TradFi (linear) instrument symbols the account can actually see,
+    optionally filtered by a case-insensitive substring. Use this to discover
+    the exact ticker Bybit expects (e.g. is it EURUSD.s, EURUSDT, or not listed).
+    """
+    def _fetch():
+        resp = _client().get_instruments_info(
+            category=config.TRADFI_CATEGORY, limit=limit)
+        rows = resp.get("result", {}).get("list", []) or []
+        syms = [r.get("symbol", "") for r in rows]
+        if search:
+            s = search.upper()
+            syms = [x for x in syms if s in x.upper()]
+        return sorted(syms)
+
+    return _retry(_fetch, "tradfi_list_symbols")
+
+
 def get_instrument_info(symbol: Optional[str] = None) -> dict:
     """
     Returns instrument metadata: lot size, tick size, leverage limits,
