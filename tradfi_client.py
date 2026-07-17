@@ -441,3 +441,59 @@ def close_position(symbol: Optional[str] = None) -> Optional[dict]:
         return results
 
     return _retry(_close, "tradfi_close_position")
+
+
+# ── Diagnostics ────────────────────────────────────────────────────────────────
+
+def diagnose(symbol: Optional[str] = None) -> dict:
+    """One-shot health check for the MT5 link — surfaces exactly why a symbol
+    reads as closed. Consumed by the /tradfi/debug endpoint."""
+    d = {
+        "mt5_host": config.MT5_HOST or "(not set)",
+        "mt5_port": config.MT5_PORT,
+        "creds_set": bool(config.MT5_LOGIN and config.MT5_PASSWORD and config.MT5_SERVER),
+        "tradfi_paper": config.TRADFI_PAPER,
+    }
+    try:
+        m = _mt5()
+        d["connected"] = True
+    except Exception as e:
+        d["connected"] = False
+        d["connect_error"] = str(e)
+        return d
+
+    try:
+        acc = m.account_info()
+        d["account"] = None if acc is None else {
+            "login": getattr(acc, "login", None),
+            "server": getattr(acc, "server", None),
+            "balance": getattr(acc, "balance", None),
+            "currency": getattr(acc, "currency", None),
+        }
+    except Exception as e:
+        d["account_error"] = str(e)
+
+    try:
+        sym = resolve_symbol(symbol)
+        d["resolved_symbol"] = sym
+        info = m.symbol_info(sym)
+        d["symbol_found"] = info is not None
+        if info is not None:
+            d["trade_mode"] = getattr(info, "trade_mode", None)
+            d["visible"] = getattr(info, "visible", None)
+            tick = m.symbol_info_tick(sym)
+            if tick is not None:
+                age = datetime.now(timezone.utc).timestamp() - float(getattr(tick, "time", 0) or 0)
+                d["tick"] = {
+                    "bid": getattr(tick, "bid", None),
+                    "ask": getattr(tick, "ask", None),
+                    "age_hours": round(age / 3600, 2),
+                }
+    except Exception as e:
+        d["symbol_error"] = str(e)
+
+    try:
+        d["is_market_open"] = is_market_open(symbol)
+    except Exception as e:
+        d["market_open_error"] = str(e)
+    return d
