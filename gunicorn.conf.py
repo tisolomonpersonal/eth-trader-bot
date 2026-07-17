@@ -16,12 +16,23 @@ errorlog   = "-"
 
 
 def post_fork(server, worker):
-    """Start bot thread after the worker process is forked (not in master)."""
+    """Start bot thread(s) after the worker process is forked (not in master)."""
     import threading
-    from scheduler import run_bot
+    import config
+    from scheduler import run_bot, run_tradfi_bot
+
     t = threading.Thread(target=run_bot, daemon=True, name="bnb-bot")
     t.start()
     server.log.info("BNB bot thread started in worker")
+
+    # Start the TradFi loop too, but only when the master switch is on — mirrors
+    # the app.py __main__ launcher so both run paths behave identically.
+    if config.TRADFI_ENABLED:
+        tt = threading.Thread(target=run_tradfi_bot, daemon=True, name="tradfi-bot")
+        tt.start()
+        server.log.info(f"TradFi bot thread started in worker (symbol={config.TRADFI_SYMBOL})")
+    else:
+        server.log.info("TRADFI_ENABLED=false — TradFi bot thread not started")
 
 
 def worker_exit(server, worker):
