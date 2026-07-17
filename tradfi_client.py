@@ -497,3 +497,32 @@ def diagnose(symbol: Optional[str] = None) -> dict:
     except Exception as e:
         d["market_open_error"] = str(e)
     return d
+
+
+def market_status_reason(symbol: Optional[str] = None) -> str:
+    """Human-readable reason data/trading is unavailable — shown on the dashboard
+    so 'closed' vs 'MT5 unreachable' vs 'wrong symbol' are distinguishable."""
+    if config.TRADFI_PAPER:
+        return "TradFi paper mode — set MT5_HOST / MT5_LOGIN / MT5_PASSWORD / MT5_SERVER to trade."
+    try:
+        m = _mt5()
+    except Exception as e:
+        return (f"Cannot reach MT5 bridge at {config.MT5_HOST or '(unset)'}:{config.MT5_PORT} — {e}")
+    try:
+        if m.account_info() is None:
+            return (f"MT5 connected but not logged in "
+                    f"(check MT5_LOGIN / MT5_PASSWORD / MT5_SERVER={config.MT5_SERVER}).")
+    except Exception as e:
+        return f"MT5 account check failed: {e}"
+    try:
+        sym = resolve_symbol(symbol)
+        if m.symbol_info(sym) is None:
+            return (f"Symbol {sym} not found in the terminal — "
+                    f"check TRADFI_SYMBOL / TRADFI_MODE.")
+        tick = m.symbol_info_tick(sym)
+        if tick is None or float(getattr(tick, "time", 0) or 0) == 0:
+            return f"{sym} has no live tick — market likely closed."
+        age = (datetime.now(timezone.utc).timestamp() - float(tick.time)) / 3600.0
+        return f"{sym} last tick {age:.1f}h old — market closed."
+    except Exception as e:
+        return f"Market check error: {e}"

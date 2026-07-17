@@ -155,9 +155,10 @@ def run_cycle(state: dict) -> dict:
 
     market_open = tradfi_client.is_market_open(symbol)
     if not market_open:
+        reason = tradfi_client.market_status_reason(symbol)
         state["last_action"] = "HOLD"
-        state["last_reason"] = f"{symbol} market is closed."
-        log.info(f"[tradfi cycle] {symbol} market closed — skipping")
+        state["last_reason"] = reason
+        log.info(f"[tradfi cycle] {symbol} not tradable — {reason}")
         return state
 
     # 1. Fetch market data
