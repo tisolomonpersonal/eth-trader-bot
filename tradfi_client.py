@@ -25,6 +25,7 @@ market hours — bolting TradFi into that loop needs a real decision about
 which instrument, sizing, and leverage to use, not a guess.
 """
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -70,16 +71,47 @@ def _retry(fn, label: str):
             time.sleep(_RETRY_DELAY * attempt)
 
 
+_symbol_cache: dict = {}  # base -> the variant the exchange actually accepts
+
+
+def _normalize_base(sym: str) -> str:
+    sym = sym.upper()
+    if sym.endswith(".S"):
+        sym = sym[:-2]
+    return sym
+
+
 def resolve_symbol(base_symbol: Optional[str] = None) -> str:
     """
-    Apply the correct suffix for the configured TradFi account mode.
-    base_symbol defaults to config.TRADFI_SYMBOL (e.g. "XAUUSD").
+    Return the symbol variant the exchange actually lists.
+
+    TRADFI_MODE gives us a *preferred* suffix (zero_fee -> ".s", tight_spread ->
+    none), but if the account mode doesn't match, the preferred variant won't
+    exist and every call fails as "closed". So we probe both variants once,
+    cache whichever the exchange knows, and reuse it. Falls back to the
+    configured guess (no crash) if neither can be verified.
     """
-    sym = base_symbol or config.TRADFI_SYMBOL
-    sym = sym.rstrip(".s")  # normalize in case a suffixed value was passed in
-    if config.TRADFI_MODE == "zero_fee":
-        return f"{sym}.s"
-    return sym
+    base = _normalize_base(base_symbol or config.TRADFI_SYMBOL)
+    if base in _symbol_cache:
+        return _symbol_cache[base]
+
+    preferred = f"{base}.s" if config.TRADFI_MODE == "zero_fee" else base
+    candidates = [preferred, base if preferred.endswith(".s") else f"{base}.s"]
+
+    for cand in candidates:
+        try:
+            resp = _client().get_instruments_info(
+                category=config.TRADFI_CATEGORY, symbol=cand)
+            if resp.get("result", {}).get("list"):
+                if cand != preferred:
+                    log.warning(f"Symbol {preferred} not found — using {cand} "
+                                f"(check TRADFI_MODE matches your account)")
+                _symbol_cache[base] = cand
+                return cand
+        except Exception as e:
+            log.warning(f"Symbol probe {cand} failed: {e}")
+
+    return preferred  # unverified fallback; don't block resolution
 
 
 # ── Market data (public — no auth required) ───────────────────────────────────
@@ -131,10 +163,33 @@ def get_instrument_info(symbol: Optional[str] = None) -> dict:
 
 
 def is_market_open(symbol: Optional[str] = None) -> bool:
-    """Best-effort check via tradingStatus; treat unknown/errors as closed (fail safe)."""
+    """
+    Open == the exchange is still producing fresh candles for this symbol.
+
+    This is far more reliable than the instrument "status" field, which reports
+    the *listing* status ("Trading" = the instrument is listed), NOT whether the
+    session is currently open. During real market hours candles keep advancing;
+    over the weekend / session close they go stale. We consider the market open
+    when the newest candle is younger than ~3 intervals.
+    """
     try:
-        info = get_instrument_info(symbol)
-        return str(info.get("status", info.get("tradingStatus", ""))).lower() == "trading"
+        df = get_klines(symbol, limit=2)
+        if df is None or df.empty:
+            return False
+        last_ts = df["ts"].iloc[-1].to_pydatetime()
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        try:
+            interval_min = int(config.TRADFI_INTERVAL)
+        except (TypeError, ValueError):
+            interval_min = 15  # non-numeric intervals (e.g. "D") -> daily-ish
+        age_min = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60.0
+        fresh_window = max(3 * interval_min, 10)
+        is_open = age_min <= fresh_window
+        if not is_open:
+            log.info(f"Market looks closed: newest candle {age_min:.0f}m old "
+                     f"(> {fresh_window}m window)")
+        return is_open
     except Exception as e:
         log.warning(f"Could not determine market status: {e}")
         return False
