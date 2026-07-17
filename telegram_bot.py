@@ -163,6 +163,116 @@ def alert_critical(message: str) -> None:
     )
 
 
+# ── TradFi alerts ───────────────────────────────────────────────────────────────
+
+def alert_tradfi_started(symbol: str) -> None:
+    mode = "📄 Paper Trading" if config.PAPER_MODE else "💰 Live Trading"
+    net  = "(Testnet)" if config.BYBIT_TESTNET else "(Mainnet)"
+    send(
+        f"🤖 <b>TradFi Bot Started</b>\n"
+        f"{'─'*28}\n"
+        f"Exchange:   Bybit TradFi {net}\n"
+        f"Mode:       {mode}\n"
+        f"Instrument: {symbol}\n"
+        f"Max trade:  ${config.TRADFI_MAX_INVESTMENT_USDT:.2f} USDT\n"
+        f"Stop loss:  {config.TRADFI_STOP_LOSS_PCT}%\n"
+        f"Take profit:{config.TRADFI_TAKE_PROFIT_PCT}%\n"
+        f"Min confidence: {config.TRADFI_MIN_AI_CONFIDENCE}/100\n"
+        f"Cycle: every {config.TRADFI_CYCLE_SECONDS}s | Summary: every 1 hour\n\n"
+        f"⚠️ TradFi has real market hours (not 24/7) — the bot will hold "
+        f"when the market is closed."
+    )
+
+
+def alert_tradfi_entry(symbol: str, side: str, price: float, qty: float, usdt: float,
+                        confidence: int, reason: str) -> None:
+    paper = " [PAPER]" if config.PAPER_MODE else ""
+    emoji = "🟢" if side == "BUY" else "🔻"
+    send(
+        f"{emoji} <b>TradFi {side} EXECUTED{paper}</b>\n"
+        f"{'─'*28}\n"
+        f"Instrument: {symbol}\n"
+        f"Price:    {price:,.4f}\n"
+        f"Qty:      {qty}\n"
+        f"Amount:   ${usdt:.2f} USDT\n"
+        f"AI conf:  {confidence}/100\n"
+        f"Time:     {_now()}\n\n"
+        f"<b>Reason:</b>\n{reason}"
+    )
+
+
+def alert_tradfi_exit(symbol: str, trigger: str, price: float, qty: float,
+                       pnl: float, reason: str) -> None:
+    paper = " [PAPER]" if config.PAPER_MODE else ""
+    emoji = {"SL": "🛑", "TP": "✅"}.get(trigger, "🔴")
+    label = {"SL": "STOP LOSS", "TP": "TAKE PROFIT", "AI-SELL": "AI EXIT"}.get(trigger, trigger)
+    send(
+        f"{emoji} <b>TradFi {label}{paper}</b>\n"
+        f"{'─'*28}\n"
+        f"Instrument: {symbol}\n"
+        f"Exit price: {price:,.4f}\n"
+        f"Qty:        {qty}\n"
+        f"P&L:        <b>${pnl:+.2f}</b> USDT\n"
+        f"Time:       {_now()}\n\n"
+        f"<b>Reason:</b>\n{reason}"
+    )
+
+
+def alert_tradfi_stopped() -> None:
+    send(
+        f"🔴 <b>TradFi Bot Stopped</b>\n"
+        f"{'─'*28}\n"
+        f"Service was shut down or redeployed.\n"
+        f"Time: {_now()}"
+    )
+
+
+def send_tradfi_hourly_summary(state: dict, ind: dict, balance: dict, market_open: bool) -> None:
+    now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    mode = "📄 PAPER | " if config.PAPER_MODE else ""
+    symbol = state.get("symbol", config.TRADFI_SYMBOL)
+
+    if state.get("in_position"):
+        entry    = float(state.get("entry_price", 0))
+        qty      = float(state.get("qty", 0))
+        side     = state.get("side", "Buy")
+        price    = ind["price"]
+        unreal_u = (price - entry) * qty if side == "Buy" else (entry - price) * qty
+        unreal_p = (unreal_u / (entry * qty) * 100) if entry > 0 and qty > 0 else 0
+        holdings = (f"{side} {qty} {symbol} @ {entry:,.4f}\n"
+                    f"SL: {state.get('sl_price',0):,.4f} | TP: {state.get('tp_price',0):,.4f}")
+        unrealized = f"${unreal_u:+.2f} ({unreal_p:+.2f}%)"
+        acct_val   = balance["usdt"] + unreal_u
+    else:
+        holdings   = "None"
+        unrealized = "—"
+        acct_val   = balance["usdt"]
+
+    last_trade = (
+        f"{state.get('last_action','NONE')} @ {state.get('entry_price',0):,.4f}"
+        if state.get("last_action") not in (None, "NONE", "HOLD")
+        else "None"
+    )
+
+    send(
+        f"📊 <b>{mode}TradFi Bot Report — {symbol}</b>\n"
+        f"{'─'*28}\n"
+        f"Time:          {now}\n"
+        f"Market:        {'🟢 Open' if market_open else '⚪ Closed'}\n"
+        f"Current Price: {ind['price']:,.4f}\n"
+        f"Trend:         {ind['trend']} (RSI {ind['rsi']})\n"
+        f"AI Decision:   {state.get('last_action','HOLD')}\n"
+        f"Current Position: {holdings}\n"
+        f"Account Value: ${acct_val:.2f} USDT\n"
+        f"Unrealized P/L:{unrealized}\n"
+        f"Daily P&L:     ${state.get('daily_pnl_usdt',0):+.2f} | "
+        f"Total: ${state.get('total_pnl_usdt',0):+.2f}\n"
+        f"Last Trade:    {last_trade}\n"
+        f"Bot Status:    ✅ Running\n\n"
+        f"<b>Reason:</b>\n{state.get('last_reason','Monitoring markets.')}"
+    )
+
+
 # ── Hourly summary ─────────────────────────────────────────────────────────────
 
 def send_hourly_summary(state: dict, ind: dict, balance: dict) -> None:
