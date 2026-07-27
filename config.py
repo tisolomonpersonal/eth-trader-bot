@@ -19,18 +19,8 @@ OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY",   "")
 OPENAI_BASE_URL  = os.environ.get("OPENAI_BASE_URL",  "https://api.openai.com/v1")
 OPENAI_MODEL     = os.environ.get("OPENAI_MODEL",     "gpt-4o-mini")
 
-# ── Market ────────────────────────────────────────────────────────────────────
-SYMBOL        = os.environ.get("SYMBOL",   "BTCUSDT")
-BASE_COIN     = os.environ.get("BASE_COIN", "BTC")
-CATEGORY      = "spot"
-INTERVAL      = "1"          # 1-minute candles — the scalping timeframe
-TREND_INTERVAL= "5"          # 5-minute candles — higher-TF regime/trend filter
-CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
-
-# ── Scalping engine ───────────────────────────────────────────────────────────
-# Master switch. When true, the rule-based scalp engine (scalp_signal.py) drives
-# entries and the LLM is demoted to an optional veto. When false, the original
-# AI-led swing behaviour is used unchanged.
+# ── Scalp master switch ───────────────────────────────────────────────────────
+# Read before the market block because it decides the default symbol.
 #
 # DEFAULTS TO FALSE ON PURPOSE. This repo auto-deploys to Zeabur on push, so a
 # default of true would silently swap the live strategy the moment this merges.
@@ -39,6 +29,23 @@ CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
 # any position held by the old bot has been closed (see the orphan check in
 # scheduler.run_bot).
 SCALP_MODE          = os.environ.get("SCALP_MODE", "false").lower() == "true"
+
+# ── Market ────────────────────────────────────────────────────────────────────
+# The default symbol follows the mode, so that turning SCALP_MODE off really
+# does restore the previous bot rather than pointing it at a different market.
+# An explicit SYMBOL env var always wins over both.
+_DEFAULT_SYMBOL = "BTCUSDT" if SCALP_MODE else "BNBUSDT"
+_DEFAULT_BASE   = "BTC"     if SCALP_MODE else "BNB"
+SYMBOL        = os.environ.get("SYMBOL",    _DEFAULT_SYMBOL)
+BASE_COIN     = os.environ.get("BASE_COIN", _DEFAULT_BASE)
+CATEGORY      = "spot"
+INTERVAL      = "1"          # 1-minute candles — the scalping timeframe
+TREND_INTERVAL= "5"          # 5-minute candles — higher-TF regime/trend filter
+CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
+
+# ── Scalping engine ───────────────────────────────────────────────────────────
+# SCALP_MODE itself is defined above the market block, since it decides the
+# default symbol. Everything else about the scalper is configured here.
 SCALP_CYCLE_SECONDS = int(os.environ.get("SCALP_CYCLE_SECONDS", "15"))
 
 # --- Fees. THE most important numbers in this file. -------------------------
