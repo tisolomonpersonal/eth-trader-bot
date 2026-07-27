@@ -118,7 +118,11 @@ TRADFI_ENABLED = os.environ.get("TRADFI_ENABLED", "false").lower() == "true"
 # ── Risk & position sizing ────────────────────────────────────────────────────
 GHC_RATE              = float(os.environ.get("GHC_RATE",              "15.5"))
 MAX_INVESTMENT_GHC    = float(os.environ.get("MAX_INVESTMENT_GHC",    "1000"))
-MAX_INVESTMENT_USDT   = MAX_INVESTMENT_GHC / GHC_RATE   # ~64.5 USDT default
+# MAX_INVESTMENT_USDT is normally derived from the GHC budget, but can be set
+# directly — which is what you want for a small USDT-native test float, where
+# going via a cedi conversion just obscures the actual dollar size at risk.
+MAX_INVESTMENT_USDT   = float(os.environ["MAX_INVESTMENT_USDT"]) \
+    if os.environ.get("MAX_INVESTMENT_USDT") else MAX_INVESTMENT_GHC / GHC_RATE
 STOP_LOSS_PCT         = float(os.environ.get("STOP_LOSS_PCT",         "2.0"))
 TAKE_PROFIT_PCT       = float(os.environ.get("TAKE_PROFIT_PCT",       "4.0"))
 MAX_DAILY_LOSS_PCT    = float(os.environ.get("MAX_DAILY_LOSS_PCT",    "5.0"))
