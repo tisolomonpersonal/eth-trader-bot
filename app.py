@@ -25,19 +25,30 @@ def dashboard():
 
 
 
+def _engine():
+    """The active strategy module — scalp or the original swing path."""
+    if config.SCALP_MODE:
+        import scalp_strategy
+        return scalp_strategy
+    import strategy
+    return strategy
+
+
 @app.route("/healthz")
 def health():
-    return jsonify({"status": "ok", "service": "bnb-spot-bot",
+    return jsonify({"status": "ok",
+                    "service": f"{config.SYMBOL.lower()}-{'scalp' if config.SCALP_MODE else 'swing'}-bot",
                     "paper_mode": config.PAPER_MODE})
 
 
 @app.route("/status")
 def status():
-    from strategy import load_state, get_history
-    state   = load_state()
-    history = get_history()[-5:]  # last 5 trades
+    engine  = _engine()
+    state   = engine.load_state()
+    history = engine.get_history()[-5:]
     return jsonify({
         "status":     "ok",
+        "mode":       "scalp" if config.SCALP_MODE else "swing",
         "paper_mode": config.PAPER_MODE,
         "symbol":     config.SYMBOL,
         "state":      state,
@@ -47,8 +58,91 @@ def status():
 
 @app.route("/history")
 def history():
-    from strategy import get_history
-    return jsonify(get_history())
+    return jsonify(_engine().get_history())
+
+
+@app.route("/scalp/stats")
+def scalp_stats():
+    """Live performance summary — the numbers that decide whether to keep going."""
+    if not config.SCALP_MODE:
+        return jsonify({"status": "disabled", "message": "Set SCALP_MODE=true."})
+
+    import scalp_strategy
+    state = scalp_strategy.load_state()
+    trades = [t for t in scalp_strategy.get_history() if t.get("side") == "SELL"]
+
+    wins   = [t for t in trades if t.get("pnl", 0) > 0]
+    losses = [t for t in trades if t.get("pnl", 0) <= 0]
+    gross_win  = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    fees = sum(t.get("fees", 0) for t in trades)
+
+    by_setup = {}
+    for t in trades:
+        s = by_setup.setdefault(t.get("setup", "?"), {"n": 0, "wins": 0, "pnl": 0.0})
+        s["n"] += 1
+        s["wins"] += 1 if t.get("pnl", 0) > 0 else 0
+        s["pnl"] = round(s["pnl"] + t.get("pnl", 0), 4)
+
+    return jsonify({
+        "status": "ok",
+        "symbol": config.SYMBOL,
+        "paper_mode": config.PAPER_MODE,
+        "closed_trades": len(trades),
+        "win_rate_pct": round(len(wins) / len(trades) * 100, 1) if trades else None,
+        "net_pnl_usdt": round(state.get("total_pnl_usdt", 0), 4),
+        "total_fees_usdt": round(fees, 4),
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
+        "expectancy_usdt": round(state.get("total_pnl_usdt", 0) / len(trades), 4) if trades else None,
+        "daily_pnl_usdt": round(state.get("daily_pnl_usdt", 0), 4),
+        "trades_today": state.get("trade_count_today", 0),
+        "consecutive_losses": state.get("consecutive_losses", 0),
+        "in_position": state.get("in_position"),
+        "current_setup": state.get("setup"),
+        "by_setup": by_setup,
+        "fee_config": {
+            "round_trip_pct": config.ROUND_TRIP_FEE_PCT,
+            "min_tp_pct": round(config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT, 4),
+        },
+    })
+
+
+@app.route("/scalp/signal")
+def scalp_signal_debug():
+    """
+    Live look at what the engine sees right now — indicators, regime, and the
+    decision with its reason. The first place to look when it isn't trading.
+    """
+    if not config.SCALP_MODE:
+        return jsonify({"status": "disabled"})
+
+    import bybit_client
+    import indicators as ind_calc
+    import scalp_signal as ss
+    import scalp_risk
+    import scalp_strategy
+
+    try:
+        df = bybit_client.get_klines(config.INTERVAL)
+        df5 = bybit_client.get_klines(config.TREND_INTERVAL, limit=100)
+        ind = ind_calc.calculate_scalp(df, df5)
+        state = scalp_strategy.load_state()
+        sig = ss.get_signal(ind, state)
+        balance = bybit_client.get_balance()
+        allowed, reason = scalp_risk.validate(sig, state, balance, ind)
+        brackets = scalp_risk.compute_brackets(ind["price"], ind["atr"], sig.target)
+
+        return jsonify({
+            "status": "ok",
+            "indicators": ind,
+            "signal": {"action": sig.action, "setup": sig.setup,
+                       "confidence": sig.confidence, "reason": sig.reason,
+                       "target": sig.target},
+            "risk": {"allowed": allowed, "reason": reason},
+            "brackets_if_entered_now": brackets,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)})
 
 
 @app.route("/tradfi/status")
@@ -119,9 +213,11 @@ def _tradfi_bot_thread():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    log.info(f"Starting BNB bot (paper={config.PAPER_MODE}) on port {port}")
+    mode = "scalp" if config.SCALP_MODE else "swing"
+    log.info(f"Starting {config.SYMBOL} {mode} bot "
+             f"(paper={config.PAPER_MODE}) on port {port}")
 
-    t = threading.Thread(target=_bot_thread, daemon=True, name="bnb-bot")
+    t = threading.Thread(target=_bot_thread, daemon=True, name=f"{mode}-bot")
     t.start()
 
     if config.TRADFI_ENABLED:

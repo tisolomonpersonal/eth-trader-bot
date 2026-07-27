@@ -28,12 +28,27 @@ def stop():
 
 def run_bot() -> None:
     """Main bot loop — runs inside the gunicorn worker thread."""
-    log.info(f"BNB/USDT Spot Bot starting | paper={config.PAPER_MODE} | "
-             f"testnet={config.BYBIT_TESTNET}")
+    # SCALP_MODE swaps the whole signal/exit engine. The original AI-led swing
+    # path stays reachable with SCALP_MODE=false.
+    if config.SCALP_MODE:
+        import scalp_strategy
+        engine = scalp_strategy
+        cycle_seconds = config.SCALP_CYCLE_SECONDS
+        min_sleep = 5
+        log.info(f"{config.SYMBOL} SCALP bot starting | cycle={cycle_seconds}s | "
+                 f"paper={config.PAPER_MODE} | testnet={config.BYBIT_TESTNET} | "
+                 f"round-trip fees={config.ROUND_TRIP_FEE_PCT:.2f}% | "
+                 f"min TP={config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT:.2f}%")
+    else:
+        engine = strategy
+        cycle_seconds = 60
+        min_sleep = 5
+        log.info(f"{config.SYMBOL} swing bot starting | paper={config.PAPER_MODE} | "
+                 f"testnet={config.BYBIT_TESTNET}")
 
     tg.alert_started()
 
-    state        = strategy.load_state()
+    state        = engine.load_state()
     last_hour    = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     error_streak = 0
 
@@ -41,9 +56,9 @@ def run_bot() -> None:
         cycle_start = time.time()
 
         try:
-            state = strategy.reset_daily_if_needed(state)
-            state = strategy.run_cycle(state)
-            strategy.save_state(state)
+            state = engine.reset_daily_if_needed(state)
+            state = engine.run_cycle(state)
+            engine.save_state(state)
             error_streak = 0
 
         except Exception as e:
@@ -77,9 +92,9 @@ def run_bot() -> None:
             except Exception as e:
                 log.error(f"Hourly summary error: {e}")
 
-        # Sleep the remainder of the 60-second cycle
+        # Sleep the remainder of the cycle
         elapsed = time.time() - cycle_start
-        time.sleep(max(5, 60 - elapsed))
+        time.sleep(max(min_sleep, cycle_seconds - elapsed))
 
     log.info("Bot loop exited cleanly")
 

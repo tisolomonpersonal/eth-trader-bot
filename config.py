@@ -20,10 +20,77 @@ OPENAI_BASE_URL  = os.environ.get("OPENAI_BASE_URL",  "https://api.openai.com/v1
 OPENAI_MODEL     = os.environ.get("OPENAI_MODEL",     "gpt-4o-mini")
 
 # ── Market ────────────────────────────────────────────────────────────────────
-SYMBOL        = "BNBUSDT"
+SYMBOL        = os.environ.get("SYMBOL",   "BTCUSDT")
+BASE_COIN     = os.environ.get("BASE_COIN", "BTC")
 CATEGORY      = "spot"
-INTERVAL      = "1"          # 1-minute candles
+INTERVAL      = "1"          # 1-minute candles — the scalping timeframe
+TREND_INTERVAL= "5"          # 5-minute candles — higher-TF regime/trend filter
 CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
+
+# ── Scalping engine ───────────────────────────────────────────────────────────
+# Master switch. When true, the rule-based scalp engine (scalp_signal.py) drives
+# entries and the LLM is demoted to an optional veto. When false, the original
+# AI-led swing behaviour is used unchanged.
+SCALP_MODE          = os.environ.get("SCALP_MODE", "true").lower() == "true"
+SCALP_CYCLE_SECONDS = int(os.environ.get("SCALP_CYCLE_SECONDS", "15"))
+
+# --- Fees. THE most important numbers in this file. -------------------------
+# Bybit spot standard: 0.1% maker / 0.1% taker. A market-in + market-out round
+# trip therefore costs 0.20%. Any target below that is a guaranteed loss before
+# the strategy has even been consulted, so ROUND_TRIP_FEE_PCT is enforced as a
+# hard floor on every take-profit distance in scalp_risk.py.
+# Linear perps are ~5x cheaper (0.02/0.055) — set these if you migrate.
+MAKER_FEE_PCT       = float(os.environ.get("MAKER_FEE_PCT", "0.10"))
+TAKER_FEE_PCT       = float(os.environ.get("TAKER_FEE_PCT", "0.10"))
+ROUND_TRIP_FEE_PCT  = MAKER_FEE_PCT + TAKER_FEE_PCT
+# Gross edge must exceed fees by this multiple or the trade is not worth taking.
+MIN_EDGE_FEE_MULT   = float(os.environ.get("MIN_EDGE_FEE_MULT", "2.5"))
+
+# --- ATR-based exits (replaces the flat 2%/4% swing brackets) ----------------
+# Scalp stops must scale with current volatility, not be a fixed percentage.
+ATR_PERIOD          = int(os.environ.get("ATR_PERIOD", "14"))
+SL_ATR_MULT         = float(os.environ.get("SL_ATR_MULT", "1.2"))
+TP_ATR_MULT         = float(os.environ.get("TP_ATR_MULT", "1.8"))
+# Absolute guardrails so a volatility spike can't produce an absurd bracket.
+MIN_SL_PCT          = float(os.environ.get("MIN_SL_PCT", "0.25"))
+MAX_SL_PCT          = float(os.environ.get("MAX_SL_PCT", "1.20"))
+
+# --- Trailing stop & time stop ----------------------------------------------
+# Once price has run TRAIL_TRIGGER_ATR in our favour, ratchet the stop to lock
+# in gains. Scalps that stall are closed by the time stop — capital sitting in
+# a dead trade is capital not available for the next setup.
+TRAIL_ENABLED       = os.environ.get("TRAIL_ENABLED", "true").lower() == "true"
+TRAIL_TRIGGER_ATR   = float(os.environ.get("TRAIL_TRIGGER_ATR", "1.0"))
+TRAIL_DISTANCE_ATR  = float(os.environ.get("TRAIL_DISTANCE_ATR", "0.7"))
+MAX_HOLD_MINUTES    = int(os.environ.get("MAX_HOLD_MINUTES", "45"))
+
+# --- Regime detection --------------------------------------------------------
+# ADX below RANGE_ADX_MAX  -> ranging  -> mean-reversion fades are armed.
+# ADX above TREND_ADX_MIN  -> trending -> only squeeze breakouts / pullbacks.
+ADX_PERIOD          = int(os.environ.get("ADX_PERIOD", "14"))
+RANGE_ADX_MAX       = float(os.environ.get("RANGE_ADX_MAX", "20"))
+TREND_ADX_MIN       = float(os.environ.get("TREND_ADX_MIN", "25"))
+BB_PERIOD           = int(os.environ.get("BB_PERIOD", "20"))
+BB_STD              = float(os.environ.get("BB_STD", "2.0"))
+SQUEEZE_LOOKBACK    = int(os.environ.get("SQUEEZE_LOOKBACK", "50"))
+SQUEEZE_PCTILE      = float(os.environ.get("SQUEEZE_PCTILE", "25"))  # bandwidth in bottom X%
+RSI_OVERSOLD        = float(os.environ.get("RSI_OVERSOLD", "30"))
+VOL_SPIKE_MULT      = float(os.environ.get("VOL_SPIKE_MULT", "1.5"))
+
+# --- Scalp-specific risk limits ---------------------------------------------
+# Scalping's real failure mode is overtrading and revenge-trading, not any one
+# bad entry. These caps matter more than the entry logic itself.
+MAX_TRADES_PER_DAY      = int(os.environ.get("MAX_TRADES_PER_DAY", "30"))
+MAX_CONSECUTIVE_LOSSES  = int(os.environ.get("MAX_CONSECUTIVE_LOSSES", "4"))
+COOLDOWN_AFTER_LOSS_MIN = int(os.environ.get("COOLDOWN_AFTER_LOSS_MIN", "10"))
+# Risk a fixed % of the pot per trade, sized off the stop distance (not a flat
+# all-in like the swing bot's RISK_PER_TRADE_PCT=100 default).
+SCALP_RISK_PCT          = float(os.environ.get("SCALP_RISK_PCT", "1.0"))
+
+# --- AI veto (off by default for scalping) -----------------------------------
+# An LLM round-trip per 15s cycle is latency and noise on a scalp timeframe.
+# When enabled the model can only VETO a rule-generated entry, never create one.
+AI_VETO_ENABLED     = os.environ.get("AI_VETO_ENABLED", "false").lower() == "true"
 
 # ── TradFi (Bybit's stock/forex/commodity CFD perpetuals) ─────────────────────
 # TradFi runs on the same V5 API, category="linear" — no separate host/creds
@@ -92,6 +159,11 @@ DATA_DIR      = Path(os.environ.get("DATA_DIR",   "/data"))
 STATE_FILE    = DATA_DIR / "bot_state.json"
 HISTORY_FILE  = DATA_DIR / "trade_history.json"
 MAX_HISTORY   = 200   # keep last N trades in history file
+
+# Scalp bot keeps its own files so switching SCALP_MODE never mixes the two
+# strategies' P&L, counters or open-position state.
+SCALP_STATE_FILE   = DATA_DIR / "scalp_state.json"
+SCALP_HISTORY_FILE = DATA_DIR / "scalp_trade_history.json"
 
 # ── TradFi persistence (separate files — never shares state with the BNB bot) ─
 TRADFI_STATE_FILE   = DATA_DIR / "tradfi_state.json"
