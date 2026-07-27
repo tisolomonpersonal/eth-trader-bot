@@ -26,6 +26,43 @@ def stop():
     tradfi_stop()
 
 
+def _warn_if_legacy_position_orphaned() -> None:
+    """
+    Switching to SCALP_MODE points the bot at a different symbol AND a different
+    state file. Any position the old swing bot still had open is therefore left
+    with nothing watching its stop-loss — it simply stops being managed, silently.
+
+    This warns loudly rather than refusing to start: blocking startup would
+    leave the position equally unmanaged while also taking the bot down. A human
+    has to close it (or move it) manually.
+    """
+    import json
+    try:
+        if not config.STATE_FILE.exists():
+            return
+        legacy = json.loads(config.STATE_FILE.read_text())
+        if not legacy.get("in_position"):
+            return
+
+        msg = (
+            f"ORPHANED POSITION: the swing bot's state file still shows an open "
+            f"position — {legacy.get('qty')} @ ${legacy.get('entry_price')}, "
+            f"SL ${legacy.get('sl_price')} / TP ${legacy.get('tp_price')}.\n\n"
+            f"SCALP_MODE is now active, which trades {config.SYMBOL} off a "
+            f"separate state file. Nothing is monitoring that older position's "
+            f"stop-loss any more.\n\n"
+            f"Close it manually on Bybit, or set SCALP_MODE=false to hand it "
+            f"back to the swing bot."
+        )
+        log.critical(msg)
+        try:
+            tg.alert_critical(msg)
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"Could not check legacy state for an orphaned position: {e}")
+
+
 def run_bot() -> None:
     """Main bot loop — runs inside the gunicorn worker thread."""
     # SCALP_MODE swaps the whole signal/exit engine. The original AI-led swing
@@ -33,6 +70,7 @@ def run_bot() -> None:
     if config.SCALP_MODE:
         import scalp_strategy
         engine = scalp_strategy
+        _warn_if_legacy_position_orphaned()
         cycle_seconds = config.SCALP_CYCLE_SECONDS
         min_sleep = 5
         log.info(f"{config.SYMBOL} SCALP bot starting | cycle={cycle_seconds}s | "

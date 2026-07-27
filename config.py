@@ -31,7 +31,14 @@ CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
 # Master switch. When true, the rule-based scalp engine (scalp_signal.py) drives
 # entries and the LLM is demoted to an optional veto. When false, the original
 # AI-led swing behaviour is used unchanged.
-SCALP_MODE          = os.environ.get("SCALP_MODE", "true").lower() == "true"
+#
+# DEFAULTS TO FALSE ON PURPOSE. This repo auto-deploys to Zeabur on push, so a
+# default of true would silently swap the live strategy the moment this merges.
+# Switching strategies must be a deliberate act: set SCALP_MODE=true in the
+# Zeabur dashboard, only after backtesting and paper-trading, and only after
+# any position held by the old bot has been closed (see the orphan check in
+# scheduler.run_bot).
+SCALP_MODE          = os.environ.get("SCALP_MODE", "false").lower() == "true"
 SCALP_CYCLE_SECONDS = int(os.environ.get("SCALP_CYCLE_SECONDS", "15"))
 
 # --- Fees. THE most important numbers in this file. -------------------------
