@@ -39,22 +39,56 @@ def health():
 @app.route("/status")
 def status():
     from strategy import load_state, get_history
+    import bybit_client
+
     state   = load_state()
     history = get_history()
 
-    # Fetch live price for the dashboard's unrealised PnL display
+    # ── Live price ────────────────────────────────────────────────────────────
     last_price = 0.0
     try:
-        import bybit_client
         df = bybit_client.get_klines_m5()
         if not df.empty:
             last_price = float(df["close"].iloc[-1])
     except Exception as e:
         log.warning(f"Could not fetch live price for /status: {e}")
-
-    # Inject last price into state so the frontend can use it without a
-    # separate API call (underscore prefix signals it's a transient field)
     state["_last_price"] = round(last_price, 2)
+
+    # ── Live position (always query Bybit directly) ───────────────────────────
+    # This ensures the dashboard shows the real position even if the bot thread
+    # hasn't reconciled state yet (e.g. fresh deploy, restart mid-trade).
+    live_position = None
+    try:
+        pos = bybit_client.get_position()
+        if pos:
+            raw_side = pos.get("side", "")
+            side = "LONG" if raw_side == "Buy" else "SHORT" if raw_side == "Sell" else None
+            if side:
+                live_position = {
+                    "in_position":    True,
+                    "side":           side,
+                    "entry_price":    float(pos.get("avgPrice",      0) or 0),
+                    "qty":            float(pos.get("size",           0) or 0),
+                    "sl_price":       float(pos.get("stopLoss",       0) or 0),
+                    "tp_price":       float(pos.get("takeProfit",     0) or 0),
+                    "liq_price":      float(pos.get("liqPrice",       0) or 0),
+                    "unrealised_pnl": float(pos.get("unrealisedPnl",  0) or 0),
+                    "entry_time":     pos.get("createdTime"),
+                }
+                # Merge into state so the rest of the response is consistent
+                if not state.get("in_position"):
+                    for k in ("in_position","side","entry_price","qty",
+                              "sl_price","tp_price","entry_time"):
+                        state[k] = live_position[k]
+    except Exception as e:
+        log.warning(f"Could not fetch live position for /status: {e}")
+
+    # ── Live balance ──────────────────────────────────────────────────────────
+    balance = {"usdt": 0.0, "btc": 0.0}
+    try:
+        balance = bybit_client.get_balance()
+    except Exception as e:
+        log.warning(f"Could not fetch balance for /status: {e}")
 
     return jsonify({
         "status":        "ok",
@@ -64,7 +98,9 @@ def status():
         "leverage":      config.LEVERAGE,
         "btc_qty":       str(config.BTC_QTY),
         "state":         state,
-        "recent_trades": history[-20:],   # last 20 for the history table
+        "live_position": live_position,
+        "balance":       balance,
+        "recent_trades": history[-20:],
     })
 
 

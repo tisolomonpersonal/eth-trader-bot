@@ -207,6 +207,10 @@
         <div class="v org" id="qty-display">0.004 BTC</div>
       </div>
       <div class="pm">
+        <div class="k">Balance</div>
+        <div class="v" id="balance-usdt">—</div>
+      </div>
+      <div class="pm">
         <div class="k">Daily P&L</div>
         <div class="v" id="daily-pnl">—</div>
       </div>
@@ -329,7 +333,7 @@ function setPhase(phase) {
   });
 }
 
-function renderPosition(s, price) {
+function renderPosition(s, price, livePos) {
   const inPos = s.in_position;
   const side  = (s.side||"").toUpperCase();
   const ageEl = $("pos-age");
@@ -350,32 +354,39 @@ function renderPosition(s, price) {
   const tp    = Number(s.tp_price||0);
   const qty   = Number(s.qty||0);
   const cur   = Number(price||entry);
-  const rr    = (sl!==entry) ? Math.abs(tp-entry)/Math.abs(entry-sl) : 0;
+  const liq   = livePos ? Number(livePos.liq_price||0) : 0;
+  const rr    = (sl && tp && sl!==entry) ? Math.abs(tp-entry)/Math.abs(entry-sl) : 0;
 
-  // Unrealised PnL
-  const upnl  = side==="LONG" ? (cur-entry)*qty : (entry-cur)*qty;
+  // Prefer Bybit's server-side unrealised PnL (already accounts for funding/fees)
+  const upnl  = livePos ? Number(livePos.unrealised_pnl||0)
+                        : (side==="LONG" ? (cur-entry)*qty : (entry-cur)*qty);
   const upnlC = cls(upnl);
 
   // SL/TP progress bar (0% = SL, 100% = TP)
   let pct = 50;
-  if(tp!==sl){
+  if(tp && sl && tp!==sl){
     if(side==="LONG")  pct = Math.max(0,Math.min(100,(cur-sl)/(tp-sl)*100));
     else               pct = Math.max(0,Math.min(100,(sl-cur)/(sl-tp)*100));
   }
+
+  const slLabel  = sl  ? `SL ${nfmt(sl,0)}`  : "SL —";
+  const tpLabel  = tp  ? `TP ${nfmt(tp,0)}`  : "TP —";
+  const rrLabel  = rr  ? `RR ${rr.toFixed(2)}:1` : "RR —";
+  const liqHtml  = liq ? `<div class="m"><div class="k">Liquidation</div><div class="v dn">${nfmt(liq,2)}</div></div>` : "";
 
   $("pos-body").innerHTML = `
     <div class="pos-pill ${side.toLowerCase()}"><span class="dot"></span>${side}</div>
     <div class="metrics2">
       <div class="m"><div class="k">Entry</div><div class="v org">${nfmt(entry,2)}</div></div>
       <div class="m"><div class="k">Qty</div><div class="v">${qty} BTC</div></div>
-      <div class="m"><div class="k">Stop Loss</div><div class="v dn">${nfmt(sl,2)}</div></div>
-      <div class="m"><div class="k">Take Profit</div><div class="v up">${nfmt(tp,2)}</div></div>
+      <div class="m"><div class="k">Stop Loss</div><div class="v dn">${sl ? nfmt(sl,2) : "—"}</div></div>
+      <div class="m"><div class="k">Take Profit</div><div class="v up">${tp ? nfmt(tp,2) : "—"}</div></div>
     </div>
     <div class="sltp-bar-wrap">
       <div class="sltp-labels">
-        <span style="color:var(--down)">SL ${nfmt(sl,0)}</span>
-        <span style="color:var(--muted)">RR ${rr.toFixed(2)}:1</span>
-        <span style="color:var(--up)">TP ${nfmt(tp,0)}</span>
+        <span style="color:var(--down)">${slLabel}</span>
+        <span style="color:var(--muted)">${rrLabel}</span>
+        <span style="color:var(--up)">${tpLabel}</span>
       </div>
       <div class="sltp-bar">
         <div class="sltp-fill ${side.toLowerCase()}" style="width:${pct.toFixed(1)}%"></div>
@@ -385,6 +396,7 @@ function renderPosition(s, price) {
     <div class="metrics2" style="margin-bottom:0">
       <div class="m"><div class="k">Unrealised P&L</div><div class="v ${upnlC}">${money(upnl)}</div></div>
       <div class="m"><div class="k">Current Price</div><div class="v">${nfmt(cur,2)}</div></div>
+      ${liqHtml}
     </div>`;
 }
 
@@ -483,6 +495,12 @@ async function tick(){
     $("price").textContent = price ? `$${nfmt(price,2)}` : "$—";
     $("lev-badge").textContent = (r.leverage||25) + "×";
     $("qty-display").textContent = (r.btc_qty||"0.004") + " BTC";
+
+    // Balance
+    const bal = r.balance || {};
+    if(bal.usdt !== undefined)
+      $("balance-usdt").innerHTML = `<span class="v" style="color:var(--txt)">$${nfmt(bal.usdt,2)}</span>`;
+
     $("daily-pnl").innerHTML = `<span class="v ${cls(s.daily_pnl_usdt||0)}">${money(s.daily_pnl_usdt||0)}</span>`;
     $("total-pnl").innerHTML = `<span class="v ${cls(s.total_pnl_usdt||0)}">${money(s.total_pnl_usdt||0)}</span>`;
 
@@ -493,7 +511,7 @@ async function tick(){
     else                       setPhase("watch");
 
     // Panels
-    renderPosition(s, price);
+    renderPosition(s, price, r.live_position || null);
     renderSignalState(s);
     renderHistory(r.recent_trades || []);
 
