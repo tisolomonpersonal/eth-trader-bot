@@ -46,6 +46,8 @@ def run_bot() -> None:
     tg.alert_started()
 
     state        = strategy.load_state()
+    state        = strategy.reconcile_position_on_startup(state)
+    strategy.save_state(state)
     last_hour    = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     error_streak = 0
 

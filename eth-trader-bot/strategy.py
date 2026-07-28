@@ -108,6 +108,72 @@ def get_history() -> list:
     return []
 
 
+# ── Startup reconciliation ────────────────────────────────────────────────────
+
+def reconcile_position_on_startup(state: dict) -> dict:
+    """
+    Sync internal state against the live Bybit position on startup.
+
+    Called once before the main loop begins. If the bot restarts mid-trade
+    (deploy, crash, redeploy) and the saved state shows no position but Bybit
+    has one open, this populates state so SL/TP monitoring resumes immediately
+    instead of leaving the position unmanaged.
+
+    Does nothing when:
+      - state already knows it is in a position (saved state is authoritative)
+      - PAPER_MODE is active (get_position always returns None)
+      - Bybit returns no open position
+    """
+    if state.get("in_position"):
+        log.info("[reconcile] State already shows open position — skipping reconciliation")
+        return state
+
+    try:
+        pos = bybit_client.get_position()
+    except Exception as e:
+        log.warning(f"[reconcile] Could not fetch position from Bybit: {e}")
+        return state
+
+    if pos is None:
+        log.info("[reconcile] No open position on Bybit — state is consistent")
+        return state
+
+    # Map Bybit side ("Buy"/"Sell") → internal side ("LONG"/"SHORT")
+    raw_side = pos.get("side", "")
+    side = "LONG" if raw_side == "Buy" else "SHORT" if raw_side == "Sell" else None
+    if side is None:
+        log.warning(f"[reconcile] Unrecognised position side '{raw_side}' — skipping")
+        return state
+
+    entry_price = float(pos.get("avgPrice", 0) or 0)
+    qty         = float(pos.get("size", 0) or 0)
+    sl_price    = float(pos.get("stopLoss", 0) or 0)
+    tp_price    = float(pos.get("takeProfit", 0) or 0)
+    entry_time  = pos.get("createdTime", datetime.now(timezone.utc).isoformat())
+
+    log.warning(
+        f"[reconcile] Live {side} position found on Bybit that bot state missed. "
+        f"Entry={entry_price:.2f} qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}. "
+        f"Resuming SL/TP management."
+    )
+
+    state.update({
+        "in_position":     True,
+        "side":            side,
+        "entry_price":     entry_price,
+        "entry_time":      entry_time,
+        "qty":             qty,
+        "sl_price":        sl_price,
+        "tp_price":        tp_price,
+        "pending_signal":  None,
+        "last_action":     side,
+        "last_reason":     "Position synced from Bybit on bot startup/restart.",
+        "last_confidence": 0,
+    })
+
+    return state
+
+
 # ── Exit helpers ──────────────────────────────────────────────────────────────
 
 def _execute_exit(state: dict, price: float, trigger: str, reason: str) -> dict:
