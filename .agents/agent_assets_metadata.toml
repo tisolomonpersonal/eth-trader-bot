@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "fPDkXgd1lMqZQh0tQUpIz"
+uri = "file://attached_assets/google-ai-studio-android-prompt.md"
+type = "text"
+title = "Google AI Studio — Android Monitor App Prompt"
