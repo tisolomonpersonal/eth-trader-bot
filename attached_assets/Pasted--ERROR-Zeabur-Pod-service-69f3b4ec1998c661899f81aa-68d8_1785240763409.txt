@@ -1,0 +1,73 @@
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulling: Pulling image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828"
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulled: Successfully pulled image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828" in 308ms (308ms including waiting). Image size: 96089632 bytes.
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Created: Created container: eth-trader-bot
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Started: Started container eth-trader-bot
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+
+INFO
+[2026-07-28 12:08:11 +0000] [1] [INFO] Starting gunicorn 26.0.0
+
+INFO
+[2026-07-28 12:08:11 +0000] [1] [INFO] Listening at: http://0.0.0.0:8080 (1)
+
+INFO
+[2026-07-28 12:08:11 +0000] [1] [INFO] Using worker: sync
+
+INFO
+[2026-07-28 12:08:11 +0000] [7] [INFO] Booting worker with pid: 7
+
+ERROR
+[2026-07-28 12:08:11 +0000] [7] [ERROR] Exception in worker process
+
+INFO
+Traceback (most recent call last):
+
+INFO
+ModuleNotFoundError: No module named 'app'
+
+INFO
+No module named 'app'
+
+INFO
+[2026-07-28 12:08:11 +0000] [7] [INFO] Worker exiting (pid: 7)
+
+ERROR
+[2026-07-28 12:08:11 +0000] [1] [ERROR] Worker (pid:7) exited with code 3.
+
+INFO
+[2026-07-28 12:08:11 +0000] [1] [INFO] Control socket listening at /root/.gunicorn/gunicorn.ctl
+
+ERROR
+[2026-07-28 12:08:13 +0000] [1] [ERROR] Shutting down: Master
+
+ERROR
+[2026-07-28 12:08:13 +0000] [1] [ERROR] Reason: Worker failed to boot.
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+Ask Zeabur Agent
+Copy
+{
+  "message": "[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)",
+  "timestamp": "2026-07-28T12:08:40Z",
+  "__typename": "RuntimeLog"
+}

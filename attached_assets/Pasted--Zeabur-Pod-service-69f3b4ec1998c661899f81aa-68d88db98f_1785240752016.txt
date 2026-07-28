@@ -1,0 +1,44 @@
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulling: Pulling image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828"
+Ask Zeabur Agent
+Copy
+{
+  "message": "[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulling: Pulling image \"registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828\"",
+  "timestamp": "2026-07-28T12:06:34Z",
+  "__typename": "RuntimeLog"
+}
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulled: Successfully pulled image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828" in 7.239s (7.239s including waiting). Image size: 96089632 bytes.
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Created: Created container: eth-trader-bot
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Started: Started container eth-trader-bot
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulling: Pulling image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828"
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Pulled: Successfully pulled image "registry-oci.zeabur.cloud/e-69f3b2cf1e7c7466bb9d1654/s-69f3b4ec1998c661899f81aa:d-6a689b15225290ec74325828" in 353ms (353ms including waiting). Image size: 96089632 bytes.
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Created: Created container: eth-trader-bot
+
+INFO
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - Started: Started container eth-trader-bot
+
+ERROR
+[Zeabur] Pod/service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt - BackOff: Back-off restarting failed container eth-trader-bot in pod service-69f3b4ec1998c661899f81aa-68d88db98f-fsbvt_environment-69f3b2cf1e7c7466bb9d1654(f6967948-f976-43d2-9d45-6f1ee4768983)
+
+INFO
+[2026-07-28 12:06:45 +0000] [1] [INFO] Starting gunicorn 26.0.0
+
+INFO
+[2026-07-28 12:06:45 +0000] [1] [INFO] Listening at: http://0.0.0.0:8080 (1)
+
+INFO
+[2026-07-28 12:06:45 +0000] [1] [INFO] Using worker: sync
+
+INFO
+[2026-07-28 
