@@ -1,22 +1,25 @@
 """
-Rule-based BTC scalping signal engine.
+Rule-based BTC perpetual scalping signal engine.
 
 Deliberately NOT AI-driven: a scalp decision has to be deterministic, instant,
 and backtestable. An LLM round-trip per cycle adds latency and non-reproducible
 noise to a timeframe measured in minutes. config.AI_VETO_ENABLED can re-add the
 model as a veto on top of these rules, but it can never invent an entry.
 
-Two setups, switched by volatility regime, because they fail in opposite
-conditions and so cover for each other:
+Three setups, each with a long and a short form. Trading perps rather than spot
+is what makes the shorts possible, and they matter: BTC downtrends are faster
+and more violent than uptrends, so the short side of a mean-reversion book is
+often where the better risk/reward sits. A long-only scalper sits out half the
+market.
 
-  RANGE regime (low ADX)  -> mean-reversion fade back to VWAP / band mid
-  TREND regime (high ADX) -> squeeze breakout, or pullback continuation
+Regime, from ADX, decides which setup is armed — mean reversion and breakout
+fail in opposite conditions, so each covers for the other:
 
-Spot is long-only, so every setup here is a LONG. On a perp the mirrored short
-of each is equally valid and roughly doubles the opportunity set — see
-`_MIRROR_NOTE` at the bottom.
+  RANGE  (low ADX)  -> mean-reversion fade back to VWAP / band mid
+  TREND  (high ADX) -> squeeze breakout, or pullback continuation
 
-All functions are pure: (indicators, state) -> Signal. No I/O, no globals.
+Actions are LONG / SHORT / CLOSE / HOLD. All functions are pure:
+(indicators, state) -> Signal. No I/O, no globals.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -29,158 +32,233 @@ log = get_logger("scalp_signal")
 
 @dataclass
 class Signal:
-    action: str                      # "BUY" | "SELL" | "HOLD"
+    action: str                      # "LONG" | "SHORT" | "CLOSE" | "HOLD"
     confidence: int                  # 0-100
     reason: str
     setup: str                       # which rule fired, "" when HOLD
     target: Optional[float] = None   # setup's natural profit objective
     provider: str = "rules"
 
+    @property
+    def is_entry(self) -> bool:
+        return self.action in ("LONG", "SHORT")
+
+    @property
+    def side(self) -> Optional[str]:
+        """Bybit order side for this action."""
+        return {"LONG": "Buy", "SHORT": "Sell"}.get(self.action)
+
 
 def _hold(reason: str) -> Signal:
     return Signal(action="HOLD", confidence=0, reason=reason, setup="")
 
 
-# ── Entry setups ──────────────────────────────────────────────────────────────
+# ── Setup 1: mean reversion ───────────────────────────────────────────────────
 
 def _mean_reversion(ind: dict) -> Optional[Signal]:
     """
-    Setup 1 — fade an overextension back to the mean. BTC on 1m spends most of
-    its life ranging, which makes this the highest-frequency setup, but it is
-    ONLY valid while ADX confirms no trend. Fading a real trend is how scalpers
-    blow up, so the regime gate here is not optional.
+    Fade an overextension back to the mean. BTC on 1m spends most of its life
+    ranging, which makes this the highest-frequency setup — but it is ONLY
+    valid while ADX confirms no trend. Fading a real trend is how scalpers blow
+    up, so the regime gate is not optional.
 
-    Entry: price stretched below the lower Bollinger band with RSI oversold.
-    Target: the band mid / VWAP, whichever is nearer (conservative).
+    Long:  price at/below the lower band, RSI oversold, below VWAP.
+    Short: the exact mirror at the upper band.
+
+    Both target the nearer of band-mid / VWAP, which keeps the objective
+    realistic rather than assuming a full reversion.
     """
     if ind["regime"] != "RANGE":
         return None
 
-    # Never fade a market that the 5m chart says is falling — that's a knife.
-    if ind["htf_bias"] == "BEARISH":
-        return None
+    price = ind["price"]
 
-    stretched = ind["bb_pct_b"] <= 0.05          # at or below the lower band
-    oversold = ind["rsi"] <= config.RSI_OVERSOLD
-    below_vwap = ind["price"] < ind["vwap"]
+    # --- Long: fade the low -------------------------------------------------
+    if (ind["bb_pct_b"] <= 0.05
+            and ind["rsi"] <= config.RSI_OVERSOLD
+            and price < ind["vwap"]
+            and ind["htf_bias"] != "BEARISH"):     # never catch a falling knife
 
-    if not (stretched and oversold and below_vwap):
-        return None
+        target = min(ind["bb_mid"], ind["vwap"])
+        if target > price:
+            conf = 60
+            if ind["rsi"] <= config.RSI_OVERSOLD - 5:
+                conf += 10
+            if ind["htf_bias"] == "BULLISH":
+                conf += 10        # buying a dip inside an uptrend is the A+ case
+            if ind["vol_trend"] == "High":
+                conf += 5         # capitulation volume marks exhaustion
+            return Signal(
+                action="LONG",
+                confidence=min(conf, 95),
+                reason=(f"Mean-reversion long: ${price:,.2f} at lower band "
+                        f"(%B={ind['bb_pct_b']:.2f}), RSI {ind['rsi']}, "
+                        f"ADX {ind['adx']} confirms range. Target ${target:,.2f}."),
+                setup="MEAN_REVERSION",
+                target=target,
+            )
 
-    # Target the nearer of band-mid / VWAP so the objective is realistic.
-    target = min(ind["bb_mid"], ind["vwap"])
-    if target <= ind["price"]:
-        return None  # mean is already below us — no room, skip
+    # --- Short: fade the high (the half spot could not trade) ---------------
+    if (ind["bb_pct_b"] >= 0.95
+            and ind["rsi"] >= config.RSI_OVERBOUGHT
+            and price > ind["vwap"]
+            and ind["htf_bias"] != "BULLISH"):     # never short into a rally
 
-    confidence = 60
-    if ind["rsi"] <= config.RSI_OVERSOLD - 5:
-        confidence += 10
-    if ind["htf_bias"] == "BULLISH":
-        confidence += 10          # fading a dip inside an uptrend is the A+ case
-    if ind["vol_trend"] == "High":
-        confidence += 5           # capitulation volume marks exhaustion
+        target = max(ind["bb_mid"], ind["vwap"])
+        if target < price:
+            conf = 60
+            if ind["rsi"] >= config.RSI_OVERBOUGHT + 5:
+                conf += 10
+            if ind["htf_bias"] == "BEARISH":
+                conf += 10
+            if ind["vol_trend"] == "High":
+                conf += 5
+            return Signal(
+                action="SHORT",
+                confidence=min(conf, 95),
+                reason=(f"Mean-reversion short: ${price:,.2f} at upper band "
+                        f"(%B={ind['bb_pct_b']:.2f}), RSI {ind['rsi']}, "
+                        f"ADX {ind['adx']} confirms range. Target ${target:,.2f}."),
+                setup="MEAN_REVERSION",
+                target=target,
+            )
 
-    return Signal(
-        action="BUY",
-        confidence=min(confidence, 95),
-        reason=(f"Mean-reversion fade: price ${ind['price']:,.2f} at lower band "
-                f"(%B={ind['bb_pct_b']:.2f}), RSI {ind['rsi']}, ADX {ind['adx']} "
-                f"confirms range. Target ${target:,.2f}."),
-        setup="MEAN_REVERSION",
-        target=target,
-    )
+    return None
 
+
+# ── Setup 2: squeeze breakout ─────────────────────────────────────────────────
 
 def _squeeze_breakout(ind: dict) -> Optional[Signal]:
     """
-    Setup 2 — volatility expansion. Bollinger bandwidth compressed into the
-    bottom quartile of its recent range means energy is coiled; the subsequent
-    expansion is directional and fast. This is BTC's signature move.
+    Volatility expansion. Bollinger bandwidth compressed into the bottom
+    quartile of its recent range means energy is coiled; the expansion that
+    follows is directional and fast. This is BTC's signature move.
 
-    Fires exactly when mean-reversion is switched off, so the two setups
-    complement rather than compete.
+    Fires exactly when mean-reversion is switched off, so the two complement
+    rather than compete.
 
-    Entry: squeeze present (or just released) + price breaking the recent high
-    on above-average volume.
-    Target: measured move — breakout level plus the compressed range height.
+    Target is a measured move: half the compressed range projected off the break.
     """
     if ind["regime"] == "RANGE" and not ind["squeeze"]:
         return None
 
-    # Only take breakouts in the direction the 5m chart supports.
-    if ind["htf_bias"] == "BEARISH":
-        return None
-
-    breaking_out = ind["price"] >= ind["recent_high"] * 0.9995
-    volume_confirms = ind["vol_trend"] == "High"
-    momentum_up = ind["macd_hist"] > 0 and ind["ema9"] > ind["ema21"]
-
-    if not (breaking_out and volume_confirms and momentum_up):
-        return None
-
-    # Measured move: project the pre-breakout range height off the break level.
+    price = ind["price"]
     range_height = ind["recent_high"] - ind["recent_low"]
-    target = ind["price"] + range_height * 0.5
+    if range_height <= 0:
+        return None
 
-    confidence = 55
-    if ind["squeeze"]:
-        confidence += 15          # a true squeeze release is the high-quality version
-    if ind["htf_bias"] == "BULLISH":
-        confidence += 10
-    if ind["adx"] >= config.TREND_ADX_MIN:
-        confidence += 5
+    volume_confirms = ind["vol_trend"] == "High"
+    if not volume_confirms:
+        return None       # an unconfirmed break is usually a fakeout
 
-    return Signal(
-        action="BUY",
-        confidence=min(confidence, 95),
-        reason=(f"Squeeze breakout: price ${ind['price']:,.2f} clearing "
-                f"${ind['recent_high']:,.2f} on high volume, "
-                f"squeeze={ind['squeeze']}, ADX {ind['adx']}. "
-                f"Measured target ${target:,.2f}."),
-        setup="SQUEEZE_BREAKOUT",
-        target=target,
-    )
+    # --- Long breakout ------------------------------------------------------
+    if (price >= ind["recent_high"] * 0.9995
+            and ind["macd_hist"] > 0
+            and ind["ema9"] > ind["ema21"]
+            and ind["htf_bias"] != "BEARISH"):
 
+        target = price + range_height * 0.5
+        conf = 55
+        if ind["squeeze"]:
+            conf += 15    # a true squeeze release is the high-quality version
+        if ind["htf_bias"] == "BULLISH":
+            conf += 10
+        if ind["adx"] >= config.TREND_ADX_MIN:
+            conf += 5
+        return Signal(
+            action="LONG",
+            confidence=min(conf, 95),
+            reason=(f"Squeeze breakout long: ${price:,.2f} clearing "
+                    f"${ind['recent_high']:,.2f} on high volume, "
+                    f"squeeze={ind['squeeze']}, ADX {ind['adx']}. "
+                    f"Measured target ${target:,.2f}."),
+            setup="SQUEEZE_BREAKOUT",
+            target=target,
+        )
+
+    # --- Short breakdown ----------------------------------------------------
+    # Downside breaks on BTC tend to run faster than upside ones — liquidation
+    # cascades are one-directional by construction, since leveraged longs
+    # dominate open interest.
+    if (price <= ind["recent_low"] * 1.0005
+            and ind["macd_hist"] < 0
+            and ind["ema9"] < ind["ema21"]
+            and ind["htf_bias"] != "BULLISH"):
+
+        target = price - range_height * 0.5
+        conf = 55
+        if ind["squeeze"]:
+            conf += 15
+        if ind["htf_bias"] == "BEARISH":
+            conf += 10
+        if ind["adx"] >= config.TREND_ADX_MIN:
+            conf += 5
+        return Signal(
+            action="SHORT",
+            confidence=min(conf, 95),
+            reason=(f"Squeeze breakdown short: ${price:,.2f} losing "
+                    f"${ind['recent_low']:,.2f} on high volume, "
+                    f"squeeze={ind['squeeze']}, ADX {ind['adx']}. "
+                    f"Measured target ${target:,.2f}."),
+            setup="SQUEEZE_BREAKOUT",
+            target=target,
+        )
+
+    return None
+
+
+# ── Setup 3: trend pullback ───────────────────────────────────────────────────
 
 def _trend_pullback(ind: dict) -> Optional[Signal]:
     """
-    Setup 3 — buy the dip inside an established uptrend. Lower conviction than
-    the two above (it's the most crowded retail setup, so edge is thinner), but
-    it fills the gap when neither of the others qualifies.
-
-    Entry: 5m bullish + 1m trending + price pulled back to EMA21 and reclaimed EMA9.
+    Continuation after a pullback inside an established trend. Lower conviction
+    than the two above — it is the most crowded retail setup, so the edge is
+    thinner — but it fills the gap when neither of the others qualifies.
     """
-    if ind["htf_bias"] != "BULLISH":
-        return None
     if ind["regime"] != "TREND":
         return None
 
-    pulled_back = ind["price"] <= ind["ema21"] * 1.001
-    reclaiming = ind["price"] > ind["ema9"]
-    not_overbought = ind["rsi"] < 65
+    price = ind["price"]
 
-    if not (pulled_back and reclaiming and not_overbought):
-        return None
+    if (ind["htf_bias"] == "BULLISH"
+            and price <= ind["ema21"] * 1.001
+            and price > ind["ema9"]
+            and ind["rsi"] < 65):
 
-    target = ind["recent_high"]
-    if target <= ind["price"]:
-        return None
+        target = ind["recent_high"]
+        if target > price:
+            conf = 55 + (5 if ind["vol_trend"] != "Low" else 0) \
+                      + (5 if ind["macd_hist"] > 0 else 0)
+            return Signal(
+                action="LONG",
+                confidence=min(conf, 90),
+                reason=(f"Trend pullback long: 5m bullish, ${price:,.2f} held "
+                        f"EMA21 ${ind['ema21']:,.2f} and reclaimed EMA9. "
+                        f"Target ${target:,.2f}."),
+                setup="TREND_PULLBACK",
+                target=target,
+            )
 
-    confidence = 55
-    if ind["vol_trend"] != "Low":
-        confidence += 5
-    if ind["macd_hist"] > 0:
-        confidence += 5
+    if (ind["htf_bias"] == "BEARISH"
+            and price >= ind["ema21"] * 0.999
+            and price < ind["ema9"]
+            and ind["rsi"] > 35):
 
-    return Signal(
-        action="BUY",
-        confidence=min(confidence, 90),
-        reason=(f"Trend pullback: 5m bullish, price ${ind['price']:,.2f} held "
-                f"EMA21 ${ind['ema21']:,.2f} and reclaimed EMA9. "
-                f"Target ${target:,.2f}."),
-        setup="TREND_PULLBACK",
-        target=target,
-    )
+        target = ind["recent_low"]
+        if target < price:
+            conf = 55 + (5 if ind["vol_trend"] != "Low" else 0) \
+                      + (5 if ind["macd_hist"] < 0 else 0)
+            return Signal(
+                action="SHORT",
+                confidence=min(conf, 90),
+                reason=(f"Trend pullback short: 5m bearish, ${price:,.2f} "
+                        f"rejected EMA21 ${ind['ema21']:,.2f}. "
+                        f"Target ${target:,.2f}."),
+                setup="TREND_PULLBACK",
+                target=target,
+            )
+
+    return None
 
 
 # Order matters: highest-conviction setup first, first match wins.
@@ -191,33 +269,48 @@ _SETUPS = (_mean_reversion, _squeeze_breakout, _trend_pullback)
 
 def _exit_signal(ind: dict, state: dict) -> Optional[Signal]:
     """
-    Signal-based exits, checked before hard SL/TP brackets get a chance to fire.
+    Signal-based exits, evaluated before the hard brackets get a chance to fire.
     A scalp thesis can die before the stop is hit — when the reason for the
     trade evaporates, leave, rather than donating the difference to the stop.
     """
     setup = state.get("setup", "")
+    is_long = state.get("side") == "Buy"
+    price = ind["price"]
 
-    # Mean-reversion trades exist purely to reach the mean. Once price is back
-    # at VWAP/band-mid the edge is spent regardless of what the P&L says.
     if setup == "MEAN_REVERSION":
-        if ind["price"] >= min(ind["bb_mid"], ind["vwap"]):
-            return Signal("SELL", 80, "Mean reached — fade objective complete.", setup)
-        if ind["regime"] == "TREND" and ind["htf_bias"] == "BEARISH":
-            return Signal("SELL", 85,
-                          "Range broke into a bearish trend — fade thesis invalidated.",
-                          setup)
+        # These trades exist purely to reach the mean. Once price is back at
+        # VWAP/band-mid the edge is spent, whatever the P&L says.
+        if is_long and price >= min(ind["bb_mid"], ind["vwap"]):
+            return Signal("CLOSE", 80, "Mean reached — fade objective complete.", setup)
+        if not is_long and price <= max(ind["bb_mid"], ind["vwap"]):
+            return Signal("CLOSE", 80, "Mean reached — fade objective complete.", setup)
+        # The range breaking is the fade thesis being invalidated outright.
+        if ind["regime"] == "TREND":
+            if is_long and ind["htf_bias"] == "BEARISH":
+                return Signal("CLOSE", 85,
+                              "Range broke into a bearish trend — long fade invalidated.",
+                              setup)
+            if not is_long and ind["htf_bias"] == "BULLISH":
+                return Signal("CLOSE", 85,
+                              "Range broke into a bullish trend — short fade invalidated.",
+                              setup)
 
-    # Breakouts that lose momentum tend to fully retrace the break.
     if setup == "SQUEEZE_BREAKOUT":
-        if ind["ema9"] < ind["ema21"] and ind["macd_hist"] < 0:
-            return Signal("SELL", 75,
-                          "Breakout momentum lost (EMA9 back under EMA21).", setup)
+        # Breakouts that lose momentum tend to fully retrace the break.
+        if is_long and ind["ema9"] < ind["ema21"] and ind["macd_hist"] < 0:
+            return Signal("CLOSE", 75, "Breakout momentum lost (EMA9 back under EMA21).", setup)
+        if not is_long and ind["ema9"] > ind["ema21"] and ind["macd_hist"] > 0:
+            return Signal("CLOSE", 75, "Breakdown momentum lost (EMA9 back over EMA21).", setup)
 
     if setup == "TREND_PULLBACK":
-        if ind["htf_bias"] == "BEARISH":
-            return Signal("SELL", 80, "Higher-timeframe trend flipped bearish.", setup)
-        if ind["rsi"] > 75:
-            return Signal("SELL", 70, "RSI overbought — taking the scalp.", setup)
+        if is_long and ind["htf_bias"] == "BEARISH":
+            return Signal("CLOSE", 80, "Higher-timeframe trend flipped bearish.", setup)
+        if not is_long and ind["htf_bias"] == "BULLISH":
+            return Signal("CLOSE", 80, "Higher-timeframe trend flipped bullish.", setup)
+        if is_long and ind["rsi"] > 75:
+            return Signal("CLOSE", 70, "RSI overbought — taking the scalp.", setup)
+        if not is_long and ind["rsi"] < 25:
+            return Signal("CLOSE", 70, "RSI oversold — taking the scalp.", setup)
 
     return None
 
@@ -225,40 +318,20 @@ def _exit_signal(ind: dict, state: dict) -> Optional[Signal]:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def get_signal(ind: dict, state: dict) -> Signal:
-    """
-    Evaluate all rules and return a single decision.
-
-    Mirrors ai.get_signal()'s contract so strategy.py can swap between them,
-    but is deterministic and adds no network latency.
-    """
+    """Evaluate all rules and return a single decision."""
     if state.get("in_position"):
         exit_sig = _exit_signal(ind, state)
         if exit_sig:
             return exit_sig
-        return _hold(f"Holding {state.get('setup','position')} — thesis intact, "
-                     f"brackets managing the trade.")
+        return _hold(f"Holding {state.get('setup','position')} "
+                     f"{state.get('side','')} — thesis intact, brackets managing it.")
 
     for setup_fn in _SETUPS:
         sig = setup_fn(ind)
         if sig:
-            log.info(f"[setup] {sig.setup} fired conf={sig.confidence}")
+            log.info(f"[setup] {sig.setup} {sig.action} conf={sig.confidence}")
             return sig
 
     return _hold(f"No setup. regime={ind['regime']} ADX={ind['adx']} "
-                 f"RSI={ind['rsi']} squeeze={ind['squeeze']} bias={ind['htf_bias']}")
-
-
-# ── Note on the missing half of this strategy ─────────────────────────────────
-_MIRROR_NOTE = """
-Every setup above has an exact short mirror that spot cannot express:
-
-  MEAN_REVERSION   -> fade %B >= 0.95 with RSI >= 70 back down to VWAP
-  SQUEEZE_BREAKOUT -> short the break of recent_low on expansion
-  TREND_PULLBACK   -> short rallies to EMA21 inside a 5m downtrend
-
-On Bybit linear perps (category="linear") these are available, and round-trip
-fees drop from 0.20% to ~0.11% taker / 0.04% maker. That combination — double
-the setups at a quarter of the cost — is a far larger improvement to expectancy
-than any amount of tuning to the rules above. It is the single highest-value
-change available to this bot, at the cost of taking on liquidation risk.
-"""
+                 f"RSI={ind['rsi']} %B={ind['bb_pct_b']:.2f} "
+                 f"squeeze={ind['squeeze']} bias={ind['htf_bias']}")

@@ -1,19 +1,20 @@
 """
-Walk-forward backtester for the BTC scalping engine.
+Walk-forward backtester for the BTC perpetual scalping engine.
 
 Runs the EXACT same scalp_signal / scalp_risk code paths the live bot uses, so
 what you measure here is what you deploy. Nothing is reimplemented.
 
     python backtest.py --days 30
-    python backtest.py --days 30 --fees 0.055 --json
+    python backtest.py --days 30 --fees 0.10     # what spot would have cost
+    python backtest.py --days 30 --json
 
-Read the caveats at the bottom of the output before trusting any number.
+Read the caveats printed at the end before trusting any number.
 """
 import argparse
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -27,9 +28,9 @@ import scalp_risk
 
 def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
     """
-    Page backwards through Bybit's kline endpoint (1000 bars max per request)
-    until `days` of history is collected. Public endpoint — no API key needed,
-    which means you can validate the strategy before funding anything.
+    Page backwards through Bybit's linear kline endpoint (1000 bars per call)
+    until `days` of history is collected. Public endpoint — no API key, no
+    account, nothing at risk. Validate before funding.
     """
     from pybit.unified_trading import HTTP
     client = HTTP(testnet=False)
@@ -40,7 +41,7 @@ def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
     fetched = 0
 
     while fetched < bars_needed:
-        resp = client.get_kline(category="spot", symbol=symbol,
+        resp = client.get_kline(category="linear", symbol=symbol,
                                 interval=interval, limit=1000, end=end)
         rows = resp["result"]["list"]
         if not rows:
@@ -49,11 +50,9 @@ def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
         df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "vol", "turn"])
         frames.append(df)
         fetched += len(rows)
-
-        # Bybit returns newest-first; step `end` back past the oldest bar.
         end = int(df["ts"].astype("int64").min()) - 1
         print(f"  fetched {fetched}/{bars_needed} bars…", end="\r", file=sys.stderr)
-        time.sleep(0.1)   # stay well inside the public rate limit
+        time.sleep(0.1)
 
     if not frames:
         raise RuntimeError("No historical data returned")
@@ -68,7 +67,6 @@ def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
 
 
 def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
-    """Build the 5m higher-timeframe series from 1m bars."""
     d = df_1m.set_index("ts")
     out = d.resample("5min").agg({"open": "first", "high": "max", "low": "min",
                                   "close": "last", "vol": "sum"}).dropna()
@@ -83,7 +81,7 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
     indicator window is sliced, never the full frame, so there is no lookahead.
     """
     state = {
-        "in_position": False, "entry_price": 0.0, "entry_time": None,
+        "in_position": False, "side": None, "entry_price": 0.0, "entry_time": None,
         "qty": 0.0, "sl_price": 0.0, "tp_price": 0.0, "setup": "",
         "trailing_active": False, "daily_pnl_usdt": 0.0, "trade_count_today": 0,
         "consecutive_losses": 0, "last_loss_time": None,
@@ -93,9 +91,7 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
     peak = equity
     max_dd = 0.0
     trades = []
-    equity_curve = []
     current_day = None
-
     fee_rate = config.TAKER_FEE_PCT / 100
 
     for i in range(warmup, len(df)):
@@ -103,7 +99,6 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
         bar = df.iloc[i]
         ts = bar["ts"]
 
-        # Daily counter reset, mirroring reset_daily_if_needed().
         day = ts.date()
         if day != current_day:
             current_day = day
@@ -122,36 +117,40 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
 
         # --- Manage an open position against this bar's actual range ---------
         if state["in_position"]:
-            state = scalp_risk.update_trailing_stop(state, bar["close"], ind["atr"])
+            state, _ = scalp_risk.update_trailing_stop(state, bar["close"], ind["atr"])
+            long = state["side"] == "Buy"
 
             exit_price = None
             trigger = None
 
-            # Pessimistic ordering: if both the stop and target fall inside the
-            # same bar we assume the stop filled first. Optimistic ordering is
+            # Pessimistic ordering: when a bar's range contains both the stop
+            # and the target, assume the STOP filled. Optimistic ordering is
             # the most common way a backtest flatters a scalping strategy.
-            if bar["low"] <= state["sl_price"]:
-                exit_price = state["sl_price"]
-                trigger = "TRAIL" if state["trailing_active"] else "SL"
-            elif bar["high"] >= state["tp_price"]:
-                exit_price = state["tp_price"]
-                trigger = "TP"
+            if long:
+                if bar["low"] <= state["sl_price"]:
+                    exit_price, trigger = state["sl_price"], \
+                        ("TRAIL" if state["trailing_active"] else "SL")
+                elif bar["high"] >= state["tp_price"]:
+                    exit_price, trigger = state["tp_price"], "TP"
             else:
-                held = (ts - state["entry_time"]).total_seconds() / 60
-                if held >= config.MAX_HOLD_MINUTES:
-                    exit_price = bar["close"]
-                    trigger = "TIME"
+                if bar["high"] >= state["sl_price"]:
+                    exit_price, trigger = state["sl_price"], \
+                        ("TRAIL" if state["trailing_active"] else "SL")
+                elif bar["low"] <= state["tp_price"]:
+                    exit_price, trigger = state["tp_price"], "TP"
 
             if exit_price is None:
-                sig = scalp_signal.get_signal(ind, state)
-                if sig.action == "SELL":
-                    exit_price = bar["close"]
-                    trigger = "SIGNAL"
+                held = (ts - state["entry_time"]).total_seconds() / 60
+                if held >= config.MAX_HOLD_MINUTES:
+                    exit_price, trigger = bar["close"], "TIME"
+                else:
+                    sig = scalp_signal.get_signal(ind, state)
+                    if sig.action == "CLOSE":
+                        exit_price, trigger = bar["close"], "SIGNAL"
 
             if exit_price is not None:
-                entry = state["entry_price"]
-                qty = state["qty"]
-                gross = (exit_price - entry) * qty
+                entry, qty = state["entry_price"], state["qty"]
+                gross = (exit_price - entry) * qty if long else (entry - exit_price) * qty
                 fees = (entry * qty + exit_price * qty) * fee_rate
                 pnl = gross - fees
 
@@ -162,6 +161,7 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
                 trades.append({
                     "entry_time": state["entry_time"].isoformat(),
                     "exit_time": ts.isoformat(),
+                    "direction": "LONG" if long else "SHORT",
                     "setup": state["setup"],
                     "trigger": trigger,
                     "entry": round(entry, 2),
@@ -169,45 +169,42 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
                     "gross": round(gross, 4),
                     "fees": round(fees, 4),
                     "pnl": round(pnl, 4),
-                    "pnl_pct": round((exit_price - entry) / entry * 100, 4),
+                    "pnl_pct": round((gross / (entry * qty) * 100) if entry and qty else 0, 4),
                     "held_min": round((ts - state["entry_time"]).total_seconds() / 60, 1),
                 })
 
-                state.update({"in_position": False, "qty": 0.0, "setup": "",
-                              "trailing_active": False, "entry_time": None,
-                              "sl_price": 0.0, "tp_price": 0.0})
+                state.update({"in_position": False, "side": None, "qty": 0.0,
+                              "setup": "", "trailing_active": False,
+                              "entry_time": None, "sl_price": 0.0, "tp_price": 0.0})
                 state["daily_pnl_usdt"] += pnl
-                if pnl < 0:
-                    state["consecutive_losses"] += 1
-                else:
-                    state["consecutive_losses"] = 0
-                equity_curve.append({"ts": ts.isoformat(), "equity": round(equity, 2)})
+                state["consecutive_losses"] = 0 if pnl >= 0 else state["consecutive_losses"] + 1
                 continue
 
         # --- Look for an entry ------------------------------------------------
         sig = scalp_signal.get_signal(ind, state)
-        if sig.action != "BUY":
+        if not sig.is_entry:
             continue
 
-        balance = {"usdt": equity}
-        # Cooldown uses wall-clock in live trading; skip it here rather than
-        # fake it, and note the difference in the caveats.
+        # The cooldown uses wall-clock time in live trading; skip it here rather
+        # than fake it, and note the difference in the caveats.
         allowed, _ = scalp_risk.validate(sig, {**state, "last_loss_time": None},
-                                         balance, ind)
+                                         {"usdt": equity}, ind)
         if not allowed:
             continue
 
         entry_price = bar["close"]
-        brackets = scalp_risk.compute_brackets(entry_price, ind["atr"], sig.target)
-        notional = scalp_risk.position_size(equity, entry_price, brackets["sl_price"])
-        if notional < scalp_risk.MIN_NOTIONAL_USDT:
+        side = sig.side
+        brackets = scalp_risk.compute_brackets(entry_price, ind["atr"], side, sig.target)
+        qty = scalp_risk.position_qty(equity, entry_price, brackets["sl_price"])
+        if qty <= 0:
             continue
 
         state.update({
             "in_position": True,
+            "side": side,
             "entry_price": entry_price,
             "entry_time": ts,
-            "qty": notional / entry_price,
+            "qty": qty,
             "sl_price": brackets["sl_price"],
             "tp_price": brackets["tp_price"],
             "setup": sig.setup,
@@ -223,8 +220,8 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
 def summarise(trades, equity, max_dd, df) -> dict:
     start = config.MAX_INVESTMENT_USDT
     if not trades:
-        return {"trades": 0, "note": "No trades triggered in this period.",
-                "bars": len(df)}
+        return {"trades": 0, "bars": len(df),
+                "note": "No trades triggered. Filters may be too strict for this period."}
 
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
@@ -232,19 +229,17 @@ def summarise(trades, equity, max_dd, df) -> dict:
     gross_loss = abs(sum(t["pnl"] for t in losses))
     total_fees = sum(t["fees"] for t in trades)
 
-    by_setup = {}
-    for t in trades:
-        s = by_setup.setdefault(t["setup"], {"n": 0, "wins": 0, "pnl": 0.0})
-        s["n"] += 1
-        s["wins"] += 1 if t["pnl"] > 0 else 0
-        s["pnl"] += t["pnl"]
-    for s in by_setup.values():
-        s["win_rate"] = round(s["wins"] / s["n"] * 100, 1)
-        s["pnl"] = round(s["pnl"], 2)
-
-    by_trigger = {}
-    for t in trades:
-        by_trigger[t["trigger"]] = by_trigger.get(t["trigger"], 0) + 1
+    def _group(key):
+        out = {}
+        for t in trades:
+            g = out.setdefault(t[key], {"n": 0, "wins": 0, "pnl": 0.0})
+            g["n"] += 1
+            g["wins"] += 1 if t["pnl"] > 0 else 0
+            g["pnl"] += t["pnl"]
+        for g in out.values():
+            g["win_rate"] = round(g["wins"] / g["n"] * 100, 1)
+            g["pnl"] = round(g["pnl"], 2)
+        return out
 
     days = (df["ts"].iloc[-1] - df["ts"].iloc[0]).total_seconds() / 86400
 
@@ -256,8 +251,8 @@ def summarise(trades, equity, max_dd, df) -> dict:
         "net_pnl_usdt": round(equity - start, 2),
         "return_pct": round((equity - start) / start * 100, 2),
         "total_fees_usdt": round(total_fees, 2),
-        # Fees as a share of gross winnings — the number that tells you whether
-        # this is a strategy or a rebate program for Bybit.
+        # Fees as a share of gross winnings — the number that says whether this
+        # is a strategy or a rebate programme for Bybit.
         "fees_vs_gross_wins_pct": round(total_fees / gross_win * 100, 1) if gross_win else None,
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
         "expectancy_usdt": round((equity - start) / len(trades), 4),
@@ -265,8 +260,9 @@ def summarise(trades, equity, max_dd, df) -> dict:
         "avg_loss": round(-gross_loss / len(losses), 4) if losses else 0,
         "max_drawdown_pct": round(max_dd, 2),
         "avg_hold_min": round(sum(t["held_min"] for t in trades) / len(trades), 1),
-        "by_setup": by_setup,
-        "by_exit_trigger": by_trigger,
+        "by_direction": _group("direction"),
+        "by_setup": _group("setup"),
+        "by_exit_trigger": {k: v["n"] for k, v in _group("trigger").items()},
         "final_equity": round(equity, 2),
     }
 
@@ -280,51 +276,59 @@ CAVEATS = """
    re-check whether the edge survives.
 
 2. STOP-BEFORE-TARGET ASSUMPTION. When a bar's range contains both levels this
-   assumes the stop filled. That is conservative but crude — only tick data
-   resolves the true sequence.
+   assumes the stop filled. Conservative but crude — only tick data resolves
+   the true sequence.
 
 3. THE COOLDOWN TIMER IS NOT SIMULATED, so this takes trades the live bot would
-   skip. Live results should show fewer trades than this report.
+   skip. Live should show fewer trades than this report.
 
-4. SURVIVORSHIP / REGIME BIAS. One 30-day window is one sample of one market
+4. NO FUNDING COSTS. Perps pay/receive funding every 8h. Scalps rarely span a
+   funding stamp, but a run of trades held through them will drift from this.
+
+5. NO LIQUIDATION MODELLING. At LEVERAGE=1 that is fine. Above ~5x it is not,
+   and this backtest will happily show a profitable run through a move that
+   would have liquidated the real account.
+
+6. SURVIVORSHIP / REGIME BIAS. One 30-day window is one sample of one market
    regime. Run several disjoint windows — a trending month, a chopping month,
    a crash — before concluding anything. A strategy that only works in the
    window you tuned it on is curve-fit, not profitable.
 
-5. NO FUNDING COSTS (irrelevant on spot, but material if you migrate to perps).
-
-A profit factor under ~1.3 or an edge that vanishes when you add 2 bps of
-slippage is not a live-tradeable strategy. Paper-trade before funding.
+A profit factor under ~1.3, or an edge that vanishes when you add 2 bps of
+slippage, is not a live-tradeable strategy. Paper-trade before funding.
 """
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Backtest the BTC scalping engine")
+    ap = argparse.ArgumentParser(description="Backtest the BTC perp scalping engine")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--symbol", default=config.SYMBOL)
-    ap.add_argument("--fees", type=float, help="Override round-trip fee %% per side")
-    ap.add_argument("--json", action="store_true", help="Machine-readable output")
+    ap.add_argument("--fees", type=float,
+                    help="Override taker fee %% per side (perp 0.055, spot 0.10)")
+    ap.add_argument("--balance", type=float, help="Override starting pot in USDT")
+    ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     if args.fees is not None:
         config.TAKER_FEE_PCT = args.fees
-        config.MAKER_FEE_PCT = args.fees
         config.ROUND_TRIP_FEE_PCT = args.fees * 2
+    if args.balance is not None:
+        config.MAX_INVESTMENT_USDT = args.balance
 
-    print(f"Fetching {args.days}d of {args.symbol} 1m data…", file=sys.stderr)
+    print(f"Fetching {args.days}d of {args.symbol} perp 1m data…", file=sys.stderr)
     df = fetch_history(args.symbol, "1", args.days)
     df5 = resample_5m(df)
 
-    print(f"Simulating {len(df)} bars "
-          f"(round-trip fees {config.ROUND_TRIP_FEE_PCT:.3f}%, "
-          f"min TP {config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT:.3f}%)…",
+    print(f"Simulating {len(df)} bars | pot ${config.MAX_INVESTMENT_USDT:,.2f} | "
+          f"round-trip fees {config.ROUND_TRIP_FEE_PCT:.3f}% | "
+          f"min TP {config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT:.3f}%…",
           file=sys.stderr)
     result = run(df, df5)
 
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print("\n=== BTC Scalping Backtest ===")
+        print("\n=== BTC Perp Scalping Backtest ===")
         for k, v in result.items():
             if isinstance(v, dict):
                 print(f"{k}:")

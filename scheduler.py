@@ -45,14 +45,14 @@ def _warn_if_legacy_position_orphaned() -> None:
             return
 
         msg = (
-            f"ORPHANED POSITION: the swing bot's state file still shows an open "
-            f"position — {legacy.get('qty')} @ ${legacy.get('entry_price')}, "
+            f"ORPHANED SPOT POSITION: the swing bot's state file still shows an "
+            f"open position — {legacy.get('qty')} @ ${legacy.get('entry_price')}, "
             f"SL ${legacy.get('sl_price')} / TP ${legacy.get('tp_price')}.\n\n"
-            f"SCALP_MODE is now active, which trades {config.SYMBOL} off a "
-            f"separate state file. Nothing is monitoring that older position's "
-            f"stop-loss any more.\n\n"
-            f"Close it manually on Bybit, or set SCALP_MODE=false to hand it "
-            f"back to the swing bot."
+            f"SCALP_MODE is now active, which trades the {config.SYMBOL} "
+            f"PERPETUAL off a separate state file. That is a different market — "
+            f"nothing is monitoring the old spot position's stop-loss any more.\n\n"
+            f"Sell it manually on Bybit, or set SCALP_MODE=false to hand it back "
+            f"to the swing bot."
         )
         log.critical(msg)
         try:
@@ -63,6 +63,51 @@ def _warn_if_legacy_position_orphaned() -> None:
         log.error(f"Could not check legacy state for an orphaned position: {e}")
 
 
+def _check_account_viable() -> None:
+    """
+    Can this account open the smallest position the exchange allows?
+
+    BTCUSDT perp has a 0.001 BTC minimum. At a six-figure BTC price that is
+    ~$100+ of notional, so at 1x leverage the account needs ~$100 of margin
+    just to place one trade. A small float cannot meet that without raising
+    leverage — which is a real decision about liquidation risk, not a detail.
+
+    Checked loudly at startup so it surfaces as a clear message rather than an
+    endless stream of rejected orders.
+    """
+    import perp_client
+    try:
+        price = float(perp_client.get_klines(limit=1)["close"].iloc[-1])
+        balance = perp_client.get_balance()
+        ok, detail = perp_client.check_account_viable(balance.get("usdt", 0), price)
+
+        if ok:
+            log.info(f"Account viability: {detail}")
+            return
+
+        min_q = perp_client.min_qty()
+        needed_lev = (min_q * price) / max(balance.get("usdt", 0), 0.01)
+        msg = (
+            f"ACCOUNT TOO SMALL TO TRADE {config.SYMBOL} PERP.\n\n{detail}\n\n"
+            f"To open even the minimum position with this balance you would "
+            f"need roughly {needed_lev:.1f}x leverage (currently "
+            f"{config.LEVERAGE:g}x). At that leverage a ~{100/max(needed_lev,1):.1f}% "
+            f"adverse move liquidates the account, and BTC moves that much "
+            f"intraday regularly.\n\n"
+            f"Options: fund the account to about "
+            f"${min_q * price:,.0f} to trade at 1x, or trade a smaller-minimum "
+            f"instrument. Raising leverage to force a position through is not "
+            f"a fix — it converts a sizing problem into a liquidation problem."
+        )
+        log.critical(msg)
+        try:
+            tg.alert_critical(msg)
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"Could not run the account viability check: {e}")
+
+
 def run_bot() -> None:
     """Main bot loop — runs inside the gunicorn worker thread."""
     # SCALP_MODE swaps the whole signal/exit engine. The original AI-led swing
@@ -71,6 +116,7 @@ def run_bot() -> None:
         import scalp_strategy
         engine = scalp_strategy
         _warn_if_legacy_position_orphaned()
+        _check_account_viable()
         cycle_seconds = config.SCALP_CYCLE_SECONDS
         min_sleep = 5
         log.info(f"{config.SYMBOL} SCALP bot starting | cycle={cycle_seconds}s | "
@@ -122,9 +168,16 @@ def run_bot() -> None:
         now = datetime.now(timezone.utc)
         if (now - last_hour).total_seconds() >= 3600:
             try:
-                df  = bybit_client.get_klines()
+                # Report against the market actually being traded — spot for
+                # the swing path, the perp for the scalper.
+                if config.SCALP_MODE:
+                    import perp_client
+                    client = perp_client
+                else:
+                    client = bybit_client
+                df  = client.get_klines()
                 ind = ind_calc.calculate(df)
-                bal = bybit_client.get_balance()
+                bal = client.get_balance()
                 tg.send_hourly_summary(state, ind, bal)
                 last_hour = now.replace(minute=0, second=0, microsecond=0)
             except Exception as e:

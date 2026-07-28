@@ -31,17 +31,36 @@ OPENAI_MODEL     = os.environ.get("OPENAI_MODEL",     "gpt-4o-mini")
 SCALP_MODE          = os.environ.get("SCALP_MODE", "false").lower() == "true"
 
 # ── Market ────────────────────────────────────────────────────────────────────
-# The default symbol follows the mode, so that turning SCALP_MODE off really
-# does restore the previous bot rather than pointing it at a different market.
-# An explicit SYMBOL env var always wins over both.
-_DEFAULT_SYMBOL = "BTCUSDT" if SCALP_MODE else "BNBUSDT"
-_DEFAULT_BASE   = "BTC"     if SCALP_MODE else "BNB"
-SYMBOL        = os.environ.get("SYMBOL",    _DEFAULT_SYMBOL)
-BASE_COIN     = os.environ.get("BASE_COIN", _DEFAULT_BASE)
-CATEGORY      = "spot"
+# BTC only. In scalp mode this is the BTCUSDT LINEAR PERPETUAL, not spot.
+#
+# Why perps rather than spot, in one line: spot costs 0.20% round trip and is
+# long-only, which makes a 60%-win-rate scalper mathematically unprofitable.
+# Perps cost ~0.11% taker (0.04% maker-only) and allow shorts, which roughly
+# doubles the number of valid setups. Same strategy, opposite sign of edge.
+#
+# The cost is leverage and liquidation risk, which spot does not have. See
+# LEVERAGE below — it is deliberately pinned at 1x by default.
+SYMBOL        = os.environ.get("SYMBOL",    "BTCUSDT")
+BASE_COIN     = os.environ.get("BASE_COIN", "BTC")
+# "linear" = USDT-margined perpetual futures. The legacy swing path still runs
+# on spot, since it was never written to handle positions or shorts.
+CATEGORY      = "linear" if SCALP_MODE else "spot"
 INTERVAL      = "1"          # 1-minute candles — the scalping timeframe
 TREND_INTERVAL= "5"          # 5-minute candles — higher-TF regime/trend filter
 CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
+
+# ── Leverage ──────────────────────────────────────────────────────────────────
+# DEFAULTS TO 1x ON PURPOSE. At 1x a perp behaves like spot for risk purposes:
+# you get the cheap fees and the ability to short, without adding liquidation
+# risk on top of an unproven strategy.
+#
+# Raising this multiplies BOTH your gains and your losses, and introduces a
+# price at which the position is closed for you. On a $10 account at 10x, a
+# ~9% adverse BTC move liquidates you — and BTC moves 9% intraday several times
+# a year. Do not raise this until the strategy has proven itself at 1x.
+LEVERAGE      = float(os.environ.get("LEVERAGE", "1"))
+# One-way mode (positionIdx=0) — one position per symbol, long or short.
+POSITION_IDX  = 0
 
 # ── Scalping engine ───────────────────────────────────────────────────────────
 # SCALP_MODE itself is defined above the market block, since it decides the
@@ -49,14 +68,22 @@ CANDLE_LIMIT  = 250          # 250 candles covers EMA200 warmup
 SCALP_CYCLE_SECONDS = int(os.environ.get("SCALP_CYCLE_SECONDS", "15"))
 
 # --- Fees. THE most important numbers in this file. -------------------------
-# Bybit spot standard: 0.1% maker / 0.1% taker. A market-in + market-out round
-# trip therefore costs 0.20%. Any target below that is a guaranteed loss before
-# the strategy has even been consulted, so ROUND_TRIP_FEE_PCT is enforced as a
-# hard floor on every take-profit distance in scalp_risk.py.
-# Linear perps are ~5x cheaper (0.02/0.055) — set these if you migrate.
-MAKER_FEE_PCT       = float(os.environ.get("MAKER_FEE_PCT", "0.10"))
-TAKER_FEE_PCT       = float(os.environ.get("TAKER_FEE_PCT", "0.10"))
-ROUND_TRIP_FEE_PCT  = MAKER_FEE_PCT + TAKER_FEE_PCT
+# Bybit linear perpetual standard: 0.02% maker / 0.055% taker. A market-in +
+# market-out round trip costs 0.11%. Any target below that is a guaranteed loss
+# before the strategy has even been consulted, so ROUND_TRIP_FEE_PCT is
+# enforced as a hard floor on every take-profit distance in scalp_risk.py.
+#
+# For reference, spot is 0.10/0.10 = 0.20% round trip. That difference is why
+# this bot trades perps: at 0.20% a 60%-win-rate scalper is net negative, and
+# at 0.11% the same strategy is positive. Check your actual VIP tier and set
+# these to match — guessing low here makes every downstream number a lie.
+MAKER_FEE_PCT       = float(os.environ.get("MAKER_FEE_PCT", "0.02"))
+TAKER_FEE_PCT       = float(os.environ.get("TAKER_FEE_PCT", "0.055"))
+# Both legs are market orders today, so both pay TAKER. Modelling this as
+# maker+taker would understate real costs by ~30% and quietly let through
+# targets that cannot pay for themselves. If post-only limit entries are added
+# later, change this to MAKER_FEE_PCT + TAKER_FEE_PCT.
+ROUND_TRIP_FEE_PCT  = TAKER_FEE_PCT * 2
 # Gross edge must exceed fees by this multiple or the trade is not worth taking.
 MIN_EDGE_FEE_MULT   = float(os.environ.get("MIN_EDGE_FEE_MULT", "2.5"))
 
@@ -89,6 +116,7 @@ BB_STD              = float(os.environ.get("BB_STD", "2.0"))
 SQUEEZE_LOOKBACK    = int(os.environ.get("SQUEEZE_LOOKBACK", "50"))
 SQUEEZE_PCTILE      = float(os.environ.get("SQUEEZE_PCTILE", "25"))  # bandwidth in bottom X%
 RSI_OVERSOLD        = float(os.environ.get("RSI_OVERSOLD", "30"))
+RSI_OVERBOUGHT      = float(os.environ.get("RSI_OVERBOUGHT", "70"))
 VOL_SPIKE_MULT      = float(os.environ.get("VOL_SPIKE_MULT", "1.5"))
 
 # --- Scalp-specific risk limits ---------------------------------------------

@@ -69,7 +69,9 @@ def scalp_stats():
 
     import scalp_strategy
     state = scalp_strategy.load_state()
-    trades = [t for t in scalp_strategy.get_history() if t.get("side") == "SELL"]
+    # Only closed trades carry P&L; entries are the LONG/SHORT records.
+    trades = [t for t in scalp_strategy.get_history()
+              if t.get("side") == "CLOSE" and t.get("pnl") is not None]
 
     wins   = [t for t in trades if t.get("pnl", 0) > 0]
     losses = [t for t in trades if t.get("pnl", 0) <= 0]
@@ -98,9 +100,18 @@ def scalp_stats():
         "trades_today": state.get("trade_count_today", 0),
         "consecutive_losses": state.get("consecutive_losses", 0),
         "in_position": state.get("in_position"),
+        "position_side": state.get("side"),
         "current_setup": state.get("setup"),
+        "longs": state.get("longs", 0),
+        "shorts": state.get("shorts", 0),
+        "untracked_position": state.get("untracked_position", False),
         "by_setup": by_setup,
+        "market": {
+            "category": config.CATEGORY,
+            "leverage": config.LEVERAGE,
+        },
         "fee_config": {
+            "taker_pct": config.TAKER_FEE_PCT,
             "round_trip_pct": config.ROUND_TRIP_FEE_PCT,
             "min_tp_pct": round(config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT, 4),
         },
@@ -116,21 +127,29 @@ def scalp_signal_debug():
     if not config.SCALP_MODE:
         return jsonify({"status": "disabled"})
 
-    import bybit_client
+    import perp_client
     import indicators as ind_calc
     import scalp_signal as ss
     import scalp_risk
     import scalp_strategy
 
     try:
-        df = bybit_client.get_klines(config.INTERVAL)
-        df5 = bybit_client.get_klines(config.TREND_INTERVAL, limit=100)
+        df = perp_client.get_klines(config.INTERVAL)
+        df5 = perp_client.get_klines(config.TREND_INTERVAL, limit=100)
         ind = ind_calc.calculate_scalp(df, df5)
         state = scalp_strategy.load_state()
         sig = ss.get_signal(ind, state)
-        balance = bybit_client.get_balance()
+        balance = perp_client.get_balance()
         allowed, reason = scalp_risk.validate(sig, state, balance, ind)
-        brackets = scalp_risk.compute_brackets(ind["price"], ind["atr"], sig.target)
+
+        # Show what a hypothetical entry would look like in each direction, so
+        # the response is useful even when the current signal is HOLD.
+        brackets = {
+            d: scalp_risk.compute_brackets(ind["price"], ind["atr"], s, None)
+            for d, s in (("long", "Buy"), ("short", "Sell"))
+        }
+        viable, viable_msg = perp_client.check_account_viable(
+            balance.get("usdt", 0), ind["price"])
 
         return jsonify({
             "status": "ok",
@@ -139,7 +158,9 @@ def scalp_signal_debug():
                        "confidence": sig.confidence, "reason": sig.reason,
                        "target": sig.target},
             "risk": {"allowed": allowed, "reason": reason},
+            "account_viable": {"ok": viable, "detail": viable_msg},
             "brackets_if_entered_now": brackets,
+            "position_on_exchange": perp_client.get_position(),
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)})
