@@ -1,10 +1,9 @@
 """
-Flask health server + bot launcher.
-Procfile: web: python app.py
+Flask health server + bot launcher — BTC Directional Candle Bot.
+Procfile: web: gunicorn app:app --config gunicorn.conf.py
 """
 import os
 import threading
-import json
 
 from flask import Flask, jsonify, send_from_directory
 
@@ -20,28 +19,52 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 @app.route("/")
 @app.route("/dashboard")
 def dashboard():
-    """Serve the monitoring console (single-file HTML)."""
+    """Serve the monitoring console."""
     return send_from_directory(_HERE, "dashboard.html")
-
 
 
 @app.route("/healthz")
 def health():
-    return jsonify({"status": "ok", "service": "bnb-spot-bot",
-                    "paper_mode": config.PAPER_MODE})
+    return jsonify({
+        "status":     "ok",
+        "service":    "btc-directional-candle-bot",
+        "symbol":     config.SYMBOL,
+        "category":   config.CATEGORY,
+        "leverage":   config.LEVERAGE,
+        "btc_qty":    config.BTC_QTY,
+        "paper_mode": config.PAPER_MODE,
+    })
 
 
 @app.route("/status")
 def status():
     from strategy import load_state, get_history
     state   = load_state()
-    history = get_history()[-5:]  # last 5 trades
+    history = get_history()
+
+    # Fetch live price for the dashboard's unrealised PnL display
+    last_price = 0.0
+    try:
+        import bybit_client
+        df = bybit_client.get_klines_m5()
+        if not df.empty:
+            last_price = float(df["close"].iloc[-1])
+    except Exception as e:
+        log.warning(f"Could not fetch live price for /status: {e}")
+
+    # Inject last price into state so the frontend can use it without a
+    # separate API call (underscore prefix signals it's a transient field)
+    state["_last_price"] = round(last_price, 2)
+
     return jsonify({
-        "status":     "ok",
-        "paper_mode": config.PAPER_MODE,
-        "symbol":     config.SYMBOL,
-        "state":      state,
-        "recent_trades": history,
+        "status":        "ok",
+        "paper_mode":    config.PAPER_MODE,
+        "symbol":        config.SYMBOL,
+        "category":      config.CATEGORY,
+        "leverage":      config.LEVERAGE,
+        "btc_qty":       str(config.BTC_QTY),
+        "state":         state,
+        "recent_trades": history[-20:],   # last 20 for the history table
     })
 
 
@@ -51,18 +74,21 @@ def history():
     return jsonify(get_history())
 
 
+# ── TradFi routes (kept intact — only runs when TRADFI_ENABLED=true) ──────────
+
 @app.route("/tradfi/status")
 def tradfi_status():
     if not config.TRADFI_ENABLED:
-        return jsonify({"status": "disabled", "message": "Set TRADFI_ENABLED=true to activate."})
+        return jsonify({"status": "disabled",
+                        "message": "Set TRADFI_ENABLED=true to activate."})
     from tradfi_strategy import load_state, get_history
     state   = load_state()
     history = get_history()[-5:]
     return jsonify({
-        "status":     "ok",
-        "paper_mode": config.TRADFI_PAPER,
-        "symbol":     config.TRADFI_SYMBOL,
-        "state":      state,
+        "status":        "ok",
+        "paper_mode":    config.TRADFI_PAPER,
+        "symbol":        config.TRADFI_SYMBOL,
+        "state":         state,
         "recent_trades": history,
     })
 
@@ -77,7 +103,6 @@ def tradfi_history():
 
 @app.route("/tradfi/debug")
 def tradfi_debug():
-    """MT5 link diagnostics for a symbol. Use ?symbol=EURUSD to test any instrument."""
     from flask import request
     import tradfi_client as tc
     base = request.args.get("symbol", config.TRADFI_SYMBOL)
@@ -96,7 +121,6 @@ def tradfi_debug():
 
 @app.route("/tradfi/symbols")
 def tradfi_symbols():
-    """List available TradFi symbols. Use ?search=EUR to filter."""
     from flask import request
     import tradfi_client as tc
     search = request.args.get("search")
@@ -106,6 +130,8 @@ def tradfi_symbols():
     except Exception as e:
         return jsonify({"error": str(e), "search": search})
 
+
+# ── Bot threads ────────────────────────────────────────────────────────────────
 
 def _bot_thread():
     from scheduler import run_bot
@@ -119,16 +145,20 @@ def _tradfi_bot_thread():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    log.info(f"Starting BNB bot (paper={config.PAPER_MODE}) on port {port}")
+    log.info(
+        f"Starting BTC Directional Candle Bot | "
+        f"symbol={config.SYMBOL} leverage={config.LEVERAGE}× "
+        f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
+    )
 
-    t = threading.Thread(target=_bot_thread, daemon=True, name="bnb-bot")
+    t = threading.Thread(target=_bot_thread, daemon=True, name="btc-bot")
     t.start()
 
     if config.TRADFI_ENABLED:
-        log.info(f"TRADFI_ENABLED=true — starting TradFi bot thread (symbol={config.TRADFI_SYMBOL})")
+        log.info(f"TRADFI_ENABLED=true — starting TradFi thread (symbol={config.TRADFI_SYMBOL})")
         tt = threading.Thread(target=_tradfi_bot_thread, daemon=True, name="tradfi-bot")
         tt.start()
     else:
-        log.info("TRADFI_ENABLED=false — TradFi bot thread not started")
+        log.info("TRADFI_ENABLED=false — TradFi thread not started")
 
     app.run(host="0.0.0.0", port=port)
