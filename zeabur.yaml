@@ -1,0 +1,51 @@
+# zeabur.yaml — Multi-service deployment for the trading bot + MT5 bridge
+# ─────────────────────────────────────────────────────────────────────────────
+# Repository root is the Replit workspace; bot source lives under eth-trader-bot/.
+# rootDir tells Zeabur to set its build context to that subdirectory so it finds
+# the Dockerfile and requirements.txt there.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Two services:
+#   1. bot-app     — Flask dashboard + BTC directional candle strategy (25× leverage)
+#   2. mt5-server  — MetaTrader5 terminal (Wine) + mt5linux RPC bridge (TradFi)
+#
+# TradFi reaches MT5 over Zeabur's private DNS:
+#   MT5_HOST = mt5-server.zeabur.internal   MT5_PORT = 8001
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── 1. Flask trading bot ─────────────────────────────────────────────────────
+  - name: bot-app
+    domainPrefix: eth-bot             # public URL: eth-bot.zeabur.app
+    rootDir: eth-trader-bot           # build context = repo/eth-trader-bot/
+    buildType: DOCKER
+    dockerfilePath: Dockerfile        # relative to rootDir
+    volumes:
+      - mountPath: /data
+        name: bot-data
+    # Environment variables (set in Zeabur dashboard → bot-app → Variables):
+    #   ── Crypto (BTC perpetual, 25× leverage) ──
+    #   BYBIT_API_KEY / BYBIT_API_SECRET   (omit → runs in paper mode)
+    #   ── TradFi master switch ──
+    #   TRADFI_ENABLED = true
+    #   TRADFI_SYMBOL  = EURUSD
+    #   TRADFI_MODE    = zero_fee | tight_spread
+    #   ── MT5 connection ──
+    #   MT5_HOST       = mt5-server.zeabur.internal
+    #   MT5_PORT       = 8001
+    #   MT5_LOGIN / MT5_PASSWORD / MT5_SERVER
+    #   ── Alerts ──
+    #   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+    #   GROQ_API_KEY or OPENAI_API_KEY
+
+  # ── 2. MT5 RPC server ────────────────────────────────────────────────────────
+  - name: mt5-server
+    domainPrefix: ~                   # internal only
+    rootDir: eth-trader-bot           # Dockerfile is at eth-trader-bot/mt5-server/Dockerfile
+    buildType: DOCKER
+    dockerfilePath: mt5-server/Dockerfile
+    volumes:
+      - mountPath: /root/.wine
+        name: wine-prefix
+    # Environment variables:
+    #   MT5_PORT / MT5_LOGIN / MT5_PASSWORD / MT5_SERVER / VNC_PASSWORD
