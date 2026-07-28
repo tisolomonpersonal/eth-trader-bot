@@ -28,6 +28,86 @@ you discover it through rejected orders. Your options:
 
 Raising `LEVERAGE` to force a position through is not a fix.
 
+## Measured results — read before deploying anything
+
+Backtested on 30 days of real BTCUSDT perp data, $2,000 pot (sizing constraint
+removed so the strategy could be judged on its own), perp taker fees.
+
+| Base TF | trades | win rate | return | profit factor |
+|---|---|---|---|---|
+| **1m** | 68 | 36.8% | **−7.35%** | 0.31 |
+| **5m** | 91 | 37.4% | **−7.90%** | 0.43 |
+| **15m** | 31 | 41.9% | −3.57% | 0.45 |
+| **30m** | 15 | 60.0% | +0.40% | 1.13 |
+| 30m + 2bps slippage | 11 | 63.6% | +0.49% | 1.25 |
+| 60m | 6 | 50.0% | −1.09% | 0.47 |
+
+**As a 1-minute scalper this strategy loses money. That result is solid** — 68
+and 91 trades are meaningful samples, and both are decisively negative.
+
+The 30m rows are NOT evidence of an edge. Eleven to fifteen trades is noise
+around zero, and 60m turning negative again shows there's no stable trend past
+30m. Do not read "+0.49% with slippage" as a working strategy.
+
+### Why 1m fails — the mechanism
+
+```
+BTC 1-minute ATR (30d):  median 0.0483%,  p90 0.0976%
+Fee floor (0.11% × 2.5): 0.275%  =  5.70 ATR
+```
+
+BTC's 1-minute bars are far too small relative to fixed costs. The consequence
+is that the ATR-scaled brackets **never actually engage** — `MIN_SL_PCT` and the
+fee floor clamp every trade to the same fixed 0.25% stop / 0.275% target:
+
+```
+effective R:R          1.1   (config intends 1.50)
+break-even win rate    47.6%
+achieved win rate      36.8%
+```
+
+So the bot was structurally losing before any setup logic ran. The fix is not
+parameter tuning — it is making the fee floor small relative to ATR, which
+means either a coarser timeframe (ATR scales with √time) or a lower fee tier.
+
+| Base TF | est. ATR | fee floor in ATR |
+|---|---|---|
+| 1m | 0.048% | 5.7 |
+| 5m | 0.108% | 2.5 |
+| 15m | 0.187% | 1.5 |
+| 30m | 0.265% | 1.04 |
+
+You want that right column at ~1 or below.
+
+### The lever that actually matters
+
+Maker-only execution (post-only limit entry and exit) costs **0.04% round trip**
+instead of 0.11%, dropping the fee floor from 0.275% to **0.10%** — which makes
+**5m** viable (0.93 ATR) while preserving something recognisable as scalping.
+
+That is why the order-flow work described at the bottom of this document is not
+an optional enhancement. It is the thing that makes maker fills achievable
+without adverse selection, and therefore the only route to a 1-5m strategy that
+clears costs.
+
+### Other findings
+
+- `MEAN_REVERSION` fired **zero times in 30 days** at 1m. The setup billed as
+  the highest-frequency, highest-win-rate edge is gated too tightly
+  (`%B≤0.05` AND `RSI≤30` AND below VWAP AND RANGE regime AND HTF not bearish).
+  The whole book ran on the two low-win-rate setups.
+- Shorts underperformed badly at 1m (18.8% win rate vs 52.8% for longs) over a
+  window where BTC rose. Expected, but it means the long/short split needs
+  testing across a down month before drawing conclusions.
+- Trailing-stop geometry was wrong: arming at +1.0 ATR and trailing 0.7 ATR
+  behind, against a 1.2-ATR stop, caps winners below losses by construction.
+  Only 3 of 68 trades reached take-profit.
+
+**No parameter in this repo has been tuned against these results.** Doing so
+would curve-fit to a single 30-day window of a single regime. Any change to the
+trail or the thresholds needs validating on windows other than the one that
+motivated it.
+
 ## Why perps rather than spot
 
 Fees, and the ability to short.

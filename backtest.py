@@ -89,10 +89,11 @@ def fetch_history(symbol: str, interval: str, days: int,
     return out
 
 
-def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
-    d = df_1m.set_index("ts")
-    out = d.resample("5min").agg({"open": "first", "high": "max", "low": "min",
-                                  "close": "last", "vol": "sum"}).dropna()
+def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Aggregate to a coarser timeframe — used to build the higher-TF bias series."""
+    d = df.set_index("ts")
+    out = d.resample(f"{minutes}min").agg({"open": "first", "high": "max", "low": "min",
+                                           "close": "last", "vol": "sum"}).dropna()
     return out.reset_index()
 
 
@@ -338,6 +339,10 @@ def main():
     ap.add_argument("--fees", type=float,
                     help="Override taker fee %% per side (perp 0.055, spot 0.10)")
     ap.add_argument("--balance", type=float, help="Override starting pot in USDT")
+    ap.add_argument("--interval", type=int, default=1,
+                    help="Base timeframe in minutes. BTC's 1m ATR (~0.05%%) is "
+                         "far smaller than the fee floor, so a coarser base is "
+                         "often the only way a target clears costs.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -346,12 +351,21 @@ def main():
         config.ROUND_TRIP_FEE_PCT = args.fees * 2
     if args.balance is not None:
         config.MAX_INVESTMENT_USDT = args.balance
+    if args.interval > 1:
+        # The time stop is expressed in minutes but its purpose is "N bars".
+        # Left at 45 on a 15m base it would close every trade after 3 bars.
+        config.MAX_HOLD_MINUTES = config.MAX_HOLD_MINUTES * args.interval
 
     print(f"Fetching {args.days}d of {args.symbol} perp 1m data…", file=sys.stderr)
     df = fetch_history(args.symbol, "1", args.days)
-    df5 = resample_5m(df)
+    if args.interval > 1:
+        df = resample(df, args.interval)
+        print(f"  resampled to {args.interval}m: {len(df)} bars", file=sys.stderr)
+    # Higher-timeframe bias always runs at 5x the base timeframe.
+    df5 = resample(df, args.interval * 5)
 
-    print(f"Simulating {len(df)} bars | pot ${config.MAX_INVESTMENT_USDT:,.2f} | "
+    print(f"Simulating {len(df)} bars @ {args.interval}m | "
+          f"pot ${config.MAX_INVESTMENT_USDT:,.2f} | "
           f"round-trip fees {config.ROUND_TRIP_FEE_PCT:.3f}% | "
           f"min TP {config.ROUND_TRIP_FEE_PCT * config.MIN_EDGE_FEE_MULT:.3f}%…",
           file=sys.stderr)
