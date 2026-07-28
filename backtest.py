@@ -140,7 +140,11 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
 
         # --- Manage an open position against this bar's actual range ---------
         if state["in_position"]:
-            state, _ = scalp_risk.update_trailing_stop(state, bar["close"], ind["atr"])
+            # Sequencing matters. The stop in force during THIS bar is the one
+            # set at the end of the previous bar, so exits are checked against
+            # that first. Moving the trail on this bar's close and then testing
+            # this bar's low against the new level fires exits at prices that
+            # did not exist when the low happened.
             long = state["side"] == "Buy"
 
             exit_price = None
@@ -202,6 +206,11 @@ def run(df: pd.DataFrame, df5: pd.DataFrame, warmup: int = 250) -> dict:
                 state["daily_pnl_usdt"] += pnl
                 state["consecutive_losses"] = 0 if pnl >= 0 else state["consecutive_losses"] + 1
                 continue
+
+            # Survived the bar — now ratchet the trail off the close, so it
+            # governs the NEXT bar.
+            state, _ = scalp_risk.update_trailing_stop(state, bar["close"], ind["atr"])
+            continue
 
         # --- Look for an entry ------------------------------------------------
         sig = scalp_signal.get_signal(ind, state)
