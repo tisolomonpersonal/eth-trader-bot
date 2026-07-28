@@ -1,0 +1,29 @@
+Here is the logical execution loop to implement the directional candle strategy specifically for the 1-hour timeframe. The parameters below are structured so you can evaluate the setup manually or write it into an automated execution script.
+
+1. **Define Timeframe Constants:**
+Set your Higher Timeframe (HTF) evaluation variable to **H1** (1-hour).
+Set your Lower Timeframe (LTF) execution triggers to **M5** (5-minute).
+
+
+2. **Detect the H1 Signal:**
+Monitor the close of each H1 candle to check for momentum and a liquidity sweep. A valid trigger occurs when:
+
+* **For a Short (Bearish):** The H1 candle's high is greater than the previous H1 candle's high, AND its close is lower than the previous H1 candle's low.
+* **For a Long (Bullish):** The H1 candle's low is lower than the previous H1 candle's low, AND its close is higher than the previous H1 candle's high.
+
+
+3. **Run the Contextual Filter:**
+Check the structural context of the closed H1 candle. If the H1 directional candle just rejected off a major HTF support or resistance level (e.g., slamming into a daily order block), abort the setup. The price needs clear runway to the next structural level.
+
+
+4. **Set M5 Entry Parameters:**
+Once a valid H1 signal closes, switch your charting or array focus to M5. Wait for price to retrace back into the range of that specific H1 candle.
+
+* Calculate the Fibonacci retracement of the completed H1 directional candle.
+* Look for an entry trigger within the **61.8% to 70.5%** retracement zone.
+* *Optional Confluence:* Require an M5 Fair Value Gap (FVG) or Order Block to overlap with this golden zone before dropping a limit order.
+
+
+5. **Define the Invalidation Boundary and Targets:**
+* **Invalidation Boundary (Stop-Loss):** Place strictly above the extreme high of the H1 bearish directional candle, or below the extreme low of the H1 bullish directional candle. If price breaks this coordinate, the setup is invalidated.
+* **Take-Profit:** Target the next structural M5 swing low (for shorts) or high (for longs). The setup should yield a minimum 1.5:1 to 3:1 reward-to-risk ratio.
