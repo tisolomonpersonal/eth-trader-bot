@@ -15,6 +15,7 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -26,12 +27,26 @@ import scalp_risk
 
 # ── Historical data ───────────────────────────────────────────────────────────
 
-def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
+CACHE_DIR = Path(__file__).parent / ".backtest_cache"
+
+
+def fetch_history(symbol: str, interval: str, days: int,
+                  use_cache: bool = True) -> pd.DataFrame:
     """
     Page backwards through Bybit's linear kline endpoint (1000 bars per call)
     until `days` of history is collected. Public endpoint — no API key, no
     account, nothing at risk. Validate before funding.
+
+    Results are cached to disk per (symbol, interval, days, UTC date). Comparing
+    fee scenarios means running this repeatedly over identical data, and
+    refetching 43k bars each time is both slow and rude to the rate limiter.
     """
+    cache_file = CACHE_DIR / (f"{symbol}_{interval}m_{days}d_"
+                              f"{datetime.now(timezone.utc):%Y%m%d}.pkl")
+    if use_cache and cache_file.exists():
+        print(f"  using cached data: {cache_file.name}", file=sys.stderr)
+        return pd.read_pickle(cache_file)
+
     from pybit.unified_trading import HTTP
     client = HTTP(testnet=False)
 
@@ -63,6 +78,14 @@ def fetch_history(symbol: str, interval: str, days: int) -> pd.DataFrame:
     out["ts"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
     out = out.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
     print(f"  fetched {len(out)} bars total          ", file=sys.stderr)
+
+    if use_cache:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            out.to_pickle(cache_file)
+        except Exception as e:
+            print(f"  (could not cache: {e})", file=sys.stderr)
+
     return out
 
 
