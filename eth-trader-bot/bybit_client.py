@@ -110,21 +110,33 @@ def get_klines() -> pd.DataFrame:
 # ── Account data ──────────────────────────────────────────────────────────────
 
 def get_balance() -> dict:
-    """Returns {'usdt': float, 'btc': float}."""
+    """Returns {'usdt': float, 'btc': float, 'equity': float}.
+    Tries UNIFIED account first (standard), falls back to CONTRACT."""
     if config.PAPER_MODE:
-        return {"usdt": 10000.0, "btc": 0.0}
+        return {"usdt": 10000.0, "btc": 0.0, "equity": 10000.0}
 
-    def _fetch():
-        resp = _client().get_wallet_balance(accountType="UNIFIED")
-        coins = resp["result"]["list"][0]["coin"]
-        bal = {"usdt": 0.0, "btc": 0.0}
+    def _parse_coins(coins):
+        bal = {"usdt": 0.0, "btc": 0.0, "equity": 0.0}
         for c in coins:
             sym = c["coin"].upper()
             if sym == "USDT":
-                bal["usdt"] = float(c.get("walletBalance") or 0)
+                bal["usdt"]   = float(c.get("walletBalance")  or 0)
+                bal["equity"] = float(c.get("equity")         or c.get("walletBalance") or 0)
             elif sym == "BTC":
-                bal["btc"]  = float(c.get("walletBalance") or 0)
+                bal["btc"]    = float(c.get("walletBalance")  or 0)
         return bal
+
+    def _fetch():
+        cl = _client()
+        for acct_type in ("UNIFIED", "CONTRACT"):
+            try:
+                resp  = cl.get_wallet_balance(accountType=acct_type)
+                rows  = resp.get("result", {}).get("list", [])
+                if rows and rows[0].get("coin"):
+                    return _parse_coins(rows[0]["coin"])
+            except Exception:
+                continue
+        return {"usdt": 0.0, "btc": 0.0, "equity": 0.0}
 
     return _retry(_fetch, "get_balance")
 

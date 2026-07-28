@@ -167,6 +167,16 @@
     .price-big{font-size:28px}
   }
 
+  /* ── Account balance bar ── */
+  .acct-bar{display:flex;align-items:center;background:var(--surface);
+    border:1px solid var(--border);border-radius:12px;padding:14px 20px;
+    margin-bottom:18px;gap:0;flex-wrap:wrap}
+  .acct-item{display:flex;flex-direction:column;gap:4px;flex:1;min-width:100px}
+  .acct-k{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+  .acct-v{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--txt)}
+  .acct-sep{width:1px;height:32px;background:var(--border);margin:0 20px;flex-shrink:0}
+  @media(max-width:580px){.acct-sep{display:none}.acct-item{min-width:calc(50% - 10px)}.acct-bar{gap:14px}}
+
   footer{margin-top:24px;text-align:center;font-family:var(--mono);font-size:11px;color:var(--dim)}
   .err{color:var(--down)}
 </style>
@@ -207,10 +217,6 @@
         <div class="v org" id="qty-display">0.004 BTC</div>
       </div>
       <div class="pm">
-        <div class="k">Balance</div>
-        <div class="v" id="balance-usdt">—</div>
-      </div>
-      <div class="pm">
         <div class="k">Daily P&L</div>
         <div class="v" id="daily-pnl">—</div>
       </div>
@@ -218,6 +224,29 @@
         <div class="k">Total P&L</div>
         <div class="v" id="total-pnl">—</div>
       </div>
+    </div>
+  </div>
+
+  <!-- Account balance bar -->
+  <div class="acct-bar" id="acct-bar">
+    <div class="acct-item">
+      <div class="acct-k">Wallet Balance</div>
+      <div class="acct-v" id="bal-usdt">—</div>
+    </div>
+    <div class="acct-sep"></div>
+    <div class="acct-item">
+      <div class="acct-k">Equity</div>
+      <div class="acct-v" id="bal-equity">—</div>
+    </div>
+    <div class="acct-sep"></div>
+    <div class="acct-item">
+      <div class="acct-k">BTC Holdings</div>
+      <div class="acct-v" id="bal-btc">—</div>
+    </div>
+    <div class="acct-sep"></div>
+    <div class="acct-item">
+      <div class="acct-k">Account</div>
+      <div class="acct-v" id="bal-mode">—</div>
     </div>
   </div>
 
@@ -496,10 +525,12 @@ async function tick(){
     $("lev-badge").textContent = (r.leverage||25) + "×";
     $("qty-display").textContent = (r.btc_qty||"0.004") + " BTC";
 
-    // Balance
+    // Account balance bar
     const bal = r.balance || {};
-    if(bal.usdt !== undefined)
-      $("balance-usdt").innerHTML = `<span class="v" style="color:var(--txt)">$${nfmt(bal.usdt,2)}</span>`;
+    $("bal-usdt").textContent   = bal.usdt  !== undefined ? `$${nfmt(bal.usdt,2)}`   : "—";
+    $("bal-equity").textContent = bal.equity !== undefined ? `$${nfmt(bal.equity,2)}` : "—";
+    $("bal-btc").textContent    = bal.btc   !== undefined ? `${nfmt(bal.btc,4)} BTC`  : "—";
+    $("bal-mode").textContent   = r.paper_mode ? "PAPER" : "LIVE";
 
     $("daily-pnl").innerHTML = `<span class="v ${cls(s.daily_pnl_usdt||0)}">${money(s.daily_pnl_usdt||0)}</span>`;
     $("total-pnl").innerHTML = `<span class="v ${cls(s.total_pnl_usdt||0)}">${money(s.total_pnl_usdt||0)}</span>`;
