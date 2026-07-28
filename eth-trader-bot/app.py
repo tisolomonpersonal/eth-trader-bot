@@ -143,22 +143,31 @@ def _tradfi_bot_thread():
     run_tradfi_bot()
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+def _start_bot_threads():
+    """Start bot threads. Safe to call multiple times — guarded by env var."""
+    if os.environ.get("_BTC_BOT_STARTED") == "1":
+        return
+    os.environ["_BTC_BOT_STARTED"] = "1"
+
     log.info(
         f"Starting BTC Directional Candle Bot | "
         f"symbol={config.SYMBOL} leverage={config.LEVERAGE}× "
         f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
     )
-
-    t = threading.Thread(target=_bot_thread, daemon=True, name="btc-bot")
-    t.start()
+    threading.Thread(target=_bot_thread, daemon=True, name="btc-bot").start()
 
     if config.TRADFI_ENABLED:
         log.info(f"TRADFI_ENABLED=true — starting TradFi thread (symbol={config.TRADFI_SYMBOL})")
-        tt = threading.Thread(target=_tradfi_bot_thread, daemon=True, name="tradfi-bot")
-        tt.start()
+        threading.Thread(target=_tradfi_bot_thread, daemon=True, name="tradfi-bot").start()
     else:
         log.info("TRADFI_ENABLED=false — TradFi thread not started")
 
+
+# Start threads when the module is imported by gunicorn (no --config needed).
+# The env-var guard prevents a double-start if __main__ also calls this.
+_start_bot_threads()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
