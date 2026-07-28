@@ -1,5 +1,5 @@
 """
-Gunicorn configuration for BNB Spot Bot.
+Gunicorn configuration for BTC Directional Candle Bot.
 - 1 worker: prevents multiple simultaneous bot instances
 - post_fork: starts the bot trading thread inside the worker
 - worker_exit: sends Telegram alert when the worker shuts down
@@ -21,9 +21,9 @@ def post_fork(server, worker):
     import config
     from scheduler import run_bot, run_tradfi_bot
 
-    t = threading.Thread(target=run_bot, daemon=True, name="bnb-bot")
+    t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
     t.start()
-    server.log.info("BNB bot thread started in worker")
+    server.log.info("BTC bot thread started in worker")
 
     # Start the TradFi loop too, but only when the master switch is on — mirrors
     # the app.py __main__ launcher so both run paths behave identically.
