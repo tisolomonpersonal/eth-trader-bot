@@ -1,0 +1,84 @@
+Severity
+Time
+Summary
+
+INFO
+INFO 🛠️ building image | #5 sha256:463aa101532a7abeef6c2a0f4bc54076803889e951e68c0ab73f8ce3c998e08e 11.89MB / 11.89MB 0.5s done
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:062e450697faa5f02a3a74eba9864ee4d79bc9cfbd65769fc6cdff2c05c6a053
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:062e450697faa5f02a3a74eba9864ee4d79bc9cfbd65769fc6cdff2c05c6a053 0.7s done
+
+INFO
+INFO 🛠️ building image | #5 DONE 2.5s
+
+INFO
+INFO 🛠️ building image | #5 [1/4] FROM docker.io/library/python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:cd384decb92718ac6ca0ea7ee45412390d4550c2d90cb5ae66c1f5568c72256f
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:cd384decb92718ac6ca0ea7ee45412390d4550c2d90cb5ae66c1f5568c72256f 0.2s done
+
+INFO
+INFO 🛠️ building image | #5 DONE 2.7s
+
+INFO
+INFO 🛠️ building image | #5 [1/4] FROM docker.io/library/python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:463aa101532a7abeef6c2a0f4bc54076803889e951e68c0ab73f8ce3c998e08e
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:463aa101532a7abeef6c2a0f4bc54076803889e951e68c0ab73f8ce3c998e08e 0.4s done
+
+INFO
+INFO 🛠️ building image | #5 DONE 3.1s
+
+INFO
+INFO 🛠️ building image | #5 [1/4] FROM docker.io/library/python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+
+INFO
+INFO 🛠️ building image | #5 extracting sha256:4a633c382b0646fccf87ab8d848c41265bd33dffb57fc16216ad04da8ca69b0a 0.1s done
+
+INFO
+INFO 🛠️ building image | #5 DONE 3.2s
+
+INFO
+INFO 🛠️ building image | #6 [2/4] WORKDIR /app
+
+INFO
+INFO 🛠️ building image | #6 DONE 6.8s
+
+INFO
+INFO 🛠️ building image | #7 [3/4] COPY . .
+
+INFO
+INFO 🛠️ building image | #7 DONE 0.1s
+
+INFO
+INFO 🛠️ building image | #8 [4/4] RUN pip install --no-cache-dir -r requirements.txt
+
+ERROR
+INFO 🛠️ building image | #8 1.618 ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'
+
+ERROR
+INFO 🛠️ building image | #8 ERROR: process "/bin/sh -c pip install --no-cache-dir -r requirements.txt" did not complete successfully: exit code: 1
+
+INFO
+INFO 🛠️ building image | ------
+
+INFO
+INFO 🛠️ building image | > [4/4] RUN pip install --no-cache-dir -r requirements.txt:
+
+ERROR
+INFO 🛠️ building image | 1.618 ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'
+
+INFO
+INFO 🛠️ building image | ------
+
+ERROR
+ERROR 🔴 build failed err=build image: build failed: failed to solve: process "/bin/sh -c pip install --no-cache-dir -r requirements.txt" did not complete successfully: exit code: 1
