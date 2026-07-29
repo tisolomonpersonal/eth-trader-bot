@@ -132,7 +132,8 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
         allow_long: bool, allow_short: bool, max_hold_bars: int,
         min_rr: float = 0.0, min_reward_pct: float = 0.0,
         confirm_bars: int = 2, target_mode: str = "dynamic",
-        use_trend_filter: bool = False, stop_cap_atr: float = 0.0) -> dict:
+        use_trend_filter: bool = False, stop_cap_atr: float = 0.0,
+        tp_fraction: float = 1.0) -> dict:
     """
     Walk forward one bar at a time.
 
@@ -239,7 +240,12 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
             # on TP exits the MA had drifted toward the entry, turning an
             # expected 0.734% into a realised 0.440%. "static" freezes the
             # target at its entry-bar value so the reward cannot erode.
-            target = float(b["ma"]) if target_mode == "dynamic" else target_now
+            ma_now = float(b["ma"]) if target_mode == "dynamic" else target_now
+            # tp_fraction scales how far toward the MA we aim. 1.0 is the
+            # specified behaviour (all the way); 0.5 banks halfway. Closer
+            # targets are hit more often but pay less, so which wins is an
+            # empirical question, not an obvious one.
+            target = entry + tp_fraction * (ma_now - entry)
 
             if side == "LONG":
                 # Pessimistic: if a bar spans both levels, assume the stop filled.
@@ -385,6 +391,9 @@ def main():
                          "static freezes it at the entry bar's value")
     ap.add_argument("--trend-ma", type=int, default=200,
                     help="length of the long-term trend MA")
+    ap.add_argument("--tp-fraction", type=float, default=1.0,
+                    help="how far toward the MA to target; 1.0 = all the way "
+                         "(as specified), 0.5 = bank halfway")
     ap.add_argument("--stop-cap-atr", type=float, default=0.0,
                     help="cap the stop at this many ATR from entry; 0 = use the "
                          "touch candle's extreme as specified")
@@ -404,7 +413,7 @@ def main():
               min_rr=args.min_rr, min_reward_pct=args.min_reward,
               confirm_bars=args.confirm, target_mode=args.target,
               use_trend_filter=args.trend_filter,
-              stop_cap_atr=args.stop_cap_atr)
+              stop_cap_atr=args.stop_cap_atr, tp_fraction=args.tp_fraction)
 
     res["config"] = {
         "symbol": args.symbol, "interval_min": args.interval, "days": args.days,
