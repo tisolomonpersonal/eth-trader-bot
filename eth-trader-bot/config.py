@@ -20,40 +20,33 @@ OPENAI_BASE_URL  = os.environ.get("OPENAI_BASE_URL",  "https://api.openai.com/v1
 OPENAI_MODEL     = os.environ.get("OPENAI_MODEL",     "gpt-4o-mini")
 
 # ── Market ────────────────────────────────────────────────────────────────────
-SYMBOL        = "BTCUSDT"
-CATEGORY      = "linear"       # Perpetual futures — required for leverage + shorts
-H1_INTERVAL   = "60"           # 1-hour candles for signal detection
-M5_INTERVAL   = "5"            # 5-minute candles for entry execution
-H1_LIMIT      = 100            # 100 H1 candles (100 hours of history)
-M5_LIMIT      = 100            # 100 M5 candles (~8 hours)
+SYMBOL       = "BTCUSDT"
+CATEGORY     = "linear"    # Perpetual futures — required for leverage + shorts
+H4_INTERVAL  = "240"       # 4-hour candles (the only timeframe used)
+# 250 candles = ~41 days. Enough for MA200 (200) + BB(20) warm-up + a few spare.
+H4_LIMIT     = 250
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BTC_QTY       = float(os.environ.get("BTC_QTY",  "0.004"))  # Fixed contract size
-LEVERAGE      = int(os.environ.get("LEVERAGE",   "25"))      # 25× leverage
+BTC_QTY  = float(os.environ.get("BTC_QTY",  "0.004"))  # Fixed contract size
+LEVERAGE = int(os.environ.get("LEVERAGE",   "25"))      # 25× leverage
 
-# ── Strategy parameters ───────────────────────────────────────────────────────
-# Fibonacci retracement zone for M5 entry (61.8% – 70.5% of H1 candle)
-FIB_ENTRY_LOW  = 0.618
-FIB_ENTRY_HIGH = 0.705
+# ── Strategy parameters — BB Bollinger Short ──────────────────────────────────
+# Bollinger Bands
+BB_PERIOD  = int(os.environ.get("BB_PERIOD",  "20"))
+BB_STD     = float(os.environ.get("BB_STD",   "2.0"))
 
-# SL buffer beyond H1 candle extreme (0.05% — tight, above/below the wick)
-SL_BUFFER_PCT  = float(os.environ.get("SL_BUFFER_PCT", "0.05"))
+# Moving averages
+MA_SHORT   = int(os.environ.get("MA_SHORT",   "28"))    # MA28 — take-profit target
+MA_LONG    = int(os.environ.get("MA_LONG",    "200"))   # MA200 — downtrend filter
 
-# Minimum reward:risk ratio to accept a TP target
-MIN_RR         = float(os.environ.get("MIN_RR", "1.5"))
+# ATR stop cap: SL is the BB-touch candle's high, but never more than
+# ATR_CAP_MULT × ATR(ATR_PERIOD) above entry.
+ATR_PERIOD   = int(os.environ.get("ATR_PERIOD",   "14"))
+ATR_CAP_MULT = float(os.environ.get("ATR_CAP_MULT", "1.5"))
 
-# Max RR multiple used to set hard TP when no swing level is found
-DEFAULT_RR     = float(os.environ.get("DEFAULT_RR", "2.0"))
-
-# Hours after which a pending H1 signal expires if no M5 entry triggered
-SIGNAL_EXPIRY_HOURS = float(os.environ.get("SIGNAL_EXPIRY_HOURS", "4.0"))
-
-# Structural block filter: if H1 signal extreme is within this % of the
-# 50-bar lookback extreme, treat as a major HTF level and skip the setup.
-STRUCTURAL_FILTER_PCT = float(os.environ.get("STRUCTURAL_FILTER_PCT", "0.3"))
-
-# Minimum AI confidence to confirm a trade (directional signal still required)
-MIN_AI_CONFIDENCE = int(os.environ.get("MIN_AI_CONFIDENCE", "55"))
+# Small buffer added on top of the BB-touch candle high for the SL order,
+# so the stop isn't sitting exactly at the wick tip.
+SL_BUFFER_PCT = float(os.environ.get("SL_BUFFER_PCT", "0.05"))
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
 MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "50.0"))

@@ -1,6 +1,6 @@
 """
 Bybit Linear Perpetuals client — BTC/USDT with 25× leverage.
-Supports LONG and SHORT. Fetches both H1 and M5 OHLCV candles.
+Supports SHORT (primary) and LONG (reconciliation). Fetches 4H OHLCV candles.
 """
 import math
 import time
@@ -92,19 +92,25 @@ def _fetch_klines(interval: str, limit: int) -> pd.DataFrame:
     return _retry(_fetch, f"get_klines_{interval}")
 
 
+def get_klines_h4() -> pd.DataFrame:
+    """Fetch 4H OHLCV candles for BTC/USDT (sorted oldest→newest)."""
+    return _fetch_klines(config.H4_INTERVAL, config.H4_LIMIT)
+
+
+# Legacy aliases — kept so hourly summary and any other callers don't break
 def get_klines_h1() -> pd.DataFrame:
-    """Fetch H1 OHLCV candles for BTC/USDT (sorted oldest→newest)."""
-    return _fetch_klines(config.H1_INTERVAL, config.H1_LIMIT)
+    """Alias: returns 4H candles (strategy no longer uses H1)."""
+    return get_klines_h4()
 
 
 def get_klines_m5() -> pd.DataFrame:
-    """Fetch M5 OHLCV candles for BTC/USDT (sorted oldest→newest)."""
-    return _fetch_klines(config.M5_INTERVAL, config.M5_LIMIT)
+    """Alias: returns 4H candles (strategy no longer uses M5)."""
+    return get_klines_h4()
 
 
 def get_klines() -> pd.DataFrame:
-    """Alias used by legacy hourly summary — returns H1 candles."""
-    return get_klines_h1()
+    """Alias used by legacy hourly summary."""
+    return get_klines_h4()
 
 
 # ── Account data ──────────────────────────────────────────────────────────────
@@ -165,6 +171,7 @@ def get_position() -> Optional[dict]:
 def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
     """
     Open a LONG position (market buy).
+    Kept for reconciliation / TradFi. Primary strategy is SHORT only.
     Returns (qty, estimated_fill_price).
     """
     qty = qty or config.BTC_QTY
@@ -175,7 +182,7 @@ def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
 
     def _order():
         if not _http:
-            _client()  # ensure leverage is set
+            _client()
         resp = _client().place_order(
             category=config.CATEGORY,
             symbol=config.SYMBOL,
@@ -183,7 +190,7 @@ def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
             orderType="Market",
             qty=str(qty),
             timeInForce="IOC",
-            positionIdx=1,  # one-way mode → 0; hedge mode → 1 (long). Use 0 for one-way.
+            positionIdx=0,  # one-way mode
         )
         log.info(f"LONG order placed: {resp['result']}")
         return qty, ref_price
@@ -194,6 +201,7 @@ def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
 def open_short(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
     """
     Open a SHORT position (market sell).
+    Primary entry for the BB short strategy.
     Returns (qty, estimated_fill_price).
     """
     qty = qty or config.BTC_QTY
@@ -212,7 +220,7 @@ def open_short(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]
             orderType="Market",
             qty=str(qty),
             timeInForce="IOC",
-            positionIdx=0,
+            positionIdx=0,  # one-way mode
         )
         log.info(f"SHORT order placed: {resp['result']}")
         return qty, ref_price
@@ -270,7 +278,7 @@ def close_short(qty: float = None, ref_price: float = 0.0) -> float:
     return _retry(_order, "close_short")
 
 
-# ── Legacy aliases (used by tradfi summary / hourly alerts) ───────────────────
+# ── Legacy aliases ────────────────────────────────────────────────────────────
 
 def place_market_buy(usdt_amount: float, ref_price: float):
     """Legacy alias — routes to open_long with fixed BTC_QTY."""

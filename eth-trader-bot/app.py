@@ -1,5 +1,5 @@
 """
-Flask health server + bot launcher — BTC Directional Candle Bot.
+Flask health server + bot launcher — BTC 4H BB Short Bot.
 Procfile: web: gunicorn app:app --config gunicorn.conf.py
 """
 import os
@@ -27,7 +27,7 @@ def dashboard():
 def health():
     return jsonify({
         "status":     "ok",
-        "service":    "btc-directional-candle-bot",
+        "service":    "btc-4h-bb-short-bot",
         "symbol":     config.SYMBOL,
         "category":   config.CATEGORY,
         "leverage":   config.LEVERAGE,
@@ -47,7 +47,7 @@ def status():
     # ── Live price ────────────────────────────────────────────────────────────
     last_price = 0.0
     try:
-        df = bybit_client.get_klines_m5()
+        df = bybit_client.get_klines_h4()
         if not df.empty:
             last_price = float(df["close"].iloc[-1])
     except Exception as e:
@@ -186,7 +186,7 @@ def _start_bot_threads():
     os.environ["_BTC_BOT_STARTED"] = "1"
 
     log.info(
-        f"Starting BTC Directional Candle Bot | "
+        f"Starting BTC 4H BB Short Bot | "
         f"symbol={config.SYMBOL} leverage={config.LEVERAGE}× "
         f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
     )

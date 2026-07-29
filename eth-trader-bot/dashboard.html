@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BTC Bot — Directional Candle Monitor</title>
+<title>BTC Bot — 4H BB Short Monitor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -188,8 +188,8 @@
     <div class="brand">
       <div class="btc-icon">₿</div>
       <div class="brand-text">
-        <h1>BTC DIRECTIONAL CANDLE BOT</h1>
-        <div class="sub">BTCUSDT · Linear Perpetual · H1 signal → M5 entry</div>
+        <h1>BTC 4H BB SHORT BOT</h1>
+        <div class="sub">BTCUSDT · Linear Perpetual · BB(20,2) + MA28/MA200 · SHORT ONLY</div>
       </div>
     </div>
     <div class="header-right">
@@ -254,17 +254,17 @@
   <div class="phase-bar" id="phase-bar">
     <div class="phase-step" id="ph-watch">
       <div class="circle">1</div>
-      <div class="label">Watching H1</div>
+      <div class="label">Watching 4H</div>
     </div>
     <div class="phase-div" id="pd-1"></div>
     <div class="phase-step" id="ph-signal">
       <div class="circle">2</div>
-      <div class="label">Signal Armed</div>
+      <div class="label">Below MA200</div>
     </div>
     <div class="phase-div" id="pd-2"></div>
     <div class="phase-step" id="ph-entry">
       <div class="circle">3</div>
-      <div class="label">M5 Waiting</div>
+      <div class="label">BB Touch</div>
     </div>
     <div class="phase-div" id="pd-3"></div>
     <div class="phase-step" id="ph-pos">
@@ -284,7 +284,7 @@
       </div>
     </div>
 
-    <!-- RIGHT: Signal + Last action -->
+    <!-- RIGHT: BB indicators + Last action -->
     <div class="panel">
       <div class="phead"><span class="ptitle">Strategy State</span></div>
       <div class="pbody" id="signal-body">
@@ -430,47 +430,44 @@ function renderPosition(s, price, livePos) {
 }
 
 function renderSignalState(s) {
-  const ps = s.pending_signal;
-  const act = actClass(s.last_action);
+  const act   = actClass(s.last_action);
+  const price = Number(s._last_price || 0);
 
-  let signalHtml = "";
-
-  if(ps) {
-    const dir   = (ps.direction||"").toUpperCase();
-    const dirC  = dir==="LONG"?"up":"dn";
-    const fibL  = nfmt(ps.fib_low,2);
-    const fibH  = nfmt(ps.fib_high,2);
-    const h1L   = nfmt(ps.h1_low,2);
-    const h1H   = nfmt(ps.h1_high,2);
-    const exp   = timeUntil(ps.expires_at);
-
-    signalHtml = `
-      <div class="signal-card">
-        <div class="stitle"><span class="icon">⚡</span><span>${dir} SIGNAL ARMED</span></div>
-        <div class="fib-row">
-          <span class="fib-label">H1 Candle Range</span>
-          <span class="fib-val">${h1L} → ${h1H}</span>
-        </div>
-        <div class="fib-row">
-          <span class="fib-label">Fib Entry Zone (61.8–70.5%)</span>
-          <span class="fib-val" style="color:var(--signal)">${fibL} – ${fibH}</span>
-        </div>
-        <div class="fib-row">
-          <span class="fib-label">Direction</span>
-          <span class="v ${dirC}" style="font-family:var(--mono);font-size:12px">${dir}</span>
-        </div>
-        <div class="expiry">⏱ Expires in ${exp}</div>
-      </div>`;
-  }
+  // ── Strategy rules info card (always visible) ───────────────────────────────
+  // Show relevant indicator values from state when available
+  const inPos     = s.in_position;
+  const rulesHtml = `
+    <div class="signal-card" style="margin-bottom:14px">
+      <div class="stitle">
+        <span class="icon">📐</span>
+        <span>BB SHORT RULES (4H)</span>
+      </div>
+      <div class="fib-row">
+        <span class="fib-label">Direction</span>
+        <span class="fib-val" style="color:var(--down)">SHORT ONLY</span>
+      </div>
+      <div class="fib-row">
+        <span class="fib-label">Entry Conditions</span>
+        <span class="fib-val" style="color:var(--muted);font-size:10px">BB touch + red confirm + below MA200 + above MA28</span>
+      </div>
+      <div class="fib-row">
+        <span class="fib-label">Take Profit</span>
+        <span class="fib-val" style="color:var(--up)">Moving MA28 ${inPos && s.tp_price ? "= $"+nfmt(s.tp_price,2) : ""}</span>
+      </div>
+      <div class="fib-row">
+        <span class="fib-label">Stop Loss</span>
+        <span class="fib-val" style="color:var(--down)">BB-touch candle high, capped 1.5×ATR</span>
+      </div>
+    </div>`;
 
   $("signal-body").innerHTML = `
-    ${signalHtml}
+    ${rulesHtml}
     <div class="action-box">
       <div class="action-top">
         <span class="act ${act}">${esc(s.last_action||"NONE")}</span>
         <span class="action-time">${ago(s.entry_time||null)}</span>
       </div>
-      <div class="action-reason">${esc(s.last_reason||"Awaiting first H1 signal…")}</div>
+      <div class="action-reason">${esc(s.last_reason||"Watching 4H chart for BB short setup…")}</div>
     </div>`;
 }
 
@@ -535,11 +532,10 @@ async function tick(){
     $("daily-pnl").innerHTML = `<span class="v ${cls(s.daily_pnl_usdt||0)}">${money(s.daily_pnl_usdt||0)}</span>`;
     $("total-pnl").innerHTML = `<span class="v ${cls(s.total_pnl_usdt||0)}">${money(s.total_pnl_usdt||0)}</span>`;
 
-    // Phase
-    if(s.in_position)          setPhase("pos");
-    else if(s.pending_signal)  setPhase("entry");
-    else if(s.last_action==="SIGNAL") setPhase("signal");
-    else                       setPhase("watch");
+    // Phase — BB short strategy has only two meaningful states
+    // (entry is atomic at 4H close; no pending signal wait)
+    if(s.in_position)   setPhase("pos");
+    else                setPhase("watch");
 
     // Panels
     renderPosition(s, price, r.live_position || null);

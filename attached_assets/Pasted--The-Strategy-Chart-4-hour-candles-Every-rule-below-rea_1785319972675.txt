@@ -1,0 +1,54 @@
+## The Strategy
+
+**Chart:** 4-hour candles. Every rule below reads off that one chart.
+
+**Three lines on it:**
+- **Bollinger Bands** — 20 periods, 2 standard deviations (an upper and lower band that widen when the market is volatile)
+- **MA28** — average closing price of the last 28 candles
+- **MA200** — average closing price of the last 200 candles
+
+**Direction: sell only.** Never buy. Buying tested badly on every coin.
+
+---
+
+### Entry — all four must be true
+
+1. **The market is in a downtrend.** Price is below the MA200 line.
+2. **A candle touches the upper band.** Its high reaches or crosses the upper Bollinger line.
+3. **The very next candle closes red.** Closes lower than it opened. It must be the immediately following candle — if there's a gap, the setup is void.
+4. **Price is above the MA28** at that moment.
+
+Enter at the close of that red candle.
+
+---
+
+### Exit — whichever comes first
+
+**Target: the MA28 line.**
+Close the trade when price falls to the MA28. Important: this is a *moving* target — you recalculate it each candle and use the current value, not the value at entry. Tested both ways; moving is better, because when the average drifts toward you it gets you out before the trade sours.
+
+**Stop: above the candle that touched the band.**
+Place the stop at the high of the candle from step 2 — but **never further than 1.5 ATR from your entry.** If that candle's high is further away than 1.5 ATR, use 1.5 ATR instead.
+
+*(ATR = average true range, the typical size of a candle over the last 14 candles. It's just a measure of how big moves currently are.)*
+
+The cap exists because without it a single huge candle hands you an enormous stop, and one loss then wipes out several wins.
+
+---
+
+### In one sentence
+
+In a downtrend, when price spikes up to the top band and the next candle rejects it, sell — and take profit when price falls back to its 28-candle average.
+
+---
+
+### What actually held up
+
+Two parts survived testing on coins they weren't designed around:
+
+- **The MA200 filter** — only trading when price is below it. This was the single biggest improvement in everything tested: it raised the return per trade roughly 8×. Your idea.
+- **Selling rather than buying** — held on every coin tested, in both rising and falling markets.
+
+The rest — the 1.5 ATR stop cap, the single confirming candle — improved results on the coins used to design them, then mostly stopped working on fresh coins. On eight untested coins the whole thing came out roughly break-even.
+
+So: the description above is the best version we reached. The two points above are the parts I'd trust. The complete package isn't something I'd put money behind yet.

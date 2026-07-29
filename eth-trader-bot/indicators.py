@@ -1,11 +1,14 @@
 """
-Technical indicator calculations — Directional Candle Strategy.
+Technical indicator calculations — 4H Bollinger Band Short Strategy.
 
-New additions:
-  detect_directional_candle(df_h1)  → signal dict or None
-  fib_entry_zone(h1_high, h1_low, direction) → (fib_low, fib_high)
-  check_structural_block(df_h1, h1_high, h1_low, direction) → bool
-  find_swing_tp(df_m5, direction, entry, sl) → float
+Key functions for this strategy:
+  detect_bb_short_setup(df)   → setup dict or None
+  get_ma28_current(df)        → float  (current MA28 — moving TP target)
+  bollinger_bands(df)         → (upper, middle, lower) Series tuple
+  sma(series, period)         → pd.Series
+
+General helpers retained for hourly summary / TradFi:
+  atr, rsi, macd, ema_values, calculate
 """
 import pandas as pd
 from logger import get_logger
@@ -18,6 +21,11 @@ log = get_logger("indicators")
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
+
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple moving average."""
+    return series.rolling(window=period, min_periods=period).mean()
 
 
 def rsi(closes: pd.Series, period: int = 14) -> float:
@@ -78,7 +86,7 @@ def volume_trend(volumes: pd.Series, lookback: int = 20) -> str:
 
 
 def calculate(df: pd.DataFrame) -> dict:
-    """Compute all indicators from an OHLCV DataFrame. Returns a flat dict."""
+    """Compute all general indicators from an OHLCV DataFrame. Returns a flat dict."""
     closes = df["close"]
     price  = round(float(closes.iloc[-1]), 4)
 
@@ -127,199 +135,151 @@ def calculate(df: pd.DataFrame) -> dict:
     return result
 
 
-# ── Directional Candle Strategy helpers ───────────────────────────────────────
+# ── BB Short Strategy helpers ─────────────────────────────────────────────────
 
-def detect_directional_candle(df_h1: pd.DataFrame) -> dict | None:
+def bollinger_bands(
+    df: pd.DataFrame,
+    period: int = None,
+    std: float = None,
+) -> tuple:
     """
-    Inspect the last CLOSED H1 candle (index -2; index -1 is still forming).
+    Compute Bollinger Bands over the DataFrame's close prices.
 
-    Bearish setup:
-      current_high > prev_high  AND  current_close < prev_low
-      → swept above the prior high then closed below the prior low
-
-    Bullish setup:
-      current_low < prev_low  AND  current_close > prev_high
-      → swept below the prior low then closed above the prior high
-
-    Returns a dict with keys:
-      direction   : 'LONG' | 'SHORT'
-      h1_high     : float — high of the signal candle
-      h1_low      : float — low of the signal candle
-      candle_ts   : pd.Timestamp — open time of the signal candle
-    or None if no signal.
+    Returns (upper, middle, lower) as pd.Series, all same length as df.
     """
-    if len(df_h1) < 3:
+    period = period or config.BB_PERIOD
+    std    = std    or config.BB_STD
+
+    closes = df["close"]
+    middle = sma(closes, period)
+    sigma  = closes.rolling(window=period, min_periods=period).std(ddof=1)
+    upper  = middle + std * sigma
+    lower  = middle - std * sigma
+    return upper, middle, lower
+
+
+def get_ma28_current(df: pd.DataFrame) -> float:
+    """
+    Current MA28 value — used as the moving take-profit target.
+    Uses the last row (which may be a forming candle; that's intentional —
+    as the average drifts toward you, it gets you out before the trade sours).
+    Returns 0.0 if there aren't enough candles yet.
+    """
+    ma = sma(df["close"], config.MA_SHORT)
+    val = ma.iloc[-1]
+    if pd.isna(val):
+        return 0.0
+    return round(float(val), 2)
+
+
+def detect_bb_short_setup(df: pd.DataFrame) -> dict | None:
+    """
+    Scan the last two CLOSED 4H candles for a Bollinger Band short setup.
+
+    Labels (df is sorted oldest→newest, df[-1] is still forming):
+      signal_candle  = df[-3]  — must have high >= upper BB  (the "touch" candle)
+      confirm_candle = df[-2]  — must be red (close < open)  (the confirming candle)
+
+    All four conditions must be met on the CONFIRM candle's close:
+      1. signal_candle.high >= upper_bb at that candle   (price spiked to upper band)
+      2. confirm_candle is red                            (close < open)
+      3. confirm_candle.close < MA200                    (downtrend filter)
+      4. confirm_candle.close > MA28                     (price has room to fall to MA28)
+
+    Additionally:
+      - confirm_candle must immediately follow signal_candle (no gap)
+      - enough history must exist for MA200 to be valid
+
+    Returns a dict:
+      signal_candle_ts  : str  — timestamp of the BB-touch candle (used for dedup)
+      confirm_candle_ts : str  — timestamp of the red confirmation candle
+      bb_touch_high     : float — high of the signal candle (SL anchor)
+      entry_price_ref   : float — close of the confirm candle (entry reference)
+      ma28              : float — MA28 at entry (initial TP reference)
+      ma200             : float — MA200 at confirm candle
+      upper_bb          : float — upper band value at signal candle
+
+    Returns None if the setup is not present.
+    """
+    min_rows = max(config.MA_LONG, config.BB_PERIOD) + 5
+    if len(df) < min_rows:
+        log.warning(f"[BB setup] Not enough candles: {len(df)} < {min_rows}")
         return None
 
-    # -1 is still forming, -2 is the last closed, -3 is the one before
-    cur  = df_h1.iloc[-2]
-    prev = df_h1.iloc[-3]
+    upper_bb, _, _ = bollinger_bands(df)
+    ma28_series    = sma(df["close"], config.MA_SHORT)
+    ma200_series   = sma(df["close"], config.MA_LONG)
 
-    c_high  = float(cur["high"])
-    c_low   = float(cur["low"])
-    c_close = float(cur["close"])
-    p_high  = float(prev["high"])
-    p_low   = float(prev["low"])
+    # index -1 is forming; -2 is confirm candle; -3 is signal (BB touch) candle
+    sig_idx = -3
+    con_idx = -2
 
-    if c_high > p_high and c_close < p_low:
-        log.info(
-            f"[H1 Signal] BEARISH directional candle @ {cur['ts']} | "
-            f"high={c_high} swept prev_high={p_high}, close={c_close} < prev_low={p_low}"
+    sig  = df.iloc[sig_idx]
+    con  = df.iloc[con_idx]
+
+    sig_upper  = upper_bb.iloc[sig_idx]
+    con_ma28   = ma28_series.iloc[con_idx]
+    con_ma200  = ma200_series.iloc[con_idx]
+
+    if any(pd.isna(v) for v in [sig_upper, con_ma28, con_ma200]):
+        log.debug("[BB setup] NaN in indicators — not enough history yet")
+        return None
+
+    sig_high  = float(sig["high"])
+    sig_close = float(sig["close"])
+    con_open  = float(con["open"])
+    con_close = float(con["close"])
+
+    # Condition 1: signal candle touched or crossed upper band
+    if sig_high < float(sig_upper):
+        return None
+
+    # Condition 2: confirm candle is red (bearish close)
+    if con_close >= con_open:
+        log.debug(
+            f"[BB setup] Confirm candle NOT red: open={con_open:.2f} close={con_close:.2f}"
         )
-        return {
-            "direction": "SHORT",
-            "h1_high":   c_high,
-            "h1_low":    c_low,
-            "candle_ts": str(cur["ts"]),
-        }
+        return None
 
-    if c_low < p_low and c_close > p_high:
-        log.info(
-            f"[H1 Signal] BULLISH directional candle @ {cur['ts']} | "
-            f"low={c_low} swept prev_low={p_low}, close={c_close} > prev_high={p_high}"
+    # Condition 3: confirm candle close is BELOW MA200 (downtrend)
+    if con_close >= float(con_ma200):
+        log.debug(
+            f"[BB setup] Price NOT below MA200: close={con_close:.2f} ma200={con_ma200:.2f}"
         )
-        return {
-            "direction": "LONG",
-            "h1_high":   c_high,
-            "h1_low":    c_low,
-            "candle_ts": str(cur["ts"]),
-        }
+        return None
 
-    return None
+    # Condition 4: confirm candle close is ABOVE MA28 (room to drop to target)
+    if con_close <= float(con_ma28):
+        log.debug(
+            f"[BB setup] Price NOT above MA28: close={con_close:.2f} ma28={con_ma28:.2f}"
+        )
+        return None
 
-
-def fib_entry_zone(h1_high: float, h1_low: float, direction: str) -> tuple[float, float]:
-    """
-    Calculate the 61.8%–70.5% Fibonacci retracement entry zone
-    for the completed H1 directional candle.
-
-    After a BULLISH signal, price retraces DOWN from the close (≈ h1_high)
-    back into the candle. The golden zone is:
-      fib_low  = h1_high - 0.705 * range
-      fib_high = h1_high - 0.618 * range
-
-    After a BEARISH signal, price retraces UP from the close (≈ h1_low)
-    back into the candle:
-      fib_low  = h1_low + 0.618 * range
-      fib_high = h1_low + 0.705 * range
-
-    Returns (fib_low, fib_high).
-    """
-    rng = h1_high - h1_low
-
-    if direction == "LONG":
-        fib_low  = round(h1_high - config.FIB_ENTRY_HIGH * rng, 2)
-        fib_high = round(h1_high - config.FIB_ENTRY_LOW  * rng, 2)
-    else:  # SHORT
-        fib_low  = round(h1_low  + config.FIB_ENTRY_LOW  * rng, 2)
-        fib_high = round(h1_low  + config.FIB_ENTRY_HIGH * rng, 2)
-
-    return fib_low, fib_high
-
-
-def check_structural_block(
-    df_h1: pd.DataFrame,
-    h1_high: float,
-    h1_low: float,
-    direction: str,
-) -> bool:
-    """
-    Return True (block the trade) if the signal candle's extreme is
-    within STRUCTURAL_FILTER_PCT % of the 50-bar lookback extreme.
-
-    Logic: if we're a bearish candle slamming into a 50-bar high,
-    there's no runway — abort. Similarly for longs at 50-bar lows.
-    """
-    lookback = df_h1.iloc[-52:-2]  # 50 bars before the signal candle
-    if len(lookback) < 10:
-        return False
-
-    if direction == "SHORT":
-        extreme = float(lookback["high"].max())
-        pct_diff = abs(h1_high - extreme) / extreme * 100
-        if pct_diff <= config.STRUCTURAL_FILTER_PCT:
-            log.info(
-                f"[StructuralFilter] BLOCKED SHORT — signal high {h1_high:.2f} "
-                f"is within {pct_diff:.3f}% of 50-bar high {extreme:.2f}"
+    # Immediacy check: confirm candle must directly follow signal candle (no 4H gap)
+    try:
+        expected_gap = pd.Timedelta(hours=4)
+        actual_gap   = con["ts"] - sig["ts"]
+        if abs(actual_gap - expected_gap) > pd.Timedelta(minutes=30):
+            log.debug(
+                f"[BB setup] Non-consecutive candles: gap={actual_gap}. Setup void."
             )
-            return True
+            return None
+    except Exception:
+        pass  # Timestamp check is best-effort; don't block the trade
 
-    else:  # LONG
-        extreme = float(lookback["low"].min())
-        pct_diff = abs(h1_low - extreme) / extreme * 100
-        if pct_diff <= config.STRUCTURAL_FILTER_PCT:
-            log.info(
-                f"[StructuralFilter] BLOCKED LONG — signal low {h1_low:.2f} "
-                f"is within {pct_diff:.3f}% of 50-bar low {extreme:.2f}"
-            )
-            return True
+    log.info(
+        f"[BB Setup] VALID SHORT @ {con['ts']} | "
+        f"signal_high={sig_high:.2f} upper_bb={float(sig_upper):.2f} | "
+        f"confirm close={con_close:.2f} open={con_open:.2f} | "
+        f"MA28={float(con_ma28):.2f} MA200={float(con_ma200):.2f}"
+    )
 
-    return False
-
-
-def find_swing_tp(
-    df_m5: pd.DataFrame,
-    direction: str,
-    entry_price: float,
-    sl_price: float,
-) -> float:
-    """
-    Find the nearest M5 structural swing high (for shorts) or swing low (for longs)
-    that satisfies the minimum RR. Falls back to DEFAULT_RR if no valid swing found.
-
-    A swing high = bar whose high > both neighbours (simple 1-bar pivot).
-    A swing low  = bar whose low  < both neighbours.
-    """
-    risk    = abs(entry_price - sl_price)
-    min_rr  = config.MIN_RR
-    def_rr  = config.DEFAULT_RR
-
-    if direction == "LONG":
-        min_tp = entry_price + risk * min_rr
-        # Look for the nearest swing HIGH above min_tp
-        for i in range(len(df_m5) - 2, 1, -1):
-            h   = float(df_m5.iloc[i]["high"])
-            h_l = float(df_m5.iloc[i - 1]["high"])
-            h_r = float(df_m5.iloc[i + 1]["high"]) if i + 1 < len(df_m5) else 0.0
-            if h > h_l and h > h_r and h > min_tp:
-                log.info(f"[SwingTP] LONG swing high TP found: {h:.2f}")
-                return round(h, 2)
-        # Fallback: DEFAULT_RR
-        tp = round(entry_price + risk * def_rr, 2)
-        log.info(f"[SwingTP] LONG fallback TP ({def_rr}:1): {tp:.2f}")
-        return tp
-
-    else:  # SHORT
-        max_tp = entry_price - risk * min_rr
-        # Look for the nearest swing LOW below max_tp
-        for i in range(len(df_m5) - 2, 1, -1):
-            l   = float(df_m5.iloc[i]["low"])
-            l_l = float(df_m5.iloc[i - 1]["low"])
-            l_r = float(df_m5.iloc[i + 1]["low"]) if i + 1 < len(df_m5) else float("inf")
-            if l < l_l and l < l_r and l < max_tp:
-                log.info(f"[SwingTP] SHORT swing low TP found: {l:.2f}")
-                return round(l, 2)
-        tp = round(entry_price - risk * def_rr, 2)
-        log.info(f"[SwingTP] SHORT fallback TP ({def_rr}:1): {tp:.2f}")
-        return tp
-
-
-def detect_fvg(df_m5: pd.DataFrame, direction: str) -> bool:
-    """
-    Optional confluence: check for a Fair Value Gap (FVG) in the last 10 M5 bars
-    in the direction of the trade.
-
-    Bullish FVG: gap[i-1].high < gap[i+1].low  (gap skipped upward)
-    Bearish FVG: gap[i-1].low  > gap[i+1].high (gap skipped downward)
-
-    Returns True if a matching FVG is present (confluence confirmed).
-    """
-    window = df_m5.iloc[-12:-1]
-    for i in range(1, len(window) - 1):
-        if direction == "LONG":
-            if float(window.iloc[i - 1]["high"]) < float(window.iloc[i + 1]["low"]):
-                return True
-        else:  # SHORT
-            if float(window.iloc[i - 1]["low"]) > float(window.iloc[i + 1]["high"]):
-                return True
-    return False
+    return {
+        "signal_candle_ts":  str(sig["ts"]),
+        "confirm_candle_ts": str(con["ts"]),
+        "bb_touch_high":     round(sig_high, 2),
+        "entry_price_ref":   round(con_close, 2),
+        "ma28":              round(float(con_ma28), 2),
+        "ma200":             round(float(con_ma200), 2),
+        "upper_bb":          round(float(sig_upper), 2),
+    }

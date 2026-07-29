@@ -1,18 +1,21 @@
 """
-Directional Candle Strategy — BTC/USDT Linear Perpetual, 25× leverage.
+4H Bollinger Band Short Strategy — BTC/USDT Linear Perpetual, 25× leverage.
 
-Execution loop:
-  1. Detect H1 directional candle (sweep + close beyond prior range).
-  2. Contextual filter: abort if signal candle extreme is at a 50-bar HTF level.
-  3. Arm a pending signal with the 61.8%–70.5% Fibonacci entry zone.
-  4. On M5 cycle: if price retraces into the fib zone (optional FVG confluence),
-     enter with fixed 0.004 BTC qty. SL = beyond H1 extreme. TP = next M5 swing.
-  5. SL/TP are checked every cycle until the position is closed.
+Rules (SHORT ONLY — never long):
+  Entry (all four must be true on the last two closed 4H candles):
+    1. Price is below MA200 (downtrend confirmation).
+    2. The signal candle's high touches or crosses the upper Bollinger Band (20, 2σ).
+    3. The very next candle (confirm candle) closes RED (close < open).
+    4. The confirm candle's close is above MA28 (room to fall to the target).
+  Enter at the close of the confirm candle (market order).
+
+  Exit — whichever comes first:
+    Take-profit: current MA28 (recalculated every cycle — moving target).
+    Stop-loss  : high of the signal candle, capped at entry + 1.5 × ATR(14).
 
 State machine:
-  in_position=False, pending_signal=None → watching for H1 signal
-  in_position=False, pending_signal=dict → waiting for M5 retracement entry
-  in_position=True                        → managing open position
+  in_position=False → watching for BB short setup
+  in_position=True  → managing open SHORT (SL fixed, TP moving with MA28)
 """
 import json
 from datetime import datetime, timezone
@@ -33,23 +36,25 @@ log = get_logger("strategy")
 _DEFAULTS: dict = {
     # Position tracking
     "in_position":       False,
-    "side":              None,        # 'LONG' | 'SHORT'
+    "side":              None,        # always 'SHORT' in this strategy
     "entry_price":       0.0,
     "entry_time":        None,
     "qty":               0.0,
     "sl_price":          0.0,
     "tp_price":          0.0,
-    # Pending H1 signal (pre-entry)
-    "pending_signal":    None,        # dict or None
+    # Dedup: ts of the last signal candle we acted on (prevent re-entry same candle)
+    "signal_candle_ts":  None,
+    # Kept for dashboard / Android app compatibility (always None in this strategy)
+    "pending_signal":    None,
     # P&L tracking
     "daily_pnl_usdt":    0.0,
     "daily_reset_date":  "",
     "trade_count_today": 0,
     "last_action":       "NONE",
     "last_reason":       "",
-    "last_confidence":   0,
     "total_pnl_usdt":    0.0,
     "total_trades":      0,
+    "_last_price":       0.0,
 }
 
 
@@ -114,35 +119,28 @@ def reconcile_position_on_startup(state: dict) -> dict:
     """
     Sync internal state against the live Bybit position on startup.
 
-    Called once before the main loop begins. If the bot restarts mid-trade
-    (deploy, crash, redeploy) and the saved state shows no position but Bybit
-    has one open, this populates state so SL/TP monitoring resumes immediately
-    instead of leaving the position unmanaged.
-
-    Does nothing when:
-      - state already knows it is in a position (saved state is authoritative)
-      - PAPER_MODE is active (get_position always returns None)
-      - Bybit returns no open position
+    If the bot restarts mid-trade and the saved state shows no position
+    but Bybit has one open, this populates state so SL/TP monitoring
+    resumes immediately.
     """
     if state.get("in_position"):
-        log.info("[reconcile] State already shows open position — skipping reconciliation")
+        log.info("[reconcile] State already shows open position — skipping")
         return state
 
     try:
         pos = bybit_client.get_position()
     except Exception as e:
-        log.warning(f"[reconcile] Could not fetch position from Bybit: {e}")
+        log.warning(f"[reconcile] Could not fetch position: {e}")
         return state
 
     if pos is None:
         log.info("[reconcile] No open position on Bybit — state is consistent")
         return state
 
-    # Map Bybit side ("Buy"/"Sell") → internal side ("LONG"/"SHORT")
     raw_side = pos.get("side", "")
     side = "LONG" if raw_side == "Buy" else "SHORT" if raw_side == "Sell" else None
     if side is None:
-        log.warning(f"[reconcile] Unrecognised position side '{raw_side}' — skipping")
+        log.warning(f"[reconcile] Unrecognised side '{raw_side}' — skipping")
         return state
 
     entry_price = float(pos.get("avgPrice", 0) or 0)
@@ -152,32 +150,31 @@ def reconcile_position_on_startup(state: dict) -> dict:
     entry_time  = pos.get("createdTime", datetime.now(timezone.utc).isoformat())
 
     log.warning(
-        f"[reconcile] Live {side} position found on Bybit that bot state missed. "
+        f"[reconcile] Live {side} found on Bybit that state missed. "
         f"Entry={entry_price:.2f} qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}. "
         f"Resuming SL/TP management."
     )
 
     state.update({
-        "in_position":     True,
-        "side":            side,
-        "entry_price":     entry_price,
-        "entry_time":      entry_time,
-        "qty":             qty,
-        "sl_price":        sl_price,
-        "tp_price":        tp_price,
-        "pending_signal":  None,
-        "last_action":     side,
-        "last_reason":     "Position synced from Bybit on bot startup/restart.",
-        "last_confidence": 0,
+        "in_position":    True,
+        "side":           side,
+        "entry_price":    entry_price,
+        "entry_time":     entry_time,
+        "qty":            qty,
+        "sl_price":       sl_price,
+        "tp_price":       tp_price,
+        "pending_signal": None,
+        "last_action":    side,
+        "last_reason":    "Position synced from Bybit on bot startup/restart.",
     })
 
     return state
 
 
-# ── Exit helpers ──────────────────────────────────────────────────────────────
+# ── Exit helper ───────────────────────────────────────────────────────────────
 
 def _execute_exit(state: dict, price: float, trigger: str, reason: str) -> dict:
-    side = state.get("side", "LONG")
+    side = state.get("side", "SHORT")
     qty  = float(state["qty"])
 
     try:
@@ -201,6 +198,7 @@ def _execute_exit(state: dict, price: float, trigger: str, reason: str) -> dict:
         "qty":     qty,
         "pnl":     pnl,
         "reason":  reason,
+        "leverage": config.LEVERAGE,
     })
 
     state.update({
@@ -217,7 +215,6 @@ def _execute_exit(state: dict, price: float, trigger: str, reason: str) -> dict:
         "last_reason":    reason,
     })
 
-    label = "Stop loss" if trigger == "SL" else "Take profit" if trigger == "TP" else trigger
     if trigger == "SL":
         tg.alert_stop_loss(filled, qty, pnl, float(state.get("entry_price", 0)))
     elif trigger == "TP":
@@ -225,208 +222,163 @@ def _execute_exit(state: dict, price: float, trigger: str, reason: str) -> dict:
     else:
         tg.alert_sell(filled, qty, qty * filled, pnl, reason, trigger)
 
-    log.info(f"[{trigger}] {side} {qty} BTC | entry={state.get('entry_price')} "
-             f"exit={filled:.2f} | P&L ${pnl:+.4f}")
+    log.info(
+        f"[{trigger}] {side} {qty} BTC | entry={state.get('entry_price')} "
+        f"exit={filled:.2f} | P&L ${pnl:+.4f}"
+    )
     return state
 
 
-# ── Main cycle ─────────────────────────────────────────────────────────────────
+# ── Main cycle ────────────────────────────────────────────────────────────────
 
 def run_cycle(state: dict) -> dict:
     """
-    Run one M5 trading cycle. Returns updated state.
+    Run one 4H trading cycle. Returns updated state.
 
     Phases:
-      A) SL/TP check (highest priority — always runs when in a position)
-      B) H1 signal detection (only when flat and no pending signal)
-      C) M5 entry trigger (when a pending signal is armed)
+      A) SL/TP check — runs every cycle when in a position.
+         TP is updated to the current MA28 before checking (moving target).
+      B) BB short setup detection — runs when flat (no position).
+         If setup is new (dedup by signal_candle_ts), validate and enter SHORT.
     """
 
-    # ── Fetch market data ──────────────────────────────────────────────────────
-    df_h1 = bybit_client.get_klines_h1()
-    df_m5 = bybit_client.get_klines_m5()
-    price = round(float(df_m5["close"].iloc[-1]), 2)
+    # ── Fetch market data ────────────────────────────────────────────────────
+    df = bybit_client.get_klines_h4()
+    # Use the last row's close as the current price (last forming candle — live price)
+    price = round(float(df["close"].iloc[-1]), 2)
+    state["_last_price"] = price
 
-    log.info(f"[cycle] BTC price=${price:,.2f} | in_pos={state['in_position']} "
-             f"side={state.get('side')} | pending={'yes' if state.get('pending_signal') else 'no'}")
+    log.info(
+        f"[cycle] BTC=${price:,.2f} | in_pos={state['in_position']} "
+        f"side={state.get('side')} | "
+        f"sl={state.get('sl_price', 0):.2f} tp={state.get('tp_price', 0):.2f}"
+    )
 
-    # ── Phase A: SL / TP check ─────────────────────────────────────────────────
+    # ── Phase A: SL / TP management ──────────────────────────────────────────
     if state["in_position"]:
+        # Update the take-profit to the CURRENT MA28 (moving target)
+        ma28 = ind_calc.get_ma28_current(df)
+        if ma28 > 0:
+            old_tp = state.get("tp_price", 0)
+            state["tp_price"] = ma28
+            if abs(ma28 - old_tp) > 0.01:
+                log.info(f"[TP update] MA28 moved {old_tp:.2f} → {ma28:.2f}")
+
         trigger = risk.check_sl_tp(state, price)
         if trigger:
-            side  = state.get("side", "LONG")
+            side  = state.get("side", "SHORT")
             entry = float(state["entry_price"])
+            tp    = float(state.get("tp_price", 0))
+            sl    = float(state.get("sl_price", 0))
             reason = (
-                f"{'Stop loss' if trigger == 'SL' else 'Take profit'} triggered. "
-                f"{side} | Entry ${entry:,.2f} → Exit ${price:,.2f}."
+                f"{'Stop loss' if trigger == 'SL' else 'Take profit (MA28)'} triggered. "
+                f"{side} | Entry ${entry:,.2f} → Exit ${price:,.2f} | "
+                f"SL={sl:.2f} TP={tp:.2f}"
             )
             return _execute_exit(state, price, trigger, reason)
 
-        # Still in position — update last action and return
+        # Still in position — update status
         state["last_action"] = "HOLD"
         state["last_reason"] = (
-            f"Managing {state['side']} position. Entry=${state['entry_price']:.2f} "
-            f"SL={state['sl_price']:.2f} TP={state['tp_price']:.2f} price={price:.2f}"
+            f"Managing {state['side']} position. "
+            f"Entry=${state['entry_price']:.2f} SL={state['sl_price']:.2f} "
+            f"TP(MA28)={state['tp_price']:.2f} price={price:.2f}"
         )
         return state
 
-    # ── Phase B: H1 signal detection ──────────────────────────────────────────
-    if not state.get("pending_signal"):
-        signal = ind_calc.detect_directional_candle(df_h1)
+    # ── Phase B: BB short setup detection ────────────────────────────────────
+    setup = ind_calc.detect_bb_short_setup(df)
 
-        if signal:
-            blocked = ind_calc.check_structural_block(
-                df_h1,
-                signal["h1_high"],
-                signal["h1_low"],
-                signal["direction"],
-            )
-
-            if blocked:
-                state["last_action"] = "HOLD"
-                state["last_reason"] = (
-                    f"H1 {signal['direction']} signal rejected — "
-                    f"candle extreme at major HTF structural level."
-                )
-                return state
-
-            fib_low, fib_high = ind_calc.fib_entry_zone(
-                signal["h1_high"], signal["h1_low"], signal["direction"]
-            )
-
-            from datetime import timedelta
-            expiry = (
-                datetime.now(timezone.utc) +
-                timedelta(hours=config.SIGNAL_EXPIRY_HOURS)
-            ).isoformat()
-
-            state["pending_signal"] = {
-                "direction":  signal["direction"],
-                "h1_high":    signal["h1_high"],
-                "h1_low":     signal["h1_low"],
-                "fib_low":    fib_low,
-                "fib_high":   fib_high,
-                "candle_ts":  signal["candle_ts"],
-                "expires_at": expiry,
-            }
-
-            log.info(
-                f"[Signal Armed] {signal['direction']} | "
-                f"H1 candle {signal['h1_low']:.2f}–{signal['h1_high']:.2f} | "
-                f"Fib entry zone {fib_low:.2f}–{fib_high:.2f} | "
-                f"expires {expiry}"
-            )
-            state["last_action"] = "SIGNAL"
-            state["last_reason"] = (
-                f"H1 {signal['direction']} directional candle detected. "
-                f"Waiting for M5 retracement into fib zone {fib_low:.2f}–{fib_high:.2f}."
-            )
-
-        return state
-
-    # ── Phase C: M5 entry trigger ──────────────────────────────────────────────
-    ps = state["pending_signal"]
-
-    # Check expiry
-    expires_at = datetime.fromisoformat(ps["expires_at"])
-    if datetime.now(timezone.utc) > expires_at:
-        log.info(f"[Signal Expired] {ps['direction']} signal from {ps['candle_ts']} expired.")
-        state["pending_signal"] = None
-        state["last_action"]    = "HOLD"
-        state["last_reason"]    = f"H1 {ps['direction']} signal expired — no M5 entry triggered."
-        return state
-
-    direction = ps["direction"]
-    fib_low   = ps["fib_low"]
-    fib_high  = ps["fib_high"]
-
-    # Check if price has retraced into the fib entry zone
-    in_fib_zone = fib_low <= price <= fib_high
-    if not in_fib_zone:
-        log.info(
-            f"[Waiting] {direction} | price={price:.2f} not yet in "
-            f"fib zone [{fib_low:.2f}–{fib_high:.2f}]"
-        )
+    if setup is None:
         state["last_action"] = "HOLD"
         state["last_reason"] = (
-            f"Waiting for {direction} retracement into fib zone "
-            f"{fib_low:.2f}–{fib_high:.2f}. Current price: {price:.2f}."
+            f"Watching 4H chart. No BB short setup. "
+            f"price=${price:,.2f}"
         )
         return state
 
-    # Optional FVG confluence — log but don't block
-    has_fvg = ind_calc.detect_fvg(df_m5, direction)
-    if has_fvg:
-        log.info(f"[FVG Confluence] {direction} FVG confirmed in M5.")
-    else:
-        log.info(f"[FVG Confluence] No {direction} FVG found — entering on fib zone alone.")
+    # Dedup: same signal candle means we already acted (or skipped) it
+    if setup["signal_candle_ts"] == state.get("signal_candle_ts"):
+        log.debug(f"[Dedup] Signal candle {setup['signal_candle_ts']} already processed")
+        state["last_action"] = "HOLD"
+        state["last_reason"] = (
+            f"Waiting for next 4H candle. Last setup already processed "
+            f"({setup['signal_candle_ts']})."
+        )
+        return state
+
+    # Mark this signal candle as seen regardless of what happens next
+    state["signal_candle_ts"] = setup["signal_candle_ts"]
 
     # Risk validation (daily limits, no double entry)
-    allowed, block_reason = risk.validate_action(direction, 70, state, bybit_client.get_balance())
+    allowed, block_reason = risk.validate_action("SHORT", state, bybit_client.get_balance())
     if not allowed:
-        log.info(f"[risk] {direction} blocked: {block_reason}")
-        state["pending_signal"] = None
-        state["last_action"]    = "HOLD"
-        state["last_reason"]    = f"Signal blocked by risk rules: {block_reason}"
+        log.info(f"[risk] SHORT blocked: {block_reason}")
+        state["last_action"] = "HOLD"
+        state["last_reason"] = f"BB setup found but blocked by risk rules: {block_reason}"
         return state
 
-    # Calculate SL and TP
-    sl = risk.calculate_sl(ps["h1_high"], ps["h1_low"], direction)
-    tp = ind_calc.find_swing_tp(df_m5, direction, price, sl)
+    # Calculate SL: candle high capped at 1.5 ATR
+    atr_val = ind_calc.atr(df, config.ATR_PERIOD)
+    sl      = risk.calculate_sl(setup["bb_touch_high"], price, atr_val)
 
-    # Execute entry
+    # TP: current MA28 (starting value — will move each cycle)
+    ma28 = ind_calc.get_ma28_current(df)
+
+    # Execute SHORT entry
     qty = config.BTC_QTY
     try:
-        if direction == "LONG":
-            qty, filled = bybit_client.open_long(qty, price)
-        else:
-            qty, filled = bybit_client.open_short(qty, price)
+        qty, filled = bybit_client.open_short(qty, price)
     except Exception as e:
-        log.error(f"{direction} entry failed: {e}")
-        tg.alert_api_error(f"open_{direction.lower()}", str(e))
+        log.error(f"SHORT entry failed: {e}")
+        tg.alert_api_error("open_short", str(e))
         return state
 
     entry_time = datetime.now(timezone.utc).isoformat()
 
     state.update({
         "in_position":       True,
-        "side":              direction,
+        "side":              "SHORT",
         "entry_price":       filled,
         "entry_time":        entry_time,
         "qty":               qty,
         "sl_price":          sl,
-        "tp_price":          tp,
+        "tp_price":          ma28,
         "pending_signal":    None,
-        "last_action":       direction,
+        "last_action":       "SHORT",
         "last_reason":       (
-            f"H1 directional candle → M5 fib retracement entry. "
-            f"FVG confluence: {'yes' if has_fvg else 'no'}."
+            f"BB short setup: upper band touch + red confirm candle. "
+            f"MA200={setup['ma200']:.2f} MA28={ma28:.2f} "
+            f"SL={sl:.2f} ATR={atr_val:.2f}"
         ),
-        "last_confidence":   70,
         "trade_count_today": state.get("trade_count_today", 0) + 1,
         "total_trades":      state.get("total_trades", 0) + 1,
     })
 
     _append_history({
-        "time":      entry_time,
-        "side":      direction,
-        "entry":     filled,
-        "qty":       qty,
-        "sl":        sl,
-        "tp":        tp,
-        "leverage":  config.LEVERAGE,
-        "fib_zone":  [fib_low, fib_high],
-        "fvg":       has_fvg,
-        "h1_candle": {"high": ps["h1_high"], "low": ps["h1_low"]},
+        "time":             entry_time,
+        "side":             "SHORT",
+        "entry":            filled,
+        "qty":              qty,
+        "sl":               sl,
+        "tp":               ma28,
+        "leverage":         config.LEVERAGE,
+        "bb_touch_high":    setup["bb_touch_high"],
+        "signal_candle_ts": setup["signal_candle_ts"],
+        "atr":              atr_val,
+        "ma28_at_entry":    ma28,
+        "ma200_at_entry":   setup["ma200"],
     })
 
-    rr = round(abs(tp - filled) / abs(filled - sl), 2) if sl != filled else 0
-    tg.alert_buy(filled, qty, qty * filled, 70,
-                 f"{direction} | SL={sl:.2f} TP={tp:.2f} RR={rr}:1 | "
-                 f"Leverage={config.LEVERAGE}× FVG={'✓' if has_fvg else '✗'}")
+    rr = round(abs(filled - ma28) / abs(sl - filled), 2) if sl != filled else 0
+    tg.alert_buy(
+        filled, qty, qty * filled, 0,
+        f"SHORT | SL={sl:.2f} TP(MA28)={ma28:.2f} RR≈{rr}:1 | "
+        f"ATR={atr_val:.2f} leverage={config.LEVERAGE}×"
+    )
 
     log.info(
-        f"[ENTRY] {direction} {qty} BTC @ ${filled:,.2f} | "
-        f"SL={sl:.2f} TP={tp:.2f} RR={rr}:1 | {config.LEVERAGE}×"
+        f"[ENTRY] SHORT {qty} BTC @ ${filled:,.2f} | "
+        f"SL={sl:.2f} TP(MA28)={ma28:.2f} RR≈{rr}:1 | {config.LEVERAGE}×"
     )
     return state

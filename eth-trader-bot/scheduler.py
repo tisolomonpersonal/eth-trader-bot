@@ -1,14 +1,14 @@
 """
-Bot loop for the Directional Candle Strategy.
+Bot loop for the 4H Bollinger Band Short Strategy.
 
 Cycle timing:
-  - When idle (no position, no pending signal): run every 60 s
-    (H1 candle closes happen once per hour; no need to poll faster)
-  - When a pending signal is armed: run every 30 s
-    (need to catch the M5 fib retracement promptly)
-  - When in a position: run every 30 s (SL/TP monitoring)
+  - When idle (no position): run every 5 minutes (300 s).
+    4H candles close every 240 minutes; polling every 5 min is more than enough
+    to catch a new setup within one cycle of its candle closing.
+  - When in a position: run every 60 s.
+    Monitors the moving MA28 take-profit and fixed stop-loss.
 
-Signal handling is NOT done here — gunicorn owns the process signals.
+Signal handling is NOT done here — gunicorn owns process signals.
 The bot thread runs as a daemon inside the gunicorn worker.
 """
 import time
@@ -37,9 +37,11 @@ def stop():
 def run_bot() -> None:
     """Main bot loop — runs inside the gunicorn worker thread."""
     log.info(
-        f"BTC Directional Candle Bot starting | "
+        f"4H BB Short Bot starting | "
         f"symbol={config.SYMBOL} category={config.CATEGORY} "
         f"leverage={config.LEVERAGE}× qty={config.BTC_QTY} BTC | "
+        f"BB({config.BB_PERIOD},{config.BB_STD}) MA{config.MA_SHORT}/MA{config.MA_LONG} | "
+        f"ATR cap={config.ATR_CAP_MULT}× | "
         f"paper={config.PAPER_MODE} testnet={config.BYBIT_TESTNET}"
     )
 
@@ -82,7 +84,7 @@ def run_bot() -> None:
         now = datetime.now(timezone.utc)
         if (now - last_hour).total_seconds() >= 3600:
             try:
-                df  = bybit_client.get_klines_h1()
+                df  = bybit_client.get_klines_h4()
                 ind = ind_calc.calculate(df)
                 bal = bybit_client.get_balance()
                 tg.send_hourly_summary(state, ind, bal)
@@ -91,14 +93,16 @@ def run_bot() -> None:
                 log.error(f"Hourly summary error: {e}")
 
         # Dynamic sleep:
-        #   - Active (position open or pending signal) → 30 s
-        #   - Idle (watching for H1 signal)            → 60 s
-        active   = state.get("in_position") or bool(state.get("pending_signal"))
-        interval = 30 if active else 60
-        elapsed  = time.time() - cycle_start
-        sleep_s  = max(5, interval - elapsed)
-        log.debug(f"Cycle done in {elapsed:.1f}s — sleeping {sleep_s:.0f}s "
-                  f"({'active' if active else 'idle'})")
+        #   - In position → 60 s  (monitor SL/TP and moving MA28 more frequently)
+        #   - Idle        → 300 s (4H candles close every 240 min; 5 min polling is plenty)
+        in_position = state.get("in_position", False)
+        interval    = 60 if in_position else 300
+        elapsed     = time.time() - cycle_start
+        sleep_s     = max(5, interval - elapsed)
+        log.debug(
+            f"Cycle done in {elapsed:.1f}s — sleeping {sleep_s:.0f}s "
+            f"({'in position' if in_position else 'idle'})"
+        )
         time.sleep(sleep_s)
 
     log.info("Bot loop exited cleanly")

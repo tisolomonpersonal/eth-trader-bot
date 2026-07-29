@@ -1,6 +1,6 @@
 """
 Hard risk rules — final gate before any trade executes.
-Updated for BTC linear perpetuals with 25× leverage.
+4H Bollinger Band Short Strategy, BTC/USDT linear perpetual, 25× leverage.
 """
 from typing import Optional, Tuple
 
@@ -13,25 +13,28 @@ log = get_logger("risk")
 def check_sl_tp(state: dict, price: float) -> Optional[str]:
     """
     Check if stop-loss or take-profit has been triggered.
-    Works for both LONG and SHORT positions.
+    This strategy is SHORT only.
     Returns 'SL', 'TP', or None.
+
+    TP (MA28) is a moving target — the caller updates state['tp_price'] to
+    the current MA28 before calling this function each cycle.
     """
     if not state.get("in_position"):
         return None
 
-    side = state.get("side", "LONG")
+    side = state.get("side", "SHORT")
     sl   = float(state.get("sl_price", 0) or 0)
     tp   = float(state.get("tp_price", 0) or 0)
 
-    if side == "LONG":
-        if sl > 0 and price <= sl:
-            return "SL"
-        if tp > 0 and price >= tp:
-            return "TP"
-    else:  # SHORT
+    if side == "SHORT":
         if sl > 0 and price >= sl:
             return "SL"
         if tp > 0 and price <= tp:
+            return "TP"
+    else:  # LONG (kept for robustness / reconciled positions)
+        if sl > 0 and price <= sl:
+            return "SL"
+        if tp > 0 and price >= tp:
             return "TP"
 
     return None
@@ -39,27 +42,18 @@ def check_sl_tp(state: dict, price: float) -> Optional[str]:
 
 def validate_action(
     action: str,
-    confidence: int,
     state: dict,
     balance: dict,
 ) -> Tuple[bool, str]:
     """
-    Validate a proposed action against all hard risk rules.
+    Validate a proposed SHORT entry against all hard risk rules.
     Returns (allowed: bool, reason: str).
-    action: 'LONG' | 'SHORT' | 'CLOSE' | 'HOLD'
     """
     if action == "HOLD":
         return True, "HOLD always allowed."
 
-    # Minimum AI confidence
-    if action in ("LONG", "SHORT") and confidence < config.MIN_AI_CONFIDENCE:
-        return False, (
-            f"AI confidence {confidence} below minimum {config.MIN_AI_CONFIDENCE}. "
-            "Waiting for higher conviction signal."
-        )
-
     # Daily loss limit
-    daily_pnl  = float(state.get("daily_pnl_usdt", 0))
+    daily_pnl = float(state.get("daily_pnl_usdt", 0))
     if daily_pnl < -config.MAX_DAILY_LOSS_USDT:
         return False, (
             f"Daily loss limit reached "
@@ -67,14 +61,12 @@ def validate_action(
         )
 
     # Daily trade count
-    if action in ("LONG", "SHORT"):
+    if action == "SHORT":
         if state.get("trade_count_today", 0) >= config.MAX_TRADES_PER_DAY:
-            return False, (
-                f"Max daily trades reached ({config.MAX_TRADES_PER_DAY})."
-            )
+            return False, f"Max daily trades reached ({config.MAX_TRADES_PER_DAY})."
 
     # No double entries
-    if action in ("LONG", "SHORT") and state.get("in_position"):
+    if action == "SHORT" and state.get("in_position"):
         return False, "Already in a position — only one open trade at a time."
 
     # Nothing to close
@@ -84,19 +76,24 @@ def validate_action(
     return True, "All risk rules passed."
 
 
-def calculate_sl(h1_high: float, h1_low: float, direction: str) -> float:
+def calculate_sl(bb_touch_high: float, entry_price: float, atr_value: float) -> float:
     """
-    Place SL strictly beyond the H1 candle extreme + SL_BUFFER_PCT.
-    LONG  → SL below h1_low
-    SHORT → SL above h1_high
+    Stop-loss for a SHORT position.
+
+    Candidate 1: high of the BB-touch candle + small buffer (exact candle tip).
+    Candidate 2: entry price + 1.5 × ATR (the hard cap).
+
+    Final SL = whichever is LOWER (closer to entry), so a single huge candle
+    can never hand us an oversized stop.
     """
     buf = config.SL_BUFFER_PCT / 100
-
-    if direction == "LONG":
-        sl = round(h1_low  * (1 - buf), 2)
-    else:
-        sl = round(h1_high * (1 + buf), 2)
-
+    candidate_candle = round(bb_touch_high * (1 + buf), 2)
+    candidate_atr    = round(entry_price + config.ATR_CAP_MULT * atr_value, 2)
+    sl = min(candidate_candle, candidate_atr)
+    log.debug(
+        f"[SL calc] bb_high={bb_touch_high:.2f} candle_sl={candidate_candle:.2f} "
+        f"atr_sl={candidate_atr:.2f} (ATR={atr_value:.2f}) → final={sl:.2f}"
+    )
     return sl
 
 
