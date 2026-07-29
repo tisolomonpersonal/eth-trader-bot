@@ -112,6 +112,13 @@ def add_indicators(df: pd.DataFrame, bb_period: int, bb_std: float,
     # occur while price is simply trending through the band.
     df["trend_ma"] = df["close"].rolling(trend_len).mean()
 
+    # ATR, used only to optionally cap how far the stop may sit from entry.
+    prev = df["close"].shift()
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - prev).abs(),
+                    (df["low"] - prev).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
     df["green"] = df["close"] > df["open"]
     df["red"] = df["close"] < df["open"]
     df["touch_lower"] = df["low"] <= df["bb_lower"]
@@ -125,7 +132,7 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
         allow_long: bool, allow_short: bool, max_hold_bars: int,
         min_rr: float = 0.0, min_reward_pct: float = 0.0,
         confirm_bars: int = 2, target_mode: str = "dynamic",
-        use_trend_filter: bool = False) -> dict:
+        use_trend_filter: bool = False, stop_cap_atr: float = 0.0) -> dict:
     """
     Walk forward one bar at a time.
 
@@ -182,6 +189,21 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
 
         entry = float(row["close"])
         entry = entry * (1 + slip) if side == "LONG" else entry * (1 - slip)
+
+        # Optional stop cap. The specified stop is the touch candle's extreme,
+        # which is not symmetric between sides: a lower-band touch is a large
+        # red candle, an upper-band touch a smaller green one, so longs are
+        # handed structurally wider stops. Capping at a multiple of ATR bounds
+        # the loss without changing which setups qualify. Applied to BOTH sides
+        # so this is not a fit to the side known to underperform.
+        if stop_cap_atr:
+            atr = float(row["atr"])
+            if atr > 0:
+                limit = stop_cap_atr * atr
+                if side == "LONG":
+                    stop = max(stop, entry - limit)
+                else:
+                    stop = min(stop, entry + limit)
 
         # Reward and risk as they stand AT ENTRY. The target is the MA, which
         # the two confirming candles have already moved price toward — so a
@@ -363,6 +385,9 @@ def main():
                          "static freezes it at the entry bar's value")
     ap.add_argument("--trend-ma", type=int, default=200,
                     help="length of the long-term trend MA")
+    ap.add_argument("--stop-cap-atr", type=float, default=0.0,
+                    help="cap the stop at this many ATR from entry; 0 = use the "
+                         "touch candle's extreme as specified")
     ap.add_argument("--trend-filter", action="store_true",
                     help="only long above the trend MA, only short below it")
     ap.add_argument("--json", action="store_true")
@@ -378,7 +403,8 @@ def main():
               max_hold_bars=args.max_hold,
               min_rr=args.min_rr, min_reward_pct=args.min_reward,
               confirm_bars=args.confirm, target_mode=args.target,
-              use_trend_filter=args.trend_filter)
+              use_trend_filter=args.trend_filter,
+              stop_cap_atr=args.stop_cap_atr)
 
     res["config"] = {
         "symbol": args.symbol, "interval_min": args.interval, "days": args.days,
