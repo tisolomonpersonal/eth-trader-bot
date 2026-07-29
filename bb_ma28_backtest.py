@@ -59,7 +59,11 @@ def fetch(symbol: str, interval: str, days: int, use_cache: bool = True) -> pd.D
     client = HTTP(testnet=False)
 
     end = int(datetime.now(timezone.utc).timestamp() * 1000)
-    need = int(days * 24 * 60 / int(interval))
+    # Bybit also accepts the calendar intervals D/W/M, which aren't minute counts.
+    minutes = {"D": 1440, "W": 10080, "M": 43200}.get(str(interval).upper())
+    if minutes is None:
+        minutes = int(interval)
+    need = int(days * 24 * 60 / minutes)
     frames, got = [], 0
 
     while got < need:
