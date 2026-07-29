@@ -89,7 +89,7 @@ def fetch(symbol: str, interval: str, days: int, use_cache: bool = True) -> pd.D
 
 
 def add_indicators(df: pd.DataFrame, bb_period: int, bb_std: float,
-                   ma_len: int, ma_type: str) -> pd.DataFrame:
+                   ma_len: int, ma_type: str, trend_len: int = 200) -> pd.DataFrame:
     df = df.copy()
     mid = df["close"].rolling(bb_period).mean()
     sd = df["close"].rolling(bb_period).std()
@@ -100,6 +100,13 @@ def add_indicators(df: pd.DataFrame, bb_period: int, bb_std: float,
         df["ma"] = df["close"].ewm(span=ma_len, adjust=False).mean()
     else:
         df["ma"] = df["close"].rolling(ma_len).mean()
+
+    # Long-term trend filter. A band-touch fade is a counter-trend entry at the
+    # short horizon, so the usual discipline is to only take the side that
+    # agrees with the dominant trend: buy dips above the 200MA, sell rallies
+    # below it. This is what rejects the "false positive" band touches that
+    # occur while price is simply trending through the band.
+    df["trend_ma"] = df["close"].rolling(trend_len).mean()
 
     df["green"] = df["close"] > df["open"]
     df["red"] = df["close"] < df["open"]
@@ -112,7 +119,9 @@ def add_indicators(df: pd.DataFrame, bb_period: int, bb_std: float,
 
 def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
         allow_long: bool, allow_short: bool, max_hold_bars: int,
-        min_rr: float = 0.0, min_reward_pct: float = 0.0) -> dict:
+        min_rr: float = 0.0, min_reward_pct: float = 0.0,
+        confirm_bars: int = 2, target_mode: str = "dynamic",
+        use_trend_filter: bool = False) -> dict:
     """
     Walk forward one bar at a time.
 
@@ -130,22 +139,36 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
 
     while i < n:
         row = df.iloc[i]
-        if i < warm or pd.isna(row["ma"]) or pd.isna(row["bb_lower"]):
+        if i < max(warm, confirm_bars + 1) or pd.isna(row["ma"]) or pd.isna(row["bb_lower"]):
             i += 1
             continue
 
-        touch = df.iloc[i - 2]
-        c1, c2 = df.iloc[i - 1], df.iloc[i]
+        # confirm_bars = how many candles must close in our direction after the
+        # touch before entering. More confirmation buys certainty but spends
+        # the move — measured at 2, the median remaining target (0.35%) was
+        # already smaller than the median stop (0.44%).
+        touch = df.iloc[i - confirm_bars]
+        confirms = [df.iloc[i - k] for k in range(confirm_bars - 1, -1, -1)]
+
+        # Trend gate: only fade in the direction the 200MA supports.
+        trend = row["trend_ma"]
+        if use_trend_filter and pd.isna(trend):
+            i += 1
+            continue
+        trend_ok_long = (not use_trend_filter) or row["close"] > trend
+        trend_ok_short = (not use_trend_filter) or row["close"] < trend
 
         side = None
         if (allow_long and touch["touch_lower"]
-                and c1["green"] and c2["green"]
-                and row["close"] < row["ma"]):
+                and all(c["green"] for c in confirms)
+                and row["close"] < row["ma"]
+                and trend_ok_long):
             side = "LONG"
             stop = float(touch["low"])
         elif (allow_short and touch["touch_upper"]
-                and c1["red"] and c2["red"]
-                and row["close"] > row["ma"]):
+                and all(c["red"] for c in confirms)
+                and row["close"] > row["ma"]
+                and trend_ok_short):
             side = "SHORT"
             stop = float(touch["high"])
 
@@ -186,7 +209,11 @@ def run(df: pd.DataFrame, fee_pct: float, slippage_pct: float,
         while j < n:
             b = df.iloc[j]
             held += 1
-            target = float(b["ma"])          # dynamic — moves every bar
+            # "dynamic" re-reads the MA every bar, as specified. Measured cost:
+            # on TP exits the MA had drifted toward the entry, turning an
+            # expected 0.734% into a realised 0.440%. "static" freezes the
+            # target at its entry-bar value so the reward cannot erode.
+            target = float(b["ma"]) if target_mode == "dynamic" else target_now
 
             if side == "LONG":
                 # Pessimistic: if a bar spans both levels, assume the stop filled.
@@ -325,21 +352,37 @@ def main():
                     help="skip setups whose target is nearer than this %% from entry")
     ap.add_argument("--longs-only", action="store_true")
     ap.add_argument("--shorts-only", action="store_true")
+    ap.add_argument("--confirm", type=int, default=2,
+                    help="candles that must close in-direction after the touch")
+    ap.add_argument("--target", choices=["dynamic", "static"], default="dynamic",
+                    help="dynamic re-reads the MA each bar (as specified); "
+                         "static freezes it at the entry bar's value")
+    ap.add_argument("--trend-ma", type=int, default=200,
+                    help="length of the long-term trend MA")
+    ap.add_argument("--trend-filter", action="store_true",
+                    help="only long above the trend MA, only short below it")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     df = fetch(args.symbol, args.interval, args.days)
-    df = add_indicators(df, args.bb_period, args.bb_std, args.ma, args.ma_type)
+    df = add_indicators(df, args.bb_period, args.bb_std, args.ma, args.ma_type,
+                        args.trend_ma)
 
     res = run(df, args.fees, args.slippage,
               allow_long=not args.shorts_only,
               allow_short=not args.longs_only,
               max_hold_bars=args.max_hold,
-              min_rr=args.min_rr, min_reward_pct=args.min_reward)
+              min_rr=args.min_rr, min_reward_pct=args.min_reward,
+              confirm_bars=args.confirm, target_mode=args.target,
+              use_trend_filter=args.trend_filter)
 
     res["config"] = {
         "symbol": args.symbol, "interval_min": args.interval, "days": args.days,
         "bb": f"{args.bb_period}/{args.bb_std}", "ma": f"{args.ma_type.upper()}{args.ma}",
+        "confirm_bars": args.confirm, "target": args.target,
+        "trend_filter": f"MA{args.trend_ma}" if args.trend_filter else "off",
+        "sides": ("shorts only" if args.shorts_only else
+                  "longs only" if args.longs_only else "both"),
     }
 
     if args.json:
