@@ -110,6 +110,39 @@ def history():
     return jsonify(get_history())
 
 
+# ── Grid routes (only active when GRID_ENABLED=true) ─────────────────────────
+
+@app.route("/grid/status")
+def grid_status():
+    import grid_config as gc
+    if not gc.GRID_ENABLED:
+        return jsonify({"status": "disabled",
+                        "message": "Set GRID_ENABLED=true to activate."})
+
+    import grid_strategy
+    state = grid_strategy.load_state()
+
+    positions = {"long": None, "short": None}
+    try:
+        import grid_client
+        positions = grid_client.get_positions()
+    except Exception as e:
+        # Status must stay reachable even when Bybit is unhappy.
+        positions = {"error": str(e)[:200]}
+
+    return jsonify({
+        "status":      "halted" if state.get("halted") else "ok",
+        "paper_mode":  gc.GRID_PAPER_MODE,
+        "dry_run":     gc.GRID_DRY_RUN,
+        "symbol":      gc.GRID_SYMBOL,
+        "qty":         gc.GRID_QTY,
+        "leverage":    gc.GRID_LEVERAGE,
+        "max_per_side": gc.GRID_MAX_POSITION_BTC,
+        "positions":   positions,
+        "state":       state,
+    })
+
+
 # ── TradFi routes (kept intact — only runs when TRADFI_ENABLED=true) ──────────
 
 @app.route("/tradfi/status")
@@ -179,6 +212,11 @@ def _tradfi_bot_thread():
     run_tradfi_bot()
 
 
+def _grid_bot_thread():
+    from scheduler import run_grid_bot
+    run_grid_bot()
+
+
 def _start_bot_threads():
     """Start bot threads. Safe to call multiple times — guarded by env var."""
     if os.environ.get("_BTC_BOT_STARTED") == "1":
@@ -197,6 +235,17 @@ def _start_bot_threads():
         threading.Thread(target=_tradfi_bot_thread, daemon=True, name="tradfi-bot").start()
     else:
         log.info("TRADFI_ENABLED=false — TradFi thread not started")
+
+    import grid_config as gc
+    if gc.GRID_ENABLED:
+        log.info(
+            f"GRID_ENABLED=true — starting grid thread "
+            f"(symbol={gc.GRID_SYMBOL} qty={gc.GRID_QTY} x{gc.GRID_LEVERAGE} "
+            f"paper={gc.GRID_PAPER_MODE} dry_run={gc.GRID_DRY_RUN})"
+        )
+        threading.Thread(target=_grid_bot_thread, daemon=True, name="grid-bot").start()
+    else:
+        log.info("GRID_ENABLED=false — grid thread not started")
 
 
 # Start threads when the module is imported by gunicorn (no --config needed).

@@ -32,6 +32,7 @@ def stop():
     global _running
     _running = False
     tradfi_stop()
+    grid_stop()
 
 
 def run_bot() -> None:
@@ -183,3 +184,92 @@ def run_tradfi_bot() -> None:
         time.sleep(max(10, config.TRADFI_CYCLE_SECONDS - elapsed))
 
     log.info("TradFi bot loop exited cleanly")
+
+
+# ── Grid loop (BTC perp hedged grid, fully independent) ──────────────────────
+
+_grid_running = True
+
+
+def grid_stop():
+    """
+    Stop the grid loop and pull its resting orders.
+
+    Cancelling here is deliberate: on a redeploy or restart the loop thread is
+    a daemon and may be killed before it can clean up after itself, which would
+    leave leveraged limit orders resting on the book with nothing supervising
+    them. This runs synchronously from the worker_exit hook instead.
+    """
+    global _grid_running
+    _grid_running = False
+
+    import grid_config as gc
+    if not gc.GRID_ENABLED:
+        return
+    try:
+        import grid_client
+        grid_client.cancel_all_ours()
+    except Exception as e:
+        log.error(f"Could not cancel grid orders on shutdown: {e}")
+
+
+def run_grid_bot() -> None:
+    """Hedged grid loop — runs on its own interval, in its own thread."""
+    import grid_config as gc
+    import grid_strategy
+
+    state = grid_strategy.load_state()
+
+    try:
+        state = grid_strategy.startup(state)
+        grid_strategy.save_state(state)
+    except Exception as e:
+        log.error(f"Grid startup failed, loop not starting: {e}")
+        tg.alert_critical(f"Grid bot failed to start: {str(e)[:300]}")
+        return
+
+    error_streak = 0
+
+    while _grid_running:
+        cycle_start = time.time()
+
+        try:
+            state = grid_strategy.reset_daily_if_needed(state)
+            state = grid_strategy.run_cycle(state)
+            grid_strategy.save_state(state)
+            error_streak = 0
+
+        except Exception as e:
+            error_streak += 1
+            err_msg = str(e)[:300]
+            log.error(
+                f"Grid cycle error (streak={error_streak}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            state["last_error"] = err_msg
+            grid_strategy.save_state(state)
+
+            if error_streak <= 3:
+                tg.alert_api_error("grid_run_cycle", err_msg)
+            elif error_streak == 4:
+                # Repeated failures with resting orders and live leverage is
+                # the dangerous case — pull the book rather than leave it.
+                tg.alert_critical(
+                    f"Grid bot failed {error_streak} consecutive cycles.\n"
+                    f"Last error: {err_msg}\nCancelling resting grid orders."
+                )
+                try:
+                    import grid_client
+                    grid_client.cancel_all_ours()
+                except Exception as ce:
+                    log.error(f"Emergency cancel failed: {ce}")
+
+            backoff = min(30 * (2 ** (error_streak - 1)), 300)
+            log.info(f"Grid retrying in {backoff}s")
+            time.sleep(backoff)
+            continue
+
+        elapsed = time.time() - cycle_start
+        time.sleep(max(5, gc.GRID_CYCLE_SECONDS - elapsed))
+
+    log.info("Grid bot loop exited cleanly")

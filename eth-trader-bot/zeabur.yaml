@@ -32,6 +32,17 @@ services:
     #   MT5_LOGIN      = <your Bybit MT5 account number>
     #   MT5_PASSWORD   = <your Bybit MT5 password>
     #   MT5_SERVER     = <your Bybit MT5 server name>
+    #   ── BTC hedged grid (read GRID.md before enabling) ──
+    #   GRID_ENABLED    = true
+    #   GRID_API_KEY    = <separate sub-account key — NOT the BB strategy's key.
+    #                      The grid needs hedge mode, the BB strategy needs
+    #                      one-way mode; they cannot share an account.>
+    #   GRID_API_SECRET = <sub-account secret>
+    #   GRID_QTY        = 0.001          (BTC per level; Bybit's minimum)
+    #   GRID_LEVERAGE   = 28
+    #   GRID_MAX_POSITION_BTC    = 0.008 (hard cap per side)
+    #   GRID_MAX_DAILY_LOSS_USDT = 25    (realised-loss kill switch, UTC day)
+    #   GRID_DRY_RUN    = true           (log orders without sending — start here)
     #   ── AI + alerts ──
     #   GROQ_API_KEY or OPENAI_API_KEY   (needed for BUY/SELL/HOLD signals)
     #   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID

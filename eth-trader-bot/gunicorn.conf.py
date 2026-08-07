@@ -19,7 +19,7 @@ def post_fork(server, worker):
     """Start bot thread(s) after the worker process is forked (not in master)."""
     import threading
     import config
-    from scheduler import run_bot, run_tradfi_bot
+    from scheduler import run_bot, run_tradfi_bot, run_grid_bot
 
     t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
     t.start()
@@ -33,6 +33,18 @@ def post_fork(server, worker):
         server.log.info(f"TradFi bot thread started in worker (symbol={config.TRADFI_SYMBOL})")
     else:
         server.log.info("TRADFI_ENABLED=false — TradFi bot thread not started")
+
+    # Hedged BTC grid — same pattern, own master switch.
+    import grid_config as gc
+    if gc.GRID_ENABLED:
+        gt = threading.Thread(target=run_grid_bot, daemon=True, name="grid-bot")
+        gt.start()
+        server.log.info(
+            f"Grid bot thread started in worker "
+            f"(symbol={gc.GRID_SYMBOL} qty={gc.GRID_QTY} x{gc.GRID_LEVERAGE})"
+        )
+    else:
+        server.log.info("GRID_ENABLED=false — grid bot thread not started")
 
 
 def worker_exit(server, worker):
