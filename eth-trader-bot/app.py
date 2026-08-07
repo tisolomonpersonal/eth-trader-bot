@@ -129,24 +129,36 @@ def grid_status():
     import grid_strategy
     state = grid_strategy.load_state()
 
+    # Each of these is optional for the dashboard; a failure in one must not
+    # take the whole endpoint down, so they degrade independently.
     positions = {"long": None, "short": None}
+    orders, price, balance, error = [], None, {}, None
     try:
         import grid_client
         positions = grid_client.get_positions()
+        orders = grid_client.get_open_orders()
+        price = grid_client.get_mark_price()
+        balance = grid_client.get_balance()
     except Exception as e:
-        # Status must stay reachable even when Bybit is unhappy.
-        positions = {"error": str(e)[:200]}
+        error = str(e)[:200]
+        log.warning(f"Partial /grid/status: {error}")
 
     return jsonify({
-        "status":      "halted" if state.get("halted") else "ok",
-        "paper_mode":  gc.GRID_PAPER_MODE,
-        "dry_run":     gc.GRID_DRY_RUN,
-        "symbol":      gc.GRID_SYMBOL,
-        "qty":         gc.GRID_QTY,
-        "leverage":    gc.GRID_LEVERAGE,
+        "status":       "halted" if state.get("halted") else "ok",
+        "paper_mode":   gc.GRID_PAPER_MODE,
+        "dry_run":      gc.GRID_DRY_RUN,
+        "symbol":       gc.GRID_SYMBOL,
+        "qty":          gc.GRID_QTY,
+        "leverage":     gc.GRID_LEVERAGE,
         "max_per_side": gc.GRID_MAX_POSITION_BTC,
-        "positions":   positions,
-        "state":       state,
+        "atr_mult":     gc.GRID_ATR_MULT,
+        "daily_loss_limit": gc.GRID_MAX_DAILY_LOSS_USDT,
+        "price":        price,
+        "positions":    positions,
+        "orders":       orders,
+        "balance":      balance,
+        "state":        state,
+        "error":        error,
     })
 
 
