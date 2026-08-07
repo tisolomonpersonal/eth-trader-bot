@@ -163,12 +163,27 @@ st.update({"grid_built_at": "now", "centre": 100000, "step": 500, "bias": "long"
 check("stable -> no rebuild", gs.needs_rebuild(st, 100100, "long", 500) == "",
       gs.needs_rebuild(st, 100100, "long", 500))
 check("bias flip -> rebuild", "bias" in gs.needs_rebuild(st, 100100, "short", 500))
-# step 500 at 0.5x mult => ATR 1000; recentre at 1.5 ATR = 1500
-check("drift past 1.5 ATR -> rebuild",
-      "drifted" in gs.needs_rebuild(st, 101600, "long", 500),
-      gs.needs_rebuild(st, 101600, "long", 500))
-check("drift within band -> no rebuild", gs.needs_rebuild(st, 101400, "long", 500) == "")
+
+# Derive the drift threshold from config rather than hardcoding it, so retuning
+# GRID_ATR_MULT or GRID_RECENTER_ATR cannot silently invalidate these two.
+_atr = 500 / gc.GRID_ATR_MULT                 # stored step 500 implies this ATR
+_trigger = gc.GRID_RECENTER_ATR * _atr        # drift needed to force a rebuild
+check("drift past the band -> rebuild",
+      "drifted" in gs.needs_rebuild(st, 100000 + _trigger * 1.05, "long", 500),
+      gs.needs_rebuild(st, 100000 + _trigger * 1.05, "long", 500))
+check("drift within band -> no rebuild",
+      gs.needs_rebuild(st, 100000 + _trigger * 0.95, "long", 500) == "",
+      gs.needs_rebuild(st, 100000 + _trigger * 0.95, "long", 500))
 check("ATR regime shift -> rebuild", "ATR step" in gs.needs_rebuild(st, 100100, "long", 1200))
+
+print("\n== geometry stays coherent ==")
+_outer = gc.GRID_ATR_MULT * max(gc.GRID_LEVELS_ABOVE, gc.GRID_LEVELS_BELOW)
+check(f"recentre ({gc.GRID_RECENTER_ATR}) beyond outer level ({_outer}) ATR",
+      gc.GRID_RECENTER_ATR > _outer,
+      "grid would recentre before its own outer level could fill")
+check(f"backstop stop ({gc.GRID_STOP_ATR_MULT}) beyond outer level ({_outer}) ATR",
+      gc.GRID_STOP_ATR_MULT == 0 or gc.GRID_STOP_ATR_MULT > _outer,
+      "stop would close the position before the outer level could fill")
 
 print("\n== state round-trip ==")
 st = gs._empty_state()

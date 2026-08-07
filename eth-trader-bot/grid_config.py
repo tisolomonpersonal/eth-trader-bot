@@ -49,11 +49,20 @@ GRID_LEVELS_ABOVE = int(os.environ.get("GRID_LEVELS_ABOVE", "2"))
 GRID_LEVELS_BELOW = int(os.environ.get("GRID_LEVELS_BELOW", "2"))
 
 # Level spacing = GRID_ATR_MULT x ATR(GRID_ATR_PERIOD).
+#
+# This is set by fees, not by taste. A round trip pays the maker fee twice on
+# notional, so at 0.02% and a $65k price roughly $26 per BTC has to be cleared
+# before a capture is worth anything. Sizing bigger does not help — fees scale
+# with notional exactly as profit does, so the ratio depends only on how far
+# price travels between levels. At 0.5x ATR (~$56) fees took 47% of every
+# winning trade; at 2.5x (~$278) they take about 9%.
 GRID_ATR_PERIOD = int(os.environ.get("GRID_ATR_PERIOD", "14"))
-GRID_ATR_MULT   = float(os.environ.get("GRID_ATR_MULT", "0.5"))
+GRID_ATR_MULT   = float(os.environ.get("GRID_ATR_MULT", "2.5"))
 
 # Rebuild the grid when price drifts this many ATRs from the grid centre.
-GRID_RECENTER_ATR = float(os.environ.get("GRID_RECENTER_ATR", "1.5"))
+# Must stay beyond the outer level (GRID_ATR_MULT x levels = 5 ATR by default),
+# or the grid recentres before its own levels can ever fill.
+GRID_RECENTER_ATR = float(os.environ.get("GRID_RECENTER_ATR", "6.0"))
 
 # ── Trend filter ──────────────────────────────────────────────────────────────
 GRID_EMA_FAST = int(os.environ.get("GRID_EMA_FAST", "50"))
@@ -78,7 +87,11 @@ GRID_MAX_DAILY_LOSS_USDT = float(os.environ.get("GRID_MAX_DAILY_LOSS_USDT", "3.0
 # Backstop stop-loss on the *net* position, as a multiple of ATR from the
 # average entry. 0 disables it. This is separate from the grid's own logic —
 # it exists so a one-way run does not accumulate indefinitely.
-GRID_STOP_ATR_MULT = float(os.environ.get("GRID_STOP_ATR_MULT", "4.0"))
+#
+# Must also sit beyond the outer level, otherwise it closes the position before
+# the far level has had a chance to fill. Liquidation at 28x is around 20 ATR
+# away, so 8 leaves real margin.
+GRID_STOP_ATR_MULT = float(os.environ.get("GRID_STOP_ATR_MULT", "8.0"))
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
 GRID_CYCLE_SECONDS = int(os.environ.get("GRID_CYCLE_SECONDS", "30"))
