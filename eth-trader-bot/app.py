@@ -5,7 +5,7 @@ Procfile: web: gunicorn app:app --config gunicorn.conf.py
 import os
 import threading
 
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 
 from logger import get_logger
 import config
@@ -14,6 +14,26 @@ log = get_logger("app")
 app = Flask(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Read-only JSON endpoints an external front-end may call cross-origin.
+_CORS_PATHS = ("/status", "/history", "/healthz", "/grid/status", "/supervisor/status")
+
+
+@app.after_request
+def _cors(resp):
+    """
+    Allow cross-origin GETs on the status endpoints only.
+
+    These are already served unauthenticated to anyone with the URL, so opening
+    them to other origins gives away nothing that curl could not already fetch.
+    Nothing here mutates state — there is no endpoint that places or cancels an
+    order — so there is no request worth forging.
+    """
+    if request.path in _CORS_PATHS:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
 
 @app.route("/")
