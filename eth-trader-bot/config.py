@@ -41,7 +41,7 @@ H4_LIMIT     = 250
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BTC_QTY  = float(os.environ.get("BTC_QTY",  "0.004"))  # Fixed contract size
-LEVERAGE = int(os.environ.get("LEVERAGE",   "25"))      # 25× leverage
+LEVERAGE = int(os.environ.get("LEVERAGE",   "28"))      # 28× leverage
 
 # ── Strategy parameters — BB Bollinger Short ──────────────────────────────────
 # Bollinger Bands

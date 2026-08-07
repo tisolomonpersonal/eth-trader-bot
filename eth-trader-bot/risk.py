@@ -1,6 +1,6 @@
 """
 Hard risk rules — final gate before any trade executes.
-4H Bollinger Band Short Strategy, BTC/USDT linear perpetual, 25× leverage.
+4H Bollinger Band Short Strategy, BTC/USDT linear perpetual, config.LEVERAGE (default 28×).
 """
 from typing import Optional, Tuple
 

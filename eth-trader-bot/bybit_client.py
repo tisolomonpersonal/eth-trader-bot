@@ -1,5 +1,5 @@
 """
-Bybit Linear Perpetuals client — BTC/USDT with 25× leverage.
+Bybit Linear Perpetuals client — BTC/USDT at config.LEVERAGE (default 28×).
 Supports SHORT (primary) and LONG (reconciliation). Fetches 4H OHLCV candles.
 """
 import math

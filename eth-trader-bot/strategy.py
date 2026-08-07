@@ -1,5 +1,5 @@
 """
-4H Bollinger Band Short Strategy — BTC/USDT Linear Perpetual, 25× leverage.
+4H Bollinger Band Short Strategy — BTC/USDT Linear Perpetual, config.LEVERAGE (default 28×).
 
 Rules (SHORT ONLY — never long):
   Entry (all four must be true on the last two closed 4H candles):
