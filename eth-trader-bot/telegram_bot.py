@@ -51,16 +51,19 @@ def alert_started() -> None:
     mode = "📄 Paper Trading" if config.PAPER_MODE else "💰 Live Trading"
     net  = "(Testnet)" if config.BYBIT_TESTNET else "(Mainnet)"
     send(
-        f"🤖 <b>BNB Spot Bot Started</b>\n"
+        f"🤖 <b>BTC 4H BB Short Bot Started</b>\n"
         f"{'─'*28}\n"
-        f"Exchange:   Bybit Spot {net}\n"
+        f"Exchange:   Bybit Perpetuals {net}\n"
         f"Mode:       {mode}\n"
-        f"Pair:       BNB/USDT\n"
-        f"Max trade:  {_ghc(config.MAX_INVESTMENT_USDT)} (~${config.MAX_INVESTMENT_USDT:.2f})\n"
-        f"Stop loss:  {config.STOP_LOSS_PCT}%\n"
-        f"Take profit:{config.TAKE_PROFIT_PCT}%\n"
-        f"Min confidence: {config.MIN_AI_CONFIDENCE}/100\n"
-        f"Cycle: every 1 minute | Summary: every 1 hour"
+        f"Pair:       {config.SYMBOL}\n"
+        f"Size:       {config.BTC_QTY} BTC @ {config.LEVERAGE}×\n"
+        f"Setup:      BB({config.BB_PERIOD},{config.BB_STD}) touch, "
+        f"MA{config.MA_LONG} downtrend filter\n"
+        f"Target:     MA{config.MA_SHORT} (trailing)\n"
+        f"Stop:       BB-touch high, capped {config.ATR_CAP_MULT}× ATR({config.ATR_PERIOD})\n"
+        f"Daily caps: {config.MAX_TRADES_PER_DAY} trades / "
+        f"-${config.MAX_DAILY_LOSS_USDT:.0f} loss\n"
+        f"Cycle: 5 min idle, 60 s in position | Summary: hourly"
     )
 
 

@@ -25,63 +25,12 @@ class AISignal:
     provider:        str    # which provider answered
 
 
-_SYSTEM = (
-    "You are a conservative BNB/USDT spot trading analyst. "
-    "You ONLY analyse spot markets. You NEVER recommend futures, margin, leverage, or shorting. "
-    "You return structured JSON only."
-)
-
 _RESPONSE_FORMAT = """{
   "action": "BUY" or "SELL" or "HOLD",
   "confidence": <integer 0-100>,
   "reason": "<one concise sentence>",
   "suggested_position_pct": <integer 0-100>
 }"""
-
-
-def _build_prompt(ind: dict, holdings: dict, state: dict) -> str:
-    pos_note = (
-        f"HOLDING {holdings['bnb']:.4f} BNB (entry ${state.get('entry_price',0):,.4f}, "
-        f"SL ${state.get('sl_price',0):,.4f}, TP ${state.get('tp_price',0):,.4f}). "
-        "Consider SELL if bearish reversal or TP conditions met."
-        if state.get("in_position") else
-        "NOT in position. Consider BUY only if strong bullish signal."
-    )
-    last_trade = (
-        f"Last trade: {state.get('last_action','NONE')} @ "
-        f"${state.get('entry_price',0):,.4f} — {state.get('last_reason','')[:80]}"
-        if state.get("last_action") not in (None, "NONE") else "No previous trade."
-    )
-
-    return f"""{_SYSTEM}
-
-=== BNB/USDT 1-minute Chart ===
-Price:       ${ind['price']:,.4f}
-EMA 50:      {ind['ema50']}  |  EMA 200: {ind['ema200']}
-Trend:       {ind['trend']}  |  Crossover: {ind['crossover']}
-RSI (14):    {ind['rsi']}   {'(overbought)' if ind['rsi']>70 else '(oversold)' if ind['rsi']<30 else '(neutral)'}
-MACD hist:   {ind['macd_hist']:+.6f}  {'(bullish momentum)' if ind['macd_hist']>0 else '(bearish momentum)'}
-Volume:      {ind['vol_trend']}
-ATR (14):    {ind['atr']}
-
-=== Portfolio ===
-USDT balance: ${holdings['usdt']:.2f}
-{pos_note}
-
-=== Context ===
-{last_trade}
-Daily P&L: ${state.get('daily_pnl_usdt',0):+.2f} USDT
-
-=== Risk Rules (you must respect these) ===
-- Max investment: ${config.MAX_INVESTMENT_USDT:.2f} USDT total
-- Stop loss: {config.STOP_LOSS_PCT}% below entry
-- Take profit: {config.TAKE_PROFIT_PCT}% above entry
-- Only 1 open position allowed
-- SPOT only — no futures, margin, leverage, shorts
-
-=== Instructions ===
-Analyse all data carefully. Return ONLY this JSON, no other text:
-{_RESPONSE_FORMAT}"""
 
 
 def _parse(raw: dict) -> AISignal:
@@ -251,28 +200,4 @@ def get_tradfi_signal(ind: dict, symbol: str, holdings: dict, state: dict) -> AI
     log.info("All AI providers failed for TradFi — using rule-based signal")
     sig = _rules(ind, state.get("in_position", False))
     log.info(f"[tradfi/rules] {sig.action} conf={sig.confidence} — {sig.reason[:80]}")
-    return sig
-
-
-def get_signal(ind: dict, holdings: dict, state: dict) -> AISignal:
-    """Get trading signal from the best available AI provider."""
-    prompt     = _build_prompt(ind, holdings, state)
-    in_position= state.get("in_position", False)
-
-    providers = []
-    if config.OLLAMA_HOST:     providers.append(("ollama", _ollama))
-    if config.GROQ_API_KEY:    providers.append(("groq",   _groq))
-    if config.OPENAI_API_KEY:  providers.append(("openai", _openai))
-
-    for name, fn in providers:
-        try:
-            sig = fn(prompt)
-            log.info(f"[{name}] {sig.action} conf={sig.confidence} — {sig.reason[:80]}")
-            return sig
-        except Exception as e:
-            log.warning(f"[{name}] failed: {e}")
-
-    log.info("All AI providers failed — using rule-based signal")
-    sig = _rules(ind, in_position)
-    log.info(f"[rules] {sig.action} conf={sig.confidence} — {sig.reason[:80]}")
     return sig

@@ -11,6 +11,10 @@ BYBIT_TESTNET    = os.environ.get("BYBIT_TESTNET",    "false").lower() == "true"
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
+# USDT → GHC rate, used only to annotate Telegram alerts with a local-currency
+# figure. Display only — never used in sizing or risk maths.
+GHC_RATE = float(os.environ.get("GHC_RATE", "12.0"))
+
 # ── AI providers (first available wins) ──────────────────────────────────────
 OLLAMA_HOST      = os.environ.get("OLLAMA_HOST",      "http://localhost:11434")
 OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",     "qwen2.5:3b")
