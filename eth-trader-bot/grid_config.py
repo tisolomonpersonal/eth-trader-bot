@@ -69,11 +69,11 @@ GRID_CLOSE_COUNTER_ON_FLIP = _true(os.environ.get("GRID_CLOSE_COUNTER_ON_FLIP", 
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
 # Hard cap on accumulated size per side, in BTC.
-GRID_MAX_POSITION_BTC = float(os.environ.get("GRID_MAX_POSITION_BTC", "0.008"))
+GRID_MAX_POSITION_BTC = float(os.environ.get("GRID_MAX_POSITION_BTC", "0.002"))
 
 # Kill switch: realised loss on the day (UTC) beyond this halts the grid —
 # cancels all orders, flattens both sides, waits for the next UTC day.
-GRID_MAX_DAILY_LOSS_USDT = float(os.environ.get("GRID_MAX_DAILY_LOSS_USDT", "25.0"))
+GRID_MAX_DAILY_LOSS_USDT = float(os.environ.get("GRID_MAX_DAILY_LOSS_USDT", "3.0"))
 
 # Backstop stop-loss on the *net* position, as a multiple of ATR from the
 # average entry. 0 disables it. This is separate from the grid's own logic —

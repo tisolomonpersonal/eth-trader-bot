@@ -32,7 +32,7 @@ H4_INTERVAL  = "240"       # 4-hour candles (the only timeframe used)
 H4_LIMIT     = 250
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-BTC_QTY  = float(os.environ.get("BTC_QTY",  "0.004"))  # Fixed contract size
+BTC_QTY  = float(os.environ.get("BTC_QTY",  "0.001"))  # Bybit minimum; ~$2.30 margin at 28x
 LEVERAGE = int(os.environ.get("LEVERAGE",   "28"))      # 28× leverage
 
 # ── Strategy parameters — BB Bollinger Short ──────────────────────────────────
@@ -54,7 +54,7 @@ ATR_CAP_MULT = float(os.environ.get("ATR_CAP_MULT", "1.5"))
 SL_BUFFER_PCT = float(os.environ.get("SL_BUFFER_PCT", "0.05"))
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
-MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "50.0"))
+MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "4.0"))
 MAX_TRADES_PER_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY",    "5"))
 
 # ── Mode ──────────────────────────────────────────────────────────────────────
