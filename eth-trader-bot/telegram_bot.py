@@ -22,7 +22,33 @@ def _ghc(usdt: float) -> str:
     return f"{usdt * config.GHC_RATE:,.0f} GHC"
 
 
-def send(text: str) -> bool:
+def _suppressed(kind: str) -> bool:
+    """
+    Decide whether an alert of this kind should be sent.
+
+    kind is one of:
+      "profit"   a closed trade that made money
+      "loss"     a closed trade that lost money
+      "info"     entries, startup/shutdown, hourly summaries
+      "critical" crashes, kill switch, bot down
+
+    With TELEGRAM_PROFIT_ONLY on, only "profit" goes out — plus "critical"
+    unless TELEGRAM_ALWAYS_CRITICAL is explicitly disabled.
+    """
+    if not config.TELEGRAM_PROFIT_ONLY:
+        return False
+    if kind == "profit":
+        return False
+    if kind == "critical" and config.TELEGRAM_ALWAYS_CRITICAL:
+        return False
+    return True
+
+
+def send(text: str, kind: str = "info") -> bool:
+    if _suppressed(kind):
+        # Logged, not sent — the record still exists in the Zeabur logs.
+        log.info(f"[telegram suppressed:{kind}] {text.splitlines()[0]}")
+        return False
     if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
         log.debug("Telegram not configured — skipping")
         return False
@@ -86,18 +112,19 @@ def alert_buy(price: float, qty: float, usdt: float, confidence: int, reason: st
 def alert_sell(price: float, qty: float, usdt: float, pnl: float,
                reason: str, trigger: str = "AI") -> None:
     paper = " [PAPER]" if config.PAPER_MODE else ""
-    emoji = "🔴"
+    emoji = "✅" if pnl > 0 else "🔴"
     send(
         f"{emoji} <b>SELL EXECUTED{paper}</b>\n"
         f"{'─'*28}\n"
         f"Action:   SELL ({trigger})\n"
-        f"Pair:     BNB/USDT Spot\n"
-        f"Price:    ${price:,.4f}\n"
-        f"Qty:      {qty:.4f} BNB\n"
+        f"Pair:     {config.SYMBOL} Perp\n"
+        f"Price:    ${price:,.2f}\n"
+        f"Qty:      {qty} BTC\n"
         f"Value:    {_ghc(usdt)} (~${usdt:.2f})\n"
         f"P&L:      <b>${pnl:+.2f}</b> ({_ghc(pnl)})\n"
         f"Time:     {_now()}\n\n"
-        f"<b>Reason:</b>\n{reason}"
+        f"<b>Reason:</b>\n{reason}",
+        kind="profit" if pnl > 0 else "loss",
     )
 
 
@@ -106,11 +133,12 @@ def alert_stop_loss(price: float, qty: float, pnl: float, entry: float) -> None:
     send(
         f"🛑 <b>STOP LOSS TRIGGERED{paper}</b>\n"
         f"{'─'*28}\n"
-        f"Entry:    ${entry:,.4f}\n"
-        f"Exit:     ${price:,.4f}\n"
-        f"Qty:      {qty:.4f} BNB\n"
+        f"Entry:    ${entry:,.2f}\n"
+        f"Exit:     ${price:,.2f}\n"
+        f"Qty:      {qty} BTC\n"
         f"Loss:     <b>${pnl:+.2f}</b> ({_ghc(pnl)})\n"
-        f"Time:     {_now()}"
+        f"Time:     {_now()}",
+        kind="profit" if pnl > 0 else "loss",
     )
 
 
@@ -119,11 +147,12 @@ def alert_take_profit(price: float, qty: float, pnl: float, entry: float) -> Non
     send(
         f"✅ <b>TAKE PROFIT REACHED{paper}</b>\n"
         f"{'─'*28}\n"
-        f"Entry:    ${entry:,.4f}\n"
-        f"Exit:     ${price:,.4f}\n"
-        f"Qty:      {qty:.4f} BNB\n"
+        f"Entry:    ${entry:,.2f}\n"
+        f"Exit:     ${price:,.2f}\n"
+        f"Qty:      {qty} BTC\n"
         f"Profit:   <b>${pnl:+.2f}</b> ({_ghc(pnl)})\n"
-        f"Time:     {_now()}"
+        f"Time:     {_now()}",
+        kind="profit" if pnl > 0 else "loss",
     )
 
 
@@ -134,7 +163,8 @@ def alert_api_error(context: str, error: str) -> None:
         f"Context: {context}\n"
         f"Error:   {error[:300]}\n"
         f"Time:    {_now()}\n\n"
-        f"Bot will retry automatically."
+        f"Bot will retry automatically.",
+        kind="critical",
     )
 
 
@@ -150,10 +180,13 @@ def alert_ai_failure(providers_tried: list[str]) -> None:
 
 def alert_stopped() -> None:
     send(
-        f"🔴 <b>BNB Bot Stopped</b>\n"
+        f"🔴 <b>BTC Bot Stopped</b>\n"
         f"{'─'*28}\n"
         f"Service was shut down or redeployed.\n"
-        f"Time: {_now()}"
+        f"Time: {_now()}",
+        # Fires on every redeploy, so this is routine rather than critical —
+        # a genuine failure surfaces through alert_critical instead.
+        kind="info",
     )
 
 
@@ -162,7 +195,8 @@ def alert_critical(message: str) -> None:
         f"🚨 <b>CRITICAL ERROR</b>\n"
         f"{'─'*28}\n"
         f"{message[:400]}\n"
-        f"Time: {_now()}"
+        f"Time: {_now()}",
+        kind="critical",
     )
 
 
@@ -217,7 +251,8 @@ def alert_tradfi_exit(symbol: str, trigger: str, price: float, qty: float,
         f"Qty:        {qty}\n"
         f"P&L:        <b>${pnl:+.2f}</b> USDT\n"
         f"Time:       {_now()}\n\n"
-        f"<b>Reason:</b>\n{reason}"
+        f"<b>Reason:</b>\n{reason}",
+        kind="profit" if pnl > 0 else "loss",
     )
 
 

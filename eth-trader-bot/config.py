@@ -15,6 +15,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",   "")
 # figure. Display only — never used in sizing or risk maths.
 GHC_RATE = float(os.environ.get("GHC_RATE", "12.0"))
 
+# Only notify on profitable exits. Entries, losing exits, startup/shutdown
+# notices and hourly summaries are logged but never sent.
+TELEGRAM_PROFIT_ONLY = os.environ.get("TELEGRAM_PROFIT_ONLY", "true").lower() == "true"
+
+# Escape hatch for the above: crashes, the daily kill switch and the bot dying
+# still reach you. Set false for literally-profit-only, accepting that the bot
+# can then fail silently while leveraged positions are open.
+TELEGRAM_ALWAYS_CRITICAL = os.environ.get("TELEGRAM_ALWAYS_CRITICAL", "true").lower() == "true"
+
 # ── AI providers (first available wins) ──────────────────────────────────────
 OLLAMA_HOST      = os.environ.get("OLLAMA_HOST",      "http://localhost:11434")
 OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",     "qwen2.5:3b")
