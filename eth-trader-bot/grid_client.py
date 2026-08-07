@@ -398,6 +398,26 @@ def cancel_all_ours() -> int:
 
 # ── Realised PnL ──────────────────────────────────────────────────────────────
 
+def get_closed_pnl_records(start_ms: int) -> list:
+    """
+    Raw closed-trade records since start_ms. The supervisor mirrors these into
+    memory; get_closed_pnl below just sums them for the kill switch.
+    """
+    if gc.GRID_PAPER_MODE:
+        return []
+
+    def _fetch():
+        resp = _client().get_closed_pnl(
+            category=gc.GRID_CATEGORY,
+            symbol=gc.GRID_SYMBOL,
+            startTime=start_ms,
+            limit=100,
+        )
+        return resp["result"]["list"]
+
+    return _retry(_fetch, "get_closed_pnl_records")
+
+
 def get_closed_pnl(start_ms: int) -> float:
     """Total realised PnL for the symbol since start_ms (UTC epoch millis)."""
     if gc.GRID_PAPER_MODE:

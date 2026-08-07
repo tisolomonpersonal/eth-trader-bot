@@ -32,6 +32,7 @@ def stop():
     global _running
     _running = False
     grid_stop()
+    supervisor_stop()
 
 
 def run_bot() -> None:
@@ -195,3 +196,23 @@ def run_grid_bot() -> None:
         time.sleep(max(5, gc.GRID_CYCLE_SECONDS - elapsed))
 
     log.info("Grid bot loop exited cleanly")
+
+
+# ── Supervisor loop (watches the grid; never trades) ─────────────────────────
+
+def supervisor_stop():
+    """Ask the supervisor loop to exit. It holds no orders, so nothing to undo."""
+    import supervisor_config as sc
+    if not sc.SUPERVISOR_ENABLED:
+        return
+    try:
+        import supervisor
+        supervisor.stop()
+    except Exception as e:
+        log.error(f"Could not stop supervisor: {e}")
+
+
+def run_supervisor_bot() -> None:
+    """Thin wrapper so app.py and gunicorn import loops from one place."""
+    import supervisor
+    supervisor.run_supervisor()

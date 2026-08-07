@@ -19,7 +19,7 @@ def post_fork(server, worker):
     """Start bot thread(s) after the worker process is forked (not in master)."""
     import threading
     import config
-    from scheduler import run_bot, run_grid_bot
+    from scheduler import run_bot, run_grid_bot, run_supervisor_bot
 
     if config.BB_ENABLED:
         t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
@@ -39,6 +39,18 @@ def post_fork(server, worker):
         )
     else:
         server.log.info("GRID_ENABLED=false — grid bot thread not started")
+
+    # Supervisor — advisory only, places no orders.
+    import supervisor_config as sc
+    if sc.SUPERVISOR_ENABLED:
+        st = threading.Thread(target=run_supervisor_bot, daemon=True, name="supervisor")
+        st.start()
+        server.log.info(
+            f"Supervisor thread started in worker "
+            f"(memory={sc.MEMORY_ENABLED} llm={sc.LLM_ENABLED})"
+        )
+    else:
+        server.log.info("SUPERVISOR_ENABLED=false — supervisor thread not started")
 
 
 def worker_exit(server, worker):

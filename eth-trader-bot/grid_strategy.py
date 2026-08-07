@@ -151,10 +151,33 @@ def compute_step(df: pd.DataFrame) -> float:
 
 # ── Grid geometry ─────────────────────────────────────────────────────────────
 
+def effective_levels() -> tuple:
+    """
+    Levels per side, after any supervisor override.
+
+    The supervisor narrows or widens the grid by writing GRID_OVERRIDE_FILE.
+    Anything unreadable, malformed or out of range is ignored in favour of the
+    configured values: a supervisor problem must never widen the grid past what
+    was configured, and must never stop the grid from trading.
+    """
+    below, above = gc.GRID_LEVELS_BELOW, gc.GRID_LEVELS_ABOVE
+    try:
+        import supervisor_config as sc
+        if not sc.GRID_OVERRIDE_FILE.exists():
+            return below, above
+        lv = json.loads(sc.GRID_OVERRIDE_FILE.read_text()).get("levels_per_side")
+        if isinstance(lv, int) and 1 <= lv <= max(below, above):
+            return lv, lv
+    except Exception as e:
+        log.debug(f"Ignoring grid override: {e}")
+    return below, above
+
+
 def build_levels(centre: float, step: float) -> tuple:
     """Level prices below and above the centre, nearest first."""
-    below = [gcl.round_price(centre - step * i) for i in range(1, gc.GRID_LEVELS_BELOW + 1)]
-    above = [gcl.round_price(centre + step * i) for i in range(1, gc.GRID_LEVELS_ABOVE + 1)]
+    n_below, n_above = effective_levels()
+    below = [gcl.round_price(centre - step * i) for i in range(1, n_below + 1)]
+    above = [gcl.round_price(centre + step * i) for i in range(1, n_above + 1)]
     return below, above
 
 

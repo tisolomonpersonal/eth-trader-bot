@@ -150,6 +150,36 @@ def grid_status():
     })
 
 
+@app.route("/supervisor/status")
+def supervisor_status():
+    import supervisor_config as sc
+    if not sc.SUPERVISOR_ENABLED:
+        return jsonify({"status": "disabled",
+                        "message": "Set SUPERVISOR_ENABLED=true to activate."})
+
+    import memory
+    import supervisor
+
+    return jsonify({
+        "status":        "ok",
+        "observe_only":  sc.SUPERVISOR_OBSERVE_ONLY,
+        "levels_now":    supervisor.current_levels(),
+        "level_bounds":  [sc.SUPERVISOR_MIN_LEVELS, sc.SUPERVISOR_MAX_LEVELS],
+        "override":      supervisor.read_override(),
+        "memory":        memory.health(),
+        "llm": {
+            "enabled":       sc.LLM_ENABLED,
+            "model":         sc.OLLAMA_MODEL if sc.LLM_ENABLED else None,
+            "advisory_only": sc.LLM_ADVISORY_ONLY,
+        },
+        "performance_by_levels": (
+            memory.performance_by_levels(sc.SUPERVISOR_LOOKBACK_HOURS)
+            if memory.available() else {}
+        ),
+        "recent_decisions": memory.recent_decisions(10) if memory.available() else [],
+    })
+
+
 # ── Bot threads ────────────────────────────────────────────────────────────────
 
 def _bot_thread():
@@ -160,6 +190,11 @@ def _bot_thread():
 def _grid_bot_thread():
     from scheduler import run_grid_bot
     run_grid_bot()
+
+
+def _supervisor_thread():
+    from scheduler import run_supervisor_bot
+    run_supervisor_bot()
 
 
 def _start_bot_threads():
@@ -188,6 +223,17 @@ def _start_bot_threads():
         threading.Thread(target=_grid_bot_thread, daemon=True, name="grid-bot").start()
     else:
         log.info("GRID_ENABLED=false — grid thread not started")
+
+    import supervisor_config as sc
+    if sc.SUPERVISOR_ENABLED:
+        log.info(
+            f"SUPERVISOR_ENABLED=true — starting supervisor thread "
+            f"(memory={sc.MEMORY_ENABLED} llm={sc.LLM_ENABLED} "
+            f"observe_only={sc.SUPERVISOR_OBSERVE_ONLY})"
+        )
+        threading.Thread(target=_supervisor_thread, daemon=True, name="supervisor").start()
+    else:
+        log.info("SUPERVISOR_ENABLED=false — supervisor thread not started")
 
 
 # Start threads when the module is imported by gunicorn (no --config needed).
