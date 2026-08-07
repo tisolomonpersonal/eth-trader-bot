@@ -166,6 +166,37 @@ def get_position() -> Optional[dict]:
     return _retry(_fetch, "get_position")
 
 
+def get_effective_leverage() -> Optional[float]:
+    """
+    Leverage Bybit actually has set for the symbol, or None if unavailable.
+
+    config.LEVERAGE is only what we asked for. set_leverage returns 110043
+    ("leverage not modified") both when the value already matches and when the
+    account's margin mode will not accept a per-symbol change, so a warning
+    there does not tell you which value is live. Bybit reports leverage on the
+    position record even at zero size, so this reads the real one.
+    """
+    if config.PAPER_MODE:
+        return None
+
+    def _fetch():
+        resp = _client().get_positions(
+            category=config.CATEGORY,
+            symbol=config.SYMBOL,
+        )
+        for p in resp["result"]["list"]:
+            lev = p.get("leverage")
+            if lev:
+                return float(lev)
+        return None
+
+    try:
+        return _retry(_fetch, "get_effective_leverage")
+    except Exception as e:
+        log.warning(f"Could not read effective leverage: {e}")
+        return None
+
+
 # ── Order execution ───────────────────────────────────────────────────────────
 
 def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:

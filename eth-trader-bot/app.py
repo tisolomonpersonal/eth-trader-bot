@@ -90,6 +90,13 @@ def status():
     except Exception as e:
         log.warning(f"Could not fetch balance for /status: {e}")
 
+    # ── Leverage: what we asked for vs what Bybit actually has ────────────────
+    # These can disagree. set_leverage returns 110043 both when the value is
+    # already correct and when the margin mode refuses a per-symbol change, so
+    # the startup warning alone cannot tell you which one is live.
+    state["_leverage_configured"] = config.LEVERAGE
+    state["_leverage_effective"] = bybit_client.get_effective_leverage()
+
     return jsonify({
         "status":        "ok",
         "paper_mode":    config.PAPER_MODE,
