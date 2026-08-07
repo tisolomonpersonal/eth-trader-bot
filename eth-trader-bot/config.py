@@ -31,6 +31,12 @@ H4_INTERVAL  = "240"       # 4-hour candles (the only timeframe used)
 # 250 candles = ~41 days. Enough for MA200 (200) + BB(20) warm-up + a few spare.
 H4_LIMIT     = 250
 
+# The BB short bot runs one-way mode; the grid runs hedge mode. Bybit allows
+# only one position mode per symbol per account, so these cannot both trade
+# BTCUSDT on the same keys. The grid is the active strategy — set BB_ENABLED
+# =true only if you disable the grid or move it to a sub-account.
+BB_ENABLED = os.environ.get("BB_ENABLED", "false").lower() == "true"
+
 # ── Position sizing ───────────────────────────────────────────────────────────
 BTC_QTY  = float(os.environ.get("BTC_QTY",  "0.001"))  # Bybit minimum; ~$2.30 margin at 28x
 LEVERAGE = int(os.environ.get("LEVERAGE",   "28"))      # 28× leverage

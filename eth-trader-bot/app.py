@@ -168,12 +168,15 @@ def _start_bot_threads():
         return
     os.environ["_BTC_BOT_STARTED"] = "1"
 
-    log.info(
-        f"Starting BTC 4H BB Short Bot | "
-        f"symbol={config.SYMBOL} leverage={config.LEVERAGE}× "
-        f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
-    )
-    threading.Thread(target=_bot_thread, daemon=True, name="btc-bot").start()
+    if config.BB_ENABLED:
+        log.info(
+            f"BB_ENABLED=true — starting BTC 4H BB Short Bot | "
+            f"symbol={config.SYMBOL} leverage={config.LEVERAGE}× "
+            f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
+        )
+        threading.Thread(target=_bot_thread, daemon=True, name="btc-bot").start()
+    else:
+        log.info("BB_ENABLED=false — BB short thread not started (grid owns the symbol)")
 
     import grid_config as gc
     if gc.GRID_ENABLED:

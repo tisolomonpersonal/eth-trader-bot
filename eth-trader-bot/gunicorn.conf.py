@@ -21,9 +21,12 @@ def post_fork(server, worker):
     import config
     from scheduler import run_bot, run_grid_bot
 
-    t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
-    t.start()
-    server.log.info("BTC bot thread started in worker")
+    if config.BB_ENABLED:
+        t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
+        t.start()
+        server.log.info("BB short bot thread started in worker")
+    else:
+        server.log.info("BB_ENABLED=false — BB short thread not started (grid owns the symbol)")
 
     # Hedged BTC grid — same pattern, own master switch.
     import grid_config as gc

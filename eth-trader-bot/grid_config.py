@@ -15,7 +15,7 @@ from config import DATA_DIR
 _true = lambda v: str(v).strip().lower() in ("1", "true", "yes", "on")
 
 # ── Master switch ─────────────────────────────────────────────────────────────
-GRID_ENABLED = _true(os.environ.get("GRID_ENABLED", "false"))
+GRID_ENABLED = _true(os.environ.get("GRID_ENABLED", "true"))
 
 # Logs every order it would place, sends nothing. Off by default.
 GRID_DRY_RUN = _true(os.environ.get("GRID_DRY_RUN", "false"))
