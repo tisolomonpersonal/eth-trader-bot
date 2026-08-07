@@ -7,7 +7,7 @@ Key functions for this strategy:
   bollinger_bands(df)         → (upper, middle, lower) Series tuple
   sma(series, period)         → pd.Series
 
-General helpers retained for hourly summary / TradFi:
+General helpers retained for the hourly summary and the grid bot:
   atr, rsi, macd, ema_values, calculate
 """
 import pandas as pd

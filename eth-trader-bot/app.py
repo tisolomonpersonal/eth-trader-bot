@@ -143,73 +143,11 @@ def grid_status():
     })
 
 
-# ── TradFi routes (kept intact — only runs when TRADFI_ENABLED=true) ──────────
-
-@app.route("/tradfi/status")
-def tradfi_status():
-    if not config.TRADFI_ENABLED:
-        return jsonify({"status": "disabled",
-                        "message": "Set TRADFI_ENABLED=true to activate."})
-    from tradfi_strategy import load_state, get_history
-    state   = load_state()
-    history = get_history()[-5:]
-    return jsonify({
-        "status":        "ok",
-        "paper_mode":    config.TRADFI_PAPER,
-        "symbol":        config.TRADFI_SYMBOL,
-        "state":         state,
-        "recent_trades": history,
-    })
-
-
-@app.route("/tradfi/history")
-def tradfi_history():
-    if not config.TRADFI_ENABLED:
-        return jsonify({"status": "disabled"})
-    from tradfi_strategy import get_history
-    return jsonify(get_history())
-
-
-@app.route("/tradfi/debug")
-def tradfi_debug():
-    from flask import request
-    import tradfi_client as tc
-    base = request.args.get("symbol", config.TRADFI_SYMBOL)
-    out = {
-        "configured_symbol": config.TRADFI_SYMBOL,
-        "requested_symbol":  base,
-        "tradfi_mode":       config.TRADFI_MODE,
-        "interval_min":      config.TRADFI_INTERVAL,
-    }
-    try:
-        out.update(tc.diagnose(base))
-    except Exception as e:
-        out["diagnose_error"] = str(e)
-    return jsonify(out)
-
-
-@app.route("/tradfi/symbols")
-def tradfi_symbols():
-    from flask import request
-    import tradfi_client as tc
-    search = request.args.get("search")
-    try:
-        syms = tc.list_symbols(search)
-        return jsonify({"count": len(syms), "search": search, "symbols": syms})
-    except Exception as e:
-        return jsonify({"error": str(e), "search": search})
-
-
 # ── Bot threads ────────────────────────────────────────────────────────────────
 
 def _bot_thread():
     from scheduler import run_bot
     run_bot()
-
-
-def _tradfi_bot_thread():
-    from scheduler import run_tradfi_bot
-    run_tradfi_bot()
 
 
 def _grid_bot_thread():
@@ -229,12 +167,6 @@ def _start_bot_threads():
         f"qty={config.BTC_QTY} BTC | paper={config.PAPER_MODE}"
     )
     threading.Thread(target=_bot_thread, daemon=True, name="btc-bot").start()
-
-    if config.TRADFI_ENABLED:
-        log.info(f"TRADFI_ENABLED=true — starting TradFi thread (symbol={config.TRADFI_SYMBOL})")
-        threading.Thread(target=_tradfi_bot_thread, daemon=True, name="tradfi-bot").start()
-    else:
-        log.info("TRADFI_ENABLED=false — TradFi thread not started")
 
     import grid_config as gc
     if gc.GRID_ENABLED:

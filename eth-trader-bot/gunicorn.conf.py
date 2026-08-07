@@ -19,20 +19,11 @@ def post_fork(server, worker):
     """Start bot thread(s) after the worker process is forked (not in master)."""
     import threading
     import config
-    from scheduler import run_bot, run_tradfi_bot, run_grid_bot
+    from scheduler import run_bot, run_grid_bot
 
     t = threading.Thread(target=run_bot, daemon=True, name="btc-bot")
     t.start()
     server.log.info("BTC bot thread started in worker")
-
-    # Start the TradFi loop too, but only when the master switch is on — mirrors
-    # the app.py __main__ launcher so both run paths behave identically.
-    if config.TRADFI_ENABLED:
-        tt = threading.Thread(target=run_tradfi_bot, daemon=True, name="tradfi-bot")
-        tt.start()
-        server.log.info(f"TradFi bot thread started in worker (symbol={config.TRADFI_SYMBOL})")
-    else:
-        server.log.info("TRADFI_ENABLED=false — TradFi bot thread not started")
 
     # Hedged BTC grid — same pattern, own master switch.
     import grid_config as gc

@@ -171,7 +171,7 @@ def get_position() -> Optional[dict]:
 def open_long(qty: float = None, ref_price: float = 0.0) -> Tuple[float, float]:
     """
     Open a LONG position (market buy).
-    Kept for reconciliation / TradFi. Primary strategy is SHORT only.
+    Kept for reconciliation. Primary strategy is SHORT only.
     Returns (qty, estimated_fill_price).
     """
     qty = qty or config.BTC_QTY
