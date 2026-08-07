@@ -3,5 +3,12 @@ pandas>=2.0.0
 requests>=2.31.0
 flask>=3.0.0
 gunicorn>=21.0.0
-mt5linux>=0.1.9
+
+# Must stay below 1.0. The 0.x line is a thin rpyc client: MetaTrader5(host, port)
+# connects to a remote bridge, which is what mt5-server/ runs and what
+# tradfi_client._mt5() expects. In 1.x the constructor builds a ContainerManager
+# and launches MT5 in a local docker/udocker container instead, so it fails with
+# "No container runtime available" before it ever opens a socket — unusable from
+# an app container. The old ">=0.1.9" silently resolved to 1.1.1 on redeploy.
+mt5linux>=0.1.9,<1.0
 rpyc>=5.3.0
